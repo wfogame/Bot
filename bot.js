@@ -368,7 +368,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
     connected = false
     if (manualDisconnect || reconnectTimer) return
 
-    const delay = 5000 + Math.floor(Math.random() * 3000)
+    const delay = 8000 + Math.floor(Math.random() * 3000)
     w(`${reason}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s...`)
 
     reconnectTimer = setTimeout(() => {
@@ -383,8 +383,8 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   // 2. Auth triggers immediately on socket connection
   bot.once('login', () => {
     i('Connected to server socket. Sending auth commands...')
-    pushT(() => bot.chat('/register 123456 123456'), 200 + Math.random() * 300)
-    pushT(() => bot.chat('/login 123456'), 1220 + Math.random() * 400)
+    // pushT(() => bot.chat('/register 123456 123456'), 200 + Math.random() * 300) must register accounts manually
+    pushT(() => bot.chat('/login 123456'), 2220 + Math.random() * 400)
   })
 
   // 3. World interactions trigger only after physical spawn
@@ -463,7 +463,12 @@ const BOT_NAMES = [
   'Jt2S1m3ePer',
   'BilihJm289',
   '1evArchUsr2',
-  'LnuxOtocael'
+  'LnuxOtocael',
+  'DevArchUsr99',   // 12 letters
+  'PgrMrJt3S21m',   // 12 letters
+  'LnuxSysOp808',   // 12 letters
+  'NvimScriptr1',   // 12 letters
+  'CplusplusDev7'   // 13 letters
 ]
 
 const CONNECT_DELAY_MS = 39500  // tweak this if needed (3-5s usually safe)
