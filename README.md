@@ -50,4 +50,50 @@ to run, run
 
 ```
 node bot.js
+
 ```
+
+The Interface
+
+    Header: Displays the currently active bot and a list of other connected bots.
+
+    Log Box: Displays events, chats, and errors specific to the currently active bot. Scrollable using the mouse or terminal scroll binds.
+
+    Input Box: Send chat messages or execute internal / commands.
+
+Commands
+
+Type these commands into the bottom input box. Commands starting with / are processed by the TUI. Anything else is sent as a chat message to the Minecraft server from the active bot.
+Command Description
+/switch [username] Switch the TUI log view and control to a different connected bot.
+/new-bot [name] [ip] [port] [ver] Create and connect a new bot. (IP, port, and version default to main server if omitted).
+/bots List all connected bots and their current spawn status.
+/status Show the active bot's position, health, ping, and uptime.
+/inv List the active bot's inventory contents.
+/players List all online players (from the active bot's perspective).
+/clear Clear the active bot's TUI log view.
+/disconnect or /dc Disconnect the currently active bot without closing the program.
+/reconnect Reconnect the currently active bot to the server.
+/exit Gracefully disconnect all bots and close the program.
+/help List all available commands in the log box.
+Event Flow & Customization
+
+The bots follow a strict automated sequence upon connection. To modify this behavior, look for the bot.once('login') and bot.once('spawn') blocks inside createBotInstance():
+
+    Login: Sends /register and /login commands.
+
+    Spawn: Activates held item (Compass).
+
+    Window Open: Detects GUI, clicks slot 11, waits, and sends /warp afk.
+
+Troubleshooting
+
+    partial packet / Protocol crashes during server transfer: This is a known issue with Mineflayer 1.21+ handling Proxy (Velocity/BungeeCord) server transfers. If you experience random crashes when clicking the compass GUI, downgrade the VERSION constant to 1.21.1 or 1.20.4.
+
+    Bots getting kicked immediately: Ensure CONNECT_DELAY_MS is high enough to bypass the server's anti-bot connection throttling.
+
+Dependencies Links
+
+    Mineflayer API
+
+    Neo-Blessed
