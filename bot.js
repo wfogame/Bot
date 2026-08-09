@@ -242,7 +242,7 @@ const VERSION = '1.21.1'
   }
 
 */
-
+/*
 function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
   const id = username
   let connected = false   // <-- track real state ourselves
@@ -333,6 +333,131 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
   return bot
 }
+*/
+function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
+  const id = username
+  let connected = false
+  let manualDisconnect = false
+  let reconnectTimer = null
+
+  const s = (msg) => logFor(id, `{green-fg}✓ ${msg}{/green-fg}`)
+  const e = (msg) => logFor(id, `{red-fg}✗ ${msg}{/red-fg}`)
+  const i = (msg) => logFor(id, `{cyan-fg}› ${msg}{/cyan-fg}`)
+  const w = (msg) => logFor(id, `{yellow-fg}⚠ ${msg}{/yellow-fg}`)
+  const c = (msg) => logFor(id, `{white-fg}${msg}{/white-fg}`)
+
+  // 1. Clean up existing bot listeners before re-instantiating
+  if (bots[id]?.bot) {
+    bots[id].bot.removeAllListeners()
+    if (bots[id].bot._client) bots[id].bot._client.removeAllListeners()
+  }
+
+  // Preserve existing log history across reconnects
+  const existingLogs = bots[id]?.logs || []
+
+  const bot = mineflayer.createBot({ host, port, username: id, version, hideErrors: true })
+
+  bots[id] = { bot, spawnTime: null, logs: existingLogs, host, port, version }
+
+  const timeouts = []
+  const pushT = (fn, delay) => { const t = setTimeout(fn, delay); timeouts.push(t); return t }
+  const clearAll = () => { timeouts.forEach(clearTimeout); timeouts.length = 0 }
+
+  const scheduleReconnect = (reason) => {
+    clearAll()
+    connected = false
+    if (manualDisconnect || reconnectTimer) return
+
+    const delay = 5000 + Math.floor(Math.random() * 3000)
+    w(`${reason}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s...`)
+
+    reconnectTimer = setTimeout(() => {
+      createBotInstance(id, host, port, version)
+    }, delay)
+  }
+
+  const safeChat = (msg) => {
+    if (connected && bot.entity) bot.chat(msg)
+  }
+
+  // 2. Auth triggers immediately on socket connection
+  bot.once('login', () => {
+    i('Connected to server socket. Sending auth commands...')
+    pushT(() => bot.chat('/register 123456 123456'), 200 + Math.random() * 300)
+    pushT(() => bot.chat('/login 123456'), 1220 + Math.random() * 400)
+  })
+
+  // 3. World interactions trigger only after physical spawn
+  bot.once('spawn', () => {
+    connected = true
+    bots[id].spawnTime = Date.now()
+    s(`Bot has spawned and is connected to ${host}:${port} (v${version}).`)
+
+    pushT(() => { 
+      i('Right-clicking compass (server selector)...')
+      bot.activateItem() 
+    }, 3600 + Math.random() * 600)
+  })
+
+  // 4. GUI Navigation
+  bot.on('windowOpen', (window) => {
+    const title = window.title?.toString ? window.title.toString() : String(window.title)
+    i(`Window opened: ${title} (${window.slots.length} slots)`)
+
+    const targetSlot = 11
+    if (targetSlot >= window.slots.length) {
+      w(`Slot ${targetSlot} out of bounds — window only has ${window.slots.length} slots`)
+      return
+    }
+    if (!window.slots[targetSlot]) {
+      w(`Slot ${targetSlot} is empty — not clicking.`)
+      return
+    }
+
+    pushT(async () => {
+      if (!bot.currentWindow) {
+        w('Window closed before click could fire.')
+        return
+      }
+      try {
+        await bot.clickWindow(targetSlot, 0, 0)
+        i(`Clicked slot ${targetSlot}`)
+      } catch (err) {
+        e(`Click failed: ${err.message || err}`)
+      }
+
+      pushT(() => {
+        safeChat('/warp afk')
+        s('Sent /warp afk')
+      }, 8000 + Math.random() * 4200)
+    }, 2000 + Math.random() * 1600)
+  })
+
+  // 5. Output logging & automatic reconnection trigger
+  bot.on('message', (jsonMsg) => c(jsonMsg.toString()))
+  bot.on('kicked', (reason) => e(`Kicked: ${JSON.stringify(reason)}`))
+  bot.on('error', (err) => e(`Error: ${err.message || err}`))
+  
+  bot.on('end', () => {
+    connected = false
+    w('Disconnected.')
+    scheduleReconnect('Connection lost')
+  })
+
+  // 6. Manual disconnect method attached to object
+  bots[id].disconnectManually = () => {
+    manualDisconnect = true
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    clearAll()
+    bot.quit()
+  }
+
+  if (!activeId) activeId = id
+  updateHeader()
+
+  return bot
+}
+
 const BOT_NAMES = [
   'OnlyAProgrammer',
   'Jt2S1m3ePer',
