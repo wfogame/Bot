@@ -1,6 +1,6 @@
 # Mineflayer TUI Multi-Bot Manager
 
-A terminal-based multi-bot manager for Minecraft, built with Node.js, [Mineflayer](https://github.com/PrismarineJS/mineflayer), and [neo-blessed](https://github.com/chjj/blessed). 
+A terminal-based multi-bot manager for Minecraft, built with Node.js, [Mineflayer](https://github.com/PrismarineJS/mineflayer), and [neo-blessed](https://github.com/chjj/blessed).
 
 This program allows you to connect and manage multiple Minecraft bots simultaneously through a clean Terminal User Interface (TUI). It features automatic server authentication, GUI navigation (compass clicking), and independent log views for each bot.
 
@@ -21,5 +21,33 @@ This program allows you to connect and manage multiple Minecraft bots simultaneo
 
 1. Clone or download this repository.
 2. Install the required dependencies:
+
    ```bash
    npm install mineflayer neo-blessed
+
+You can adjust default settings before running
+
+```js
+
+const HOST = 'play.fatalmc.org'   // Target server IP
+const PORT = 25565                // Target server Port
+const VERSION = '1.21.1'          // Target Minecraft version
+
+// List of bots to connect automatically on startup
+const BOT_NAMES = [
+  'OnlyAProgrammer',
+  'Jt2S1m3ePer',
+  'BilihJm289',
+  '1evArchUsr2',
+  'LnuxOtocael'
+]
+
+const CONNECT_DELAY_MS = 39500    // Delay between each bot connecting
+
+```
+
+to run, run
+
+```
+node bot.js
+```
