@@ -97,3 +97,6 @@ Dependencies Links
     Mineflayer API
 
     Neo-Blessed
+In addition, bot-rtp.js simply automatically rtp the bots and scans for bases.
+Features
+Auto eat, notifcation for improtant events such as totem popping, player in range, and base found, auto totem, as well as rtp location logging
