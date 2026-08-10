@@ -642,3 +642,4 @@ inputBox.on('submit', (input) => {
 })
 
 screen.render()
+
