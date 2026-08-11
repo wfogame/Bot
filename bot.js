@@ -1,8 +1,10 @@
-
 require('dotenv').config()          // npm install dotenv
+const net = require('net')
 const mineflayer = require('mineflayer')
 const blessed = require('neo-blessed')
 const armorManager = require('mineflayer-armor-manager')
+let SocksClient
+try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY_HOST is set and PROXY_TYPE=socks5 — npm install socks */ }
 
 // ── .env config (with sane defaults) ──────────────────────────────────────────
 const HOST             = process.env.HOST             || 'play.fatalmc.org'
@@ -13,6 +15,15 @@ const BOT_NAMES        = (process.env.BOT_NAMES || '').split(',').map(n => n.tri
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 
+// ── Outbound proxy config ──────────────────────────────────────────────────────
+// Every bot's Minecraft TCP connection is routed through this single shared
+// proxy when PROXY_HOST is set. Leave PROXY_HOST empty/unset to connect
+// directly (default, unchanged behavior).
+const PROXY_HOST       = process.env.PROXY_HOST       || ''
+const PROXY_PORT       = parseInt(process.env.PROXY_PORT || '1080', 10)
+const PROXY_TYPE       = (process.env.PROXY_TYPE || 'socks5').toLowerCase() // 'socks5' | 'http'
+const PROXY_ENABLED    = Boolean(PROXY_HOST)
+
 // ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
 // When a Velocity proxy transfers a player between backend servers, mineflayer's
 // protocol layer can receive partial / malformed packets mid-transfer.  This
@@ -21,6 +32,9 @@ const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 //
 // We match error messages against these patterns to distinguish "proxy transfer
 // crash" (fast 3 s reconnect, no backoff) from "real kick" (exponential backoff).
+// NOTE: this is unrelated to PROXY_HOST/PROXY_PORT above — this section is about
+// the Minecraft server's own backend proxy (Velocity/Bungee), not our outbound
+// SOCKS5/HTTP proxy.
 const PROXY_CRASH_PATTERNS = [
   /PartialReadError/i,
   /deserialization/i,
@@ -46,6 +60,86 @@ const RECONNECT_MAX_MS  = 5 * 60_000  // ceiling for exponential backoff
 if (BOT_NAMES.length === 0) {
   console.error('No BOT_NAMES defined in .env — nothing to connect.')
   process.exit(1)
+}
+
+// ── Outbound proxy tunnelling ──────────────────────────────────────────────────
+// node-minecraft-protocol (which mineflayer builds on) lets you override how the
+// raw socket is opened via the `connect` option passed to createBot/createClient.
+// We use that hook to tunnel every bot's connection through a single SOCKS5 or
+// HTTP CONNECT proxy instead of dialing the Minecraft server directly.
+//
+// Important: because the tunnel socket is already open by the time we hand it
+// to the client, the underlying socket's native 'connect' event has already
+// fired and won't fire again — so we must manually emit 'connect' on the
+// client itself to kick off the handshake/login sequence.
+function makeSocksConnect(targetHost, targetPort, onLog) {
+  return (client) => {
+    if (!SocksClient) {
+      client.emit('error', new Error('PROXY_TYPE=socks5 requires the "socks" package — run: npm install socks'))
+      return
+    }
+    onLog?.(`Tunnelling through SOCKS5 proxy ${PROXY_HOST}:${PROXY_PORT}…`)
+    SocksClient.createConnection({
+      proxy: { host: PROXY_HOST, port: PROXY_PORT, type: 5 },
+      command: 'connect',
+      destination: { host: targetHost, port: targetPort }
+    }).then(({ socket }) => {
+      client.setSocket(socket)
+      client.emit('connect')
+    }).catch(err => {
+      client.emit('error', new Error(`SOCKS5 proxy connection failed: ${err.message}`))
+    })
+  }
+}
+
+function makeHttpConnect(targetHost, targetPort, onLog) {
+  return (client) => {
+    onLog?.(`Tunnelling through HTTP proxy ${PROXY_HOST}:${PROXY_PORT}…`)
+    const socket = net.connect(PROXY_PORT, PROXY_HOST, () => {
+      socket.write(
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+        `Host: ${targetHost}:${targetPort}\r\n` +
+        `Connection: keep-alive\r\n\r\n`
+      )
+    })
+
+    let buffer = ''
+    const onData = (chunk) => {
+      buffer += chunk.toString('latin1')
+      const headerEnd = buffer.indexOf('\r\n\r\n')
+      if (headerEnd === -1) return
+      socket.removeListener('data', onData)
+
+      const statusLine = buffer.slice(0, buffer.indexOf('\r\n'))
+      const match = statusLine.match(/^HTTP\/\d\.\d (\d{3})/)
+      const statusCode = match ? parseInt(match[1], 10) : null
+
+      if (statusCode !== 200) {
+        socket.destroy()
+        client.emit('error', new Error(`HTTP proxy CONNECT failed: ${statusLine || 'no response from proxy'}`))
+        return
+      }
+
+      // Any bytes after the CONNECT response headers are already Minecraft
+      // protocol data trickling in — push them back onto the socket before
+      // handing it off so nothing gets lost.
+      const leftover = buffer.slice(headerEnd + 4)
+      if (leftover.length) socket.unshift(Buffer.from(leftover, 'latin1'))
+
+      client.setSocket(socket)
+      client.emit('connect')
+    }
+
+    socket.on('data', onData)
+    socket.on('error', (err) => client.emit('error', new Error(`HTTP proxy connection failed: ${err.message}`)))
+  }
+}
+
+function makeProxyConnect(targetHost, targetPort, onLog) {
+  if (!PROXY_ENABLED) return undefined
+  return PROXY_TYPE === 'http'
+    ? makeHttpConnect(targetHost, targetPort, onLog)
+    : makeSocksConnect(targetHost, targetPort, onLog)
 }
 
 // ── Global crash guards ───────────────────────────────────────────────────────
@@ -146,7 +240,8 @@ function updateHeader() {
   const activeLabel = activeId ? `Active: [${activeIndex}] ${activeId}` : 'No active bot'
   const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` : null).filter(Boolean)
   const othersLabel = others.length ? `  |  Others: ${others.join(', ')}` : ''
-  header.setContent(`{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}   —   ${activeLabel}${othersLabel}{/center}`)
+  const proxyLabel = PROXY_ENABLED ? `   —   Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
+  header.setContent(`{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}   —   ${activeLabel}${othersLabel}${proxyLabel}{/center}`)
   debouncedRender()
 }
 
@@ -201,7 +296,10 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
   let bot
   try {
-    bot = mineflayer.createBot({ host, port, username: id, version, hideErrors: true })
+    bot = mineflayer.createBot({
+      host, port, username: id, version, hideErrors: true,
+      connect: makeProxyConnect(host, port, i)
+    })
   } catch (err) {
     const fallback = activeId || id
     logFor(fallback, `{red-fg}✗ Failed to create bot "${id}": ${sanitize(err.message)}{/red-fg}`)
@@ -403,6 +501,7 @@ const COMMANDS = {
   '/new-bot <name> [host] [port] [ver]': 'Create and connect a new bot',
   '/switch <id>':    'Switch view to a different bot by name or number',
   '/uptime':         'Show uptime for all bots',
+  '/proxy':          'Show the currently configured outbound proxy',
   'anything else':   'Sent directly as a chat message/command from the active bot'
 }
 
@@ -420,6 +519,7 @@ function runLocalCommandForBot(id, cmd) {
       const uptimeSec = entry.spawnTime ? Math.floor((Date.now() - entry.spawnTime) / 1000) : 0
       logFor(id, `{cyan-fg}› Status for ${id}:{/cyan-fg}`)
       logFor(id, `  Server: ${entry.host}:${entry.port} (v${entry.version})`)
+      logFor(id, `  Proxy: ${PROXY_ENABLED ? `${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : 'Direct (no proxy)'}`)
       logFor(id, `  Position: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`)
       logFor(id, `  Health: ${bot.health ?? 'N/A'}  Food: ${bot.food ?? 'N/A'}`)
       logFor(id, `  Ping: ${bot.player?.ping ?? 'N/A'}ms`)
@@ -588,6 +688,16 @@ function handleCommand(trimmed) {
       const up = (b?.bot?.entity && b.spawnTime) ? formatUptime(Date.now() - b.spawnTime) : '{gray-fg}offline{/gray-fg}'
       log(`  [${idx + 1}] {cyan-fg}${name}{/cyan-fg} — ${up}`)
     })
+    return
+  }
+
+  // ── /proxy ──────────────────────────────────
+  if (trimmed === '/proxy') {
+    if (PROXY_ENABLED) {
+      logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots)`)
+    } else {
+      logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST in .env to enable one.')
+    }
     return
   }
 
