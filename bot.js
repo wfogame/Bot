@@ -53,8 +53,8 @@ const PROXY_CRASH_PATTERNS = [
   /not enough (data|bytes)/i,
   /Cannot read propert/i,        // "Cannot read properties of null" from half-torn-down state
 ]
-const FAST_RECONNECT_MS = 3000        // flat delay for proxy transfer crashes
-const RECONNECT_BASE_MS = 8000        // base delay for real kicks / errors
+const FAST_RECONNECT_MS = 10400        // flat delay for proxy transfer crashes
+const RECONNECT_BASE_MS = 10400        // base delay for real kicks / errors
 const RECONNECT_MAX_MS  = 5 * 60_000  // ceiling for exponential backoff
 
 if (BOT_NAMES.length === 0) {
@@ -232,7 +232,7 @@ function timestamp() {
 // ── Multi-bot state ───────────────────────────────────────────────────────────
 const bots = {}       // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
 let activeId = null
-const MAX_LOG_LINES = 5000000000000
+const MAX_LOG_LINES = 50000000000000
 
 function updateHeader() {
   const names = Object.keys(bots)
@@ -366,7 +366,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
     i('Connected to server socket. Sending auth…')
 
     pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 0 + Math.random() * 400)
-    pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 2220 + Math.random() * 400)
+    pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 3220 + Math.random() * 400)
   })
 
   bot.once('spawn', () => {

@@ -16,6 +16,7 @@
     "minecraft-data": "^3.113.0",
     "mineflayer": "^4.37.1",
     "mineflayer-armor-manager": "^2.0.1",
-    "neo-blessed": "^0.2.0"
+    "neo-blessed": "^0.2.0",
+    "socks": "^2.8.9"
   }
 }
