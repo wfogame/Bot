@@ -9,7 +9,7 @@ try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY
 // ── .env config (with sane defaults) ──────────────────────────────────────────
 const HOST             = process.env.HOST             || 'play.fatalmc.org'
 const PORT             = parseInt(process.env.PORT    || '25565', 10)
-const VERSION          = process.env.VERSION          || '1.21.1'
+const VERSION          = process.env.VERSION          || '1.21.2'
 const LOGIN_PASSWORD   = process.env.LOGIN_PASSWORD   || '123456'
 const BOT_NAMES        = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
@@ -231,6 +231,13 @@ function timestamp() {
 }
 
 // ── Multi-bot state ───────────────────────────────────────────────────────────
+setInterval(() => {
+  const cutoff = Date.now() - (20 * 60 * 1000) // 20 minutes ago
+  Object.values(bots).forEach(botState => {
+    // Filter out anything older than the cutoff
+    botState.logs = botState.logs.filter(log => log.time > cutoff)
+  })
+}, 60000) // Runs once every 60 seconds
 const bots = {}       // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
 let activeId = null
 const MAX_LOG_LINES = 50000000000000
@@ -249,9 +256,15 @@ function updateHeader() {
 function switchTo(id) {
   if (!bots[id]) { log(`{red-fg}✗ No bot named "${sanitize(id)}"{/red-fg}`); return }
   activeId = id
+  
   logBox.setContent('')
   logBox.scrollTo(0)
-  if (bots[id].logs.length > 0) logBox.setContent(bots[id].logs.join('\n'))
+  
+  // Map the objects back to strings to render them
+  if (bots[id].logs.length > 0) {
+    logBox.setContent(bots[id].logs.map(l => l.text).join('\n'))
+  }
+  
   updateHeader()
   const bottom = logBox.getScrollHeight()
   if (bottom > 0) logBox.scrollTo(bottom)
@@ -260,13 +273,17 @@ function switchTo(id) {
 
 function logFor(id, msg) {
   if (!bots[id]) return
+  
   const line = `${timestamp()} ${msg}`
-  const logs = bots[id].logs
-  logs.push(line)
-  if (logs.length > MAX_LOG_LINES) logs.splice(0, logs.length - MAX_LOG_LINES)
-  if (id === activeId) { logBox.log(line); debouncedRender() }
+  
+  // Store as an object with a timestamp
+  bots[id].logs.push({ text: line, time: Date.now() }) 
+  
+  if (id === activeId) { 
+    logBox.log(line)
+    debouncedRender() 
+  }
 }
-
 function log(msg)        { if (activeId) logFor(activeId, msg) }
 function logSuccess(msg) { log(`{green-fg}✓ ${msg}{/green-fg}`) }
 function logError(msg)   { log(`{red-fg}✗ ${msg}{/red-fg}`) }
@@ -314,6 +331,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
     reconnectAttempts: existingReconnectAttempts,
     lastKickReason: null,
     lastDisconnectReason: null      // stores raw error text for transfer-crash classification
+
   }
 
   // Managed timers — all cleared on disconnect so nothing fires against a dead bot
@@ -407,11 +425,8 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
       }, 2000 + Math.random() * 1600)
 
       pushT(async () => {
-        if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
-        try {
-          await bot.clickWindow(GUI_SLOT, 0, 0)
-          i(`Clicked slot ${GUI_SLOT} — waiting for server transfer…`)
-        } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
+          bot.chat(WARP_AFK)
+          i(`Warped — waiting for server transfer…`)
       }, 54000 + Math.random() * 1600)
 
     } catch (err) { e(`windowOpen handler error: ${sanitize(err.message)}`) }
