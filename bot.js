@@ -291,11 +291,21 @@ function logInfo(msg)    { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
 function logWarn(msg)    { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 
 // ── Bot creation ──────────────────────────────────────────────────────────────
+function clearReconnectTimer(id) {
+  const entry = bots[id]
+  if (entry?.reconnectTimer) {
+    clearTimeout(entry.reconnectTimer)
+    entry.reconnectTimer = null
+  }
+}
+
 function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
   const id = username
   let connected = false
   let manualDisconnect = false
-  let reconnectTimer = null
+
+  // Cancel any pending reconnect from a previous instance (timer lives on bots[id], not in closure)
+  clearReconnectTimer(id)
 
   const s = (msg) => logFor(id, `{green-fg}✓ ${msg}{/green-fg}`)
   const e = (msg) => logFor(id, `{red-fg}✗ ${msg}{/red-fg}`)
@@ -329,6 +339,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   bots[id] = {
     bot, spawnTime: null, logs: existingLogs, host, port, version,
     reconnectAttempts: existingReconnectAttempts,
+    reconnectTimer: null,
     lastKickReason: null,
     lastDisconnectReason: null      // stores raw error text for transfer-crash classification
 
@@ -349,7 +360,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   const scheduleReconnect = (reason, rawError) => {
     clearAll()
     connected = false
-    if (manualDisconnect || reconnectTimer) return
+    if (manualDisconnect || bots[id]?.reconnectTimer) return
 
     const proxyCrash = isProxyCrash(rawError || reason)
     const attempt = bots[id]?.reconnectAttempts || 0
@@ -366,9 +377,10 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
       w(`${reason}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s (Attempt ${attempt + 1})…`)
     }
 
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null
-      createBotInstance(id, host, port, version)
+    bots[id].reconnectTimer = setTimeout(() => {
+      bots[id].reconnectTimer = null
+      // Defer to next tick so reconnect never runs inside the disconnect/create call stack
+      setImmediate(() => createBotInstance(id, host, port, version))
     }, delay)
   }
 
@@ -490,7 +502,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
   bots[id].disconnectManually = () => {
     manualDisconnect = true
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+    clearReconnectTimer(id)
     clearAll()
     try { bot.quit() } catch (_) {}
   }
