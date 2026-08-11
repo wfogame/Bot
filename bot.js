@@ -14,6 +14,7 @@ const LOGIN_PASSWORD   = process.env.LOGIN_PASSWORD   || '123456'
 const BOT_NAMES        = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
+const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
 
 // ── Outbound proxy config ──────────────────────────────────────────────────────
 // Every bot's Minecraft TCP connection is routed through this single shared
@@ -365,8 +366,8 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   bot.once('login', () => {
     i('Connected to server socket. Sending auth…')
 
-    pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 0 + Math.random() * 400)
-    pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 3220 + Math.random() * 400)
+    //pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 2 + Math.random() * 400)
+    pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 2000 + Math.random() * 400)
   })
 
   bot.once('spawn', () => {
@@ -404,6 +405,15 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
           i(`Clicked slot ${GUI_SLOT} — waiting for server transfer…`)
         } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
       }, 2000 + Math.random() * 1600)
+
+      pushT(async () => {
+        if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
+        try {
+          await bot.clickWindow(GUI_SLOT, 0, 0)
+          i(`Clicked slot ${GUI_SLOT} — waiting for server transfer…`)
+        } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
+      }, 54000 + Math.random() * 1600)
+
     } catch (err) { e(`windowOpen handler error: ${sanitize(err.message)}`) }
   })
 
