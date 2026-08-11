@@ -1,47 +1,109 @@
+
+require('dotenv').config()          // npm install dotenv
 const mineflayer = require('mineflayer')
 const blessed = require('neo-blessed')
+const armorManager = require('mineflayer-armor-manager')
 
-// ---- TUI setup ----
-const screen = blessed.screen({
-  smartCSR: true,
-  title: 'Mineflayer Bot Console',
-  fullUnicode: true
+// ── .env config (with sane defaults) ──────────────────────────────────────────
+const HOST             = process.env.HOST             || 'play.fatalmc.org'
+const PORT             = parseInt(process.env.PORT    || '25565', 10)
+const VERSION          = process.env.VERSION          || '1.21.1'
+const LOGIN_PASSWORD   = process.env.LOGIN_PASSWORD   || '123456'
+const BOT_NAMES        = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
+const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
+const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
+
+// ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
+// When a Velocity proxy transfers a player between backend servers, mineflayer's
+// protocol layer can receive partial / malformed packets mid-transfer.  This
+// causes deserialization errors, zlib failures, or abrupt socket resets that
+// look like crashes but are actually recoverable — just reconnect fast.
+//
+// We match error messages against these patterns to distinguish "proxy transfer
+// crash" (fast 3 s reconnect, no backoff) from "real kick" (exponential backoff).
+const PROXY_CRASH_PATTERNS = [
+  /PartialReadError/i,
+  /deserialization/i,
+  /decompress/i,
+  /zlib/i,
+  /unexpected end/i,
+  /Invalid VarInt/i,
+  /socket hang up/i,
+  /ECONNRESET/i,
+  /read ECONNRESET/i,
+  /This socket has been ended/i,
+  /write after end/i,
+  /Invalid packet/i,
+  /Missing (packet|field)/i,
+  /buffer length/i,
+  /not enough (data|bytes)/i,
+  /Cannot read propert/i,        // "Cannot read properties of null" from half-torn-down state
+]
+const FAST_RECONNECT_MS = 3000        // flat delay for proxy transfer crashes
+const RECONNECT_BASE_MS = 8000        // base delay for real kicks / errors
+const RECONNECT_MAX_MS  = 5 * 60_000  // ceiling for exponential backoff
+
+if (BOT_NAMES.length === 0) {
+  console.error('No BOT_NAMES defined in .env — nothing to connect.')
+  process.exit(1)
+}
+
+// ── Global crash guards ───────────────────────────────────────────────────────
+process.on('uncaughtException', (err) => {
+  try { logBox.log(`{red-fg}[UNCAUGHT] ${sanitize(err.message)}{/red-fg}`); debouncedRender() }
+  catch (_) { /* blessed may not be ready */ }
+})
+process.on('unhandledRejection', (reason) => {
+  try {
+    const msg = reason instanceof Error ? reason.message : String(reason)
+    logBox.log(`{red-fg}[UNHANDLED REJECTION] ${sanitize(msg)}{/red-fg}`); debouncedRender()
+  } catch (_) {}
 })
 
+// ── Blessed tag sanitiser ─────────────────────────────────────────────────────
+// Player names / chat / errors can contain {curly braces} that blessed parses
+// as formatting tags → crash.  We escape everything except our own known tags.
+const KNOWN_TAG_RE = /\{(\/?(bold|underline|blink|inverse|red|green|blue|cyan|magenta|yellow|white|gray|grey|black|center|left|right)(-fg|-bg)?)\}/g
+function sanitize(str) {
+  if (typeof str !== 'string') str = String(str ?? '')
+  const tags = []
+  const safe = str.replace(KNOWN_TAG_RE, (m) => { tags.push(m); return `\x00T${tags.length - 1}\x00` })
+  const escaped = safe.replace(/[{}]/g, c => '\\' + c)
+  return escaped.replace(/\x00T(\d+)\x00/g, (_, i) => tags[+i])
+}
+
+// ── TUI setup ─────────────────────────────────────────────────────────────────
+const screen = blessed.screen({ smartCSR: true, title: 'Mineflayer AFK Console', fullUnicode: true })
+
+// Debounced render — the single biggest fix for input lag.
+// Without this, every chat line from 14 bots triggers a full synchronous repaint.
+let renderQueued = false
+function debouncedRender() {
+  if (renderQueued) return
+  renderQueued = true
+  setImmediate(() => { renderQueued = false; screen.render() })
+}
+
 const header = blessed.box({
-  top: 0,
-  left: 0,
-  width: '100%',
-  height: 3,
-  content: '{center}{bold}⛏  MINEFLAYER BOT CONSOLE{/bold}{/center}',
+  top: 0, left: 0, width: '100%', height: 3,
+  content: '{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}{/center}',
   tags: true,
   style: { fg: 'white', bg: 'blue' }
 })
 
 const logBox = blessed.log({
-  top: 3,
-  left: 0,
-  width: '100%',
-  height: '100%-6',
+  top: 3, left: 0, width: '100%', height: '100%-6',
   border: { type: 'line' },
   label: ' Activity Log ',
   tags: true,
   padding: { left: 1, right: 1 },
-  style: {
-    border: { fg: 'gray' },
-    label: { fg: 'cyan', bold: true }
-  },
-  scrollable: true,
-  alwaysScroll: true,
-  mouse: true,
+  style: { border: { fg: 'gray' }, label: { fg: 'cyan', bold: true } },
+  scrollable: true, alwaysScroll: true, mouse: true,
   scrollbar: { ch: '│', style: { fg: 'cyan' } }
 })
 
 const inputBox = blessed.textbox({
-  bottom: 0,
-  left: 0,
-  width: '100%',
-  height: 3,
+  bottom: 0, left: 0, width: '100%', height: 3,
   border: { type: 'line' },
   tags: true,
   style: { border: { fg: 'green' }, fg: 'white' },
@@ -54,286 +116,68 @@ screen.append(logBox)
 screen.append(inputBox)
 inputBox.focus()
 
-// Redirect everything into the log box, nothing leaks to raw terminal
+// Redirect native output into the log box — nothing leaks to raw terminal
 process.stderr.write = (chunk) => {
-  logBox.log(`{gray-fg}[stderr] ${chunk.toString().trim()}{/gray-fg}`)
-  screen.render()
+  try {
+    const text = (typeof chunk === 'string' ? chunk : chunk.toString('utf8')).trim()
+    if (text) logBox.log(`{gray-fg}[stderr] ${sanitize(text)}{/gray-fg}`)
+    debouncedRender()
+  } catch (_) {}
   return true
 }
-console.log = (...args) => { logBox.log(`{gray-fg}${args.join(' ')}{/gray-fg}`); screen.render() }
-console.warn = (...args) => { logBox.log(`{yellow-fg}[warn] ${args.join(' ')}{/yellow-fg}`); screen.render() }
-console.error = (...args) => { logBox.log(`{red-fg}[error] ${args.join(' ')}{/red-fg}`); screen.render() }
+console.log   = (...a) => { logBox.log(`{gray-fg}${sanitize(a.join(' '))}{/gray-fg}`);            debouncedRender() }
+console.warn  = (...a) => { logBox.log(`{yellow-fg}[warn] ${sanitize(a.join(' '))}{/yellow-fg}`);  debouncedRender() }
+console.error = (...a) => { logBox.log(`{red-fg}[error] ${sanitize(a.join(' '))}{/red-fg}`);       debouncedRender() }
 
 screen.key(['C-c'], () => process.exit(0))
 
 function timestamp() {
-  const d = new Date()
-  return `{gray-fg}${d.toLocaleTimeString()}{/gray-fg}`
+  return `{gray-fg}${new Date().toLocaleTimeString()}{/gray-fg}`
 }
 
-// ---- Multi-bot state ----
-const bots = {}       // username -> { bot, spawnTime, logs: [], host, port, version }
+// ── Multi-bot state ───────────────────────────────────────────────────────────
+const bots = {}       // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
 let activeId = null
+const MAX_LOG_LINES = 5000000000000
 
 function updateHeader() {
   const names = Object.keys(bots)
-  const activeLabel = activeId ? `Active: ${activeId}` : 'No active bot'
-  const others = names.filter(n => n !== activeId)
+  const activeIndex = names.indexOf(activeId) + 1
+  const activeLabel = activeId ? `Active: [${activeIndex}] ${activeId}` : 'No active bot'
+  const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` : null).filter(Boolean)
   const othersLabel = others.length ? `  |  Others: ${others.join(', ')}` : ''
-  header.setContent(`{center}{bold}⛏  MINEFLAYER BOT CONSOLE{/bold}   —   ${activeLabel}${othersLabel}{/center}`)
-  screen.render()
+  header.setContent(`{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}   —   ${activeLabel}${othersLabel}{/center}`)
+  debouncedRender()
 }
 
-/**function switchTo(id) {
-  if (!bots[id]) {
-    log(`{red-fg}✗ No bot named "${id}"{/red-fg}`)
-    return
-  }
-  activeId = id
-  logBox.setContent('')
-  bots[id].logs.forEach(line => logBox.log(line))
-  updateHeader()
-  screen.render()
-}
-*/
 function switchTo(id) {
-  if (!bots[id]) {
-    log(`{red-fg}✗ No bot named "${id}"{/red-fg}`)
-    return
-  }
+  if (!bots[id]) { log(`{red-fg}✗ No bot named "${sanitize(id)}"{/red-fg}`); return }
   activeId = id
-
-  // Clear and repopulate atomically — no looped .log() calls
   logBox.setContent('')
   logBox.scrollTo(0)
-  
-  if (bots[id].logs.length > 0) {
-    logBox.setContent(bots[id].logs.join('\n'))
-  }
-
+  if (bots[id].logs.length > 0) logBox.setContent(bots[id].logs.join('\n'))
   updateHeader()
-  
-  // Jump to bottom
   const bottom = logBox.getScrollHeight()
   if (bottom > 0) logBox.scrollTo(bottom)
-  
-  screen.render()
+  debouncedRender()
 }
-// Generic log function — writes to whichever bot ID is passed, only renders if that bot is active
+
 function logFor(id, msg) {
   if (!bots[id]) return
   const line = `${timestamp()} ${msg}`
-  bots[id].logs.push(line)
-  if (id === activeId) {
-    logBox.log(line)
-    screen.render()
-  }
+  const logs = bots[id].logs
+  logs.push(line)
+  if (logs.length > MAX_LOG_LINES) logs.splice(0, logs.length - MAX_LOG_LINES)
+  if (id === activeId) { logBox.log(line); debouncedRender() }
 }
 
-// Convenience: log to whichever bot is currently active (used by command handlers)
-function log(msg) { if (activeId) logFor(activeId, msg) }
+function log(msg)        { if (activeId) logFor(activeId, msg) }
 function logSuccess(msg) { log(`{green-fg}✓ ${msg}{/green-fg}`) }
 function logError(msg)   { log(`{red-fg}✗ ${msg}{/red-fg}`) }
 function logInfo(msg)    { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
 function logWarn(msg)    { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 
-// ---- Bot creation ----
-const HOST = 'play.fatalmc.org'
-const PORT = 25565
-const VERSION = '1.21.1'
-
-/**function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
-  const id = username
-
-  const s = (msg) => logFor(id, `{green-fg}✓ ${msg}{/green-fg}`)
-  const e = (msg) => logFor(id, `{red-fg}✗ ${msg}{/red-fg}`)
-  const i = (msg) => logFor(id, `{cyan-fg}› ${msg}{/cyan-fg}`)
-  const w = (msg) => logFor(id, `{yellow-fg}⚠ ${msg}{/yellow-fg}`)
-  const c = (msg) => logFor(id, `{white-fg}${msg}{/white-fg}`)
-
-  const bot = mineflayer.createBot({
-    host,
-    port,
-    username: id,
-    version
-  })
-
-  bots[id] = { bot, spawnTime: null, logs: [], host, port, version }
-
-  bot.once('spawn', () => {
-    bots[id].spawnTime = Date.now()
-    s(`Bot has spawned and is connected to ${host}:${port} (v${version}).`)
-
-    setTimeout(() => {
-    bot.chat('/register 123456 123456')
-    }, 270);
-
-    setTimeout(() => {
-    bot.chat('/login 123456')
-    }, 1300);
-    setTimeout(() => {
-      i('Right-clicking compass (server selector)...')
-      bot.activateItem()
-    }, 3600)
-  })
-
-  bot.on('windowOpen', (window) => {
-    i(`Window opened: ${window.title}`)
-    const targetSlot = 11
-    setTimeout(async () => {
-      try {
-        await bot.clickWindow(targetSlot, 0, 0)
-        i(`Clicked slot ${targetSlot}`)
-      } catch (err) {
-        e(`Click failed: ${err}`)
-      }
-      setTimeout(() => {
-        bot.chat('/warp afk')
-        s('Sent /warp afk')
-      }, 10000)
-    }, 2000)
-  })
-
-  bot.on('message', (jsonMsg) => c(jsonMsg.toString()))
-  bot.on('kicked', (reason) => e(`Kicked: ${JSON.stringify(reason)}`))
-  bot.on('error', (err) => e(`Error: ${err}`))
-  bot.on('end', () => w('Disconnected.'))
-
-  if (!activeId) activeId = id
-  updateHeader()
-
-  return bot
-}
-*/
-/**function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
-  const id = username
-
-  const s = (msg) => logFor(id, `{green-fg}✓ ${msg}{/green-fg}`)
-  const e = (msg) => logFor(id, `{red-fg}✗ ${msg}{/red-fg}`)
-  const i = (msg) => logFor(id, `{cyan-fg}› ${msg}{/cyan-fg}`)
-  const w = (msg) => logFor(id, `{yellow-fg}⚠ ${msg}{/yellow-fg}`)
-  const c = (msg) => logFor(id, `{white-fg}${msg}{/white-fg}`)
-
-  const bot = mineflayer.createBot({
-    host,
-    port,
-    username: id,
-    version,
-    hideErrors: true
-  })
-
-  bots[id] = { bot, spawnTime: null, logs: [], host, port, version }
-
-  // ---- Timeout tracking for cleanup ----
-  const timeouts = []
-  const pushT = (fn, delay) => {
-    const t = setTimeout(fn, delay)
-    timeouts.push(t)
-    return t
-  }
-  const clearAll = () => {
-    timeouts.forEach(clearTimeout)
-    timeouts.length = 0
-  }
-
-  // Only send chat if bot is actually spawned and socket is alive
-  const safeChat = (msg) => {
-    if (bot.entity && bot._client?.writable) bot.chat(msg)
-  }
-
-*/
-/*
-function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
-  const id = username
-  let connected = false   // <-- track real state ourselves
-
-  const s = (msg) => logFor(id, `{green-fg}✓ ${msg}{/green-fg}`)
-  const e = (msg) => logFor(id, `{red-fg}✗ ${msg}{/red-fg}`)
-  const i = (msg) => logFor(id, `{cyan-fg}› ${msg}{/cyan-fg}`)
-  const w = (msg) => logFor(id, `{yellow-fg}⚠ ${msg}{/yellow-fg}`)
-  const c = (msg) => logFor(id, `{white-fg}${msg}{/white-fg}`)
-
-  const bot = mineflayer.createBot({ host, port, username: id, version, hideErrors: true })
-
-  bots[id] = { bot, spawnTime: null, logs: [], host, port, version }
-
-  const timeouts = []
-  const pushT = (fn, delay) => { const t = setTimeout(fn, delay); timeouts.push(t); return t }
-  const clearAll = () => { timeouts.forEach(clearTimeout); timeouts.length = 0 }
-
-  const safeChat = (msg) => {
-    if (connected && bot.entity) bot.chat(msg)
-
-  }
-
-
-  bot.once('login', () => {
-    connected = true
-    i('Server accepted connection, sending auth...')
-    pushT(() => bot.chat('/register 123456 123456'), 200 + Math.random() * 300)
-    pushT(() => bot.chat('/login 123456'), 1220 + Math.random() * 400)
-  })
-
-  bot.once('spawn', () => {
-    connected = true
-    bots[id].spawnTime = Date.now()
-    s(`Bot has spawned and is connected to ${host}:${port} (v${version}).`)
-
-    pushT(() => { i('Right-clicking compass (server selector)...'); bot.activateItem() }, 3600 + Math.random() * 600)
-
-  })
- bot._client.on('error', (err) => {
-  if (err.message.includes('partial packet') || err.message.includes('Chunk size')) {
-    // Silently eat the parser error caused by the proxy transfer
-    logWarn(`Swallowed proxy transfer parser error: ${err.message}`);
-    return;
-  }
-  // Let other errors pass through
-  e(`Client Error: ${err.message}`);
-}); 
-  bot.on('windowOpen', (window) => {
-    const title = window.title?.toString ? window.title.toString() : String(window.title)
-    i(`Window opened: ${title} (${window.slots.length} slots)`)
-
-    const targetSlot = 11
-    if (targetSlot >= window.slots.length) {
-      w(`Slot ${targetSlot} out of bounds — window only has ${window.slots.length} slots`)
-      return
-    }
-    if (!window.slots[targetSlot]) {
-      w(`Slot ${targetSlot} is empty — not clicking.`)
-      return
-    }
-
-    pushT(async () => {
-      if (!bot.currentWindow) {
-        w('Window closed before click could fire.')
-        return
-      }
-      try {
-        await bot.clickWindow(targetSlot, 0, 0)
-        i(`Clicked slot ${targetSlot}`)
-      } catch (err) {
-        e(`Click failed: ${err.message || err}`)
-      }
-
-      pushT(() => {
-        safeChat('/warp afk')
-        s('Sent /warp afk')
-      }, 8000 + Math.random() * 4200)
-    }, 2000 + Math.random() * 1600)
-  })
-
-  bot.on('message', (jsonMsg) => c(jsonMsg.toString()))
- bot.on('kicked', (reason) => { connected = false; e(`Kicked: ${JSON.stringify(reason)}`); clearAll() })
-  bot.on('error', (err) => { connected = false; e(`Error: ${err.message || err}`); clearAll() })
-  bot.on('end', () => { connected = false; w('Disconnected.'); clearAll() })
-  if (!activeId) activeId = id
-  updateHeader()
-
-  return bot
-}
-*/
+// ── Bot creation ──────────────────────────────────────────────────────────────
 function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
   const id = username
   let connected = false
@@ -344,302 +188,549 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   const e = (msg) => logFor(id, `{red-fg}✗ ${msg}{/red-fg}`)
   const i = (msg) => logFor(id, `{cyan-fg}› ${msg}{/cyan-fg}`)
   const w = (msg) => logFor(id, `{yellow-fg}⚠ ${msg}{/yellow-fg}`)
-  const c = (msg) => logFor(id, `{white-fg}${msg}{/white-fg}`)
+  const c = (msg) => logFor(id, `{white-fg}${sanitize(msg)}{/white-fg}`)
 
-  // 1. Clean up existing bot listeners before re-instantiating
+  // Clean up previous instance
   if (bots[id]?.bot) {
-    bots[id].bot.removeAllListeners()
-    if (bots[id].bot._client) bots[id].bot._client.removeAllListeners()
+    try { bots[id].bot.removeAllListeners() } catch (_) {}
+    try { if (bots[id].bot._client) bots[id].bot._client.removeAllListeners() } catch (_) {}
   }
 
-  // Preserve existing log history across reconnects
   const existingLogs = bots[id]?.logs || []
+  const existingReconnectAttempts = bots[id]?.reconnectAttempts || 0
 
-  const bot = mineflayer.createBot({ host, port, username: id, version, hideErrors: true })
+  let bot
+  try {
+    bot = mineflayer.createBot({ host, port, username: id, version, hideErrors: true })
+  } catch (err) {
+    const fallback = activeId || id
+    logFor(fallback, `{red-fg}✗ Failed to create bot "${id}": ${sanitize(err.message)}{/red-fg}`)
+    return null
+  }
 
-  bots[id] = { bot, spawnTime: null, logs: existingLogs, host, port, version }
+  bot.loadPlugin(armorManager)
 
+  bots[id] = {
+    bot, spawnTime: null, logs: existingLogs, host, port, version,
+    reconnectAttempts: existingReconnectAttempts,
+    lastKickReason: null,
+    lastDisconnectReason: null      // stores raw error text for transfer-crash classification
+  }
+
+  // Managed timers — all cleared on disconnect so nothing fires against a dead bot
   const timeouts = []
   const pushT = (fn, delay) => { const t = setTimeout(fn, delay); timeouts.push(t); return t }
   const clearAll = () => { timeouts.forEach(clearTimeout); timeouts.length = 0 }
 
-  const scheduleReconnect = (reason) => {
+  // Detect whether a disconnect was caused by a Velocity proxy transfer crash
+  function isProxyCrash(reason) {
+    if (!reason) return false
+    const text = typeof reason === 'string' ? reason : (reason.message || String(reason))
+    return PROXY_CRASH_PATTERNS.some(re => re.test(text))
+  }
+
+  const scheduleReconnect = (reason, rawError) => {
     clearAll()
     connected = false
     if (manualDisconnect || reconnectTimer) return
 
-    const delay = 8000 + Math.floor(Math.random() * 3000)
-    w(`${reason}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s...`)
+    const proxyCrash = isProxyCrash(rawError || reason)
+    const attempt = bots[id]?.reconnectAttempts || 0
+
+    let delay
+    if (proxyCrash) {
+      // Proxy transfer crash → fast flat reconnect, don't increment backoff
+      delay = FAST_RECONNECT_MS
+      w(`${reason} (proxy transfer crash detected). Reconnecting in ${(delay / 1000).toFixed(1)}s…`)
+    } else {
+      // Real kick / unknown error → exponential backoff
+      delay = Math.min(RECONNECT_BASE_MS * Math.pow(1.3, attempt), RECONNECT_MAX_MS)
+      if (bots[id]) bots[id].reconnectAttempts = attempt + 1
+      w(`${reason}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s (Attempt ${attempt + 1})…`)
+    }
 
     reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
       createBotInstance(id, host, port, version)
     }, delay)
   }
 
   const safeChat = (msg) => {
-    if (connected && bot.entity) bot.chat(msg)
+    if (!connected || !bot.entity) return false
+    try { bot.chat(msg); return true } catch (err) {
+      logFor(id, `{red-fg}[chat] Failed: ${sanitize(err.message)}{/red-fg}`)
+      return false
+    }
   }
 
-  // 2. Auth triggers immediately on socket connection
+  // ── Lifecycle events ─────────────────────────────────
   bot.once('login', () => {
-    i('Connected to server socket. Sending auth commands...')
-    // pushT(() => bot.chat('/register 123456 123456'), 200 + Math.random() * 300) must register accounts manually
-    pushT(() => bot.chat('/login 123456'), 2220 + Math.random() * 400)
+    i('Connected to server socket. Sending auth…')
+
+    pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 0 + Math.random() * 400)
+    pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 2220 + Math.random() * 400)
   })
 
-  // 3. World interactions trigger only after physical spawn
   bot.once('spawn', () => {
     connected = true
-    bots[id].spawnTime = Date.now()
-    s(`Bot has spawned and is connected to ${host}:${port} (v${version}).`)
+    if (bots[id]) bots[id].spawnTime = Date.now()
+    s(`Spawned on ${host}:${port} (v${version}).`)
 
-    pushT(() => { 
-      i('Right-clicking compass (server selector)...')
-      bot.activateItem() 
+    // Stable for 60 s → reset backoff
+    pushT(() => { if (connected && bots[id]) bots[id].reconnectAttempts = 0 }, 60_000)
+
+    pushT(() => {
+      i('Right-clicking compass (server selector)…')
+      try { bot.activateItem() } catch (err) { e(`activateItem failed: ${sanitize(err.message)}`) }
     }, 3600 + Math.random() * 600)
   })
 
-  // 4. GUI Navigation
   bot.on('windowOpen', (window) => {
-    const title = window.title?.toString ? window.title.toString() : String(window.title)
-    i(`Window opened: ${title} (${window.slots.length} slots)`)
+    try {
+      const title = window.title?.toString ? window.title.toString() : String(window.title || '')
+      i(`Window opened: ${sanitize(title)} (${window.slots.length} slots)`)
 
-    const targetSlot = 11
-    if (targetSlot >= window.slots.length) {
-      w(`Slot ${targetSlot} out of bounds — window only has ${window.slots.length} slots`)
-      return
-    }
-    if (!window.slots[targetSlot]) {
-      w(`Slot ${targetSlot} is empty — not clicking.`)
-      return
-    }
-
-    pushT(async () => {
-      if (!bot.currentWindow) {
-        w('Window closed before click could fire.')
+      if (GUI_SLOT >= window.slots.length) {
+        w(`Slot ${GUI_SLOT} out of bounds — window only has ${window.slots.length} slots`)
         return
       }
-      try {
-        await bot.clickWindow(targetSlot, 0, 0)
-        i(`Clicked slot ${targetSlot}`)
-      } catch (err) {
-        e(`Click failed: ${err.message || err}`)
+      if (!window.slots[GUI_SLOT]) {
+        w(`Slot ${GUI_SLOT} is empty — not clicking.`)
+        return
       }
 
-      pushT(() => {
-        safeChat('/warp afk')
-        s('Sent /warp afk')
-      }, 8000 + Math.random() * 4200)
-    }, 2000 + Math.random() * 1600)
+      pushT(async () => {
+        if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
+        try {
+          await bot.clickWindow(GUI_SLOT, 0, 0)
+          i(`Clicked slot ${GUI_SLOT} — waiting for server transfer…`)
+        } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
+      }, 2000 + Math.random() * 1600)
+    } catch (err) { e(`windowOpen handler error: ${sanitize(err.message)}`) }
   })
 
-  // 5. Output logging & automatic reconnection trigger
-  bot.on('message', (jsonMsg) => c(jsonMsg.toString()))
-  bot.on('kicked', (reason) => e(`Kicked: ${JSON.stringify(reason)}`))
-  bot.on('error', (err) => e(`Error: ${err.message || err}`))
-  
-  bot.on('end', () => {
+  bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
+
+  bot.on('kicked', (reason) => {
+    let text
+    try { text = typeof reason === 'string' ? reason : JSON.stringify(reason) } catch (_) { text = 'unknown' }
+    if (bots[id]) {
+      bots[id].lastKickReason = text
+      bots[id].lastDisconnectReason = text
+    }
+    e(`Kicked: ${sanitize(text)}`)
+  })
+
+  // ── Velocity / proxy packet-level error interception ────────────────────────
+  // Mineflayer's high-level 'error' event only fires for some failures.
+  // Protocol-layer crashes (partial packets, bad decompression) surface on the
+  // raw _client *before* the bot 'end' event.  We catch them here to:
+  //   1. Log them clearly instead of crashing
+  //   2. Store the raw error so scheduleReconnect can classify it as a
+  //      proxy transfer crash and use the fast reconnect path.
+  let lastRawError = null
+
+  bot.on('error', (err) => {
+    lastRawError = err
+    if (bots[id]) bots[id].lastDisconnectReason = err.message || String(err)
+    const proxyCrash = isProxyCrash(err)
+    if (proxyCrash) {
+      w(`Proxy packet error (will auto-reconnect): ${sanitize(err.message || String(err))}`)
+    } else {
+      e(`Error: ${sanitize(err.message || String(err))}`)
+    }
+  })
+
+  // Intercept _client-level errors — these fire for deserialization / zlib
+  // failures that don't always propagate to the bot 'error' event.
+  if (bot._client) {
+    bot._client.on('error', (err) => {
+      lastRawError = err
+      if (bots[id]) bots[id].lastDisconnectReason = err.message || String(err)
+      const proxyCrash = isProxyCrash(err)
+      if (proxyCrash) {
+        w(`Protocol-level crash (transfer?): ${sanitize(err.message || String(err))}`)
+      } else {
+        e(`Client error: ${sanitize(err.message || String(err))}`)
+      }
+    })
+  }
+
+  bot.on('end', (reason) => {
     connected = false
-    w('Disconnected.')
-    scheduleReconnect('Connection lost')
+    const reasonText = reason ? String(reason) : ''
+    w(`Disconnected${reasonText ? ': ' + sanitize(reasonText) : ''}.`)
+    // Pass the last captured raw error so the reconnect logic can classify it
+    scheduleReconnect('Connection lost', lastRawError || reasonText)
+    lastRawError = null
   })
 
-  // 6. Manual disconnect method attached to object
   bots[id].disconnectManually = () => {
     manualDisconnect = true
-    if (reconnectTimer) clearTimeout(reconnectTimer)
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
     clearAll()
-    bot.quit()
+    try { bot.quit() } catch (_) {}
   }
 
   if (!activeId) activeId = id
   updateHeader()
-
   return bot
 }
 
-const BOT_NAMES = [
-  'OnlyAProgrammer',
-  'Jt2S1m3ePer',
-  'BilihJm289',
-  '1evArchUsr2',
-  'LnuxOtocael',
-  'DevArchUsr99',   // 12 letters
-  'PgrMrJt3S21m',   // 12 letters
-  'LnuxSysOp808',   // 12 letters
-  'NvimScriptr1',   // 12 letters
-  'CplusplusDev7'   // 13 letters
-]
-
-const CONNECT_DELAY_MS = 39500  // tweak this if needed (3-5s usually safe)
-
+// ── Connect all bots with staggered delay ─────────────────────────────────────
 BOT_NAMES.forEach((name, index) => {
   setTimeout(() => {
     createBotInstance(name)
-    if (index === 0) switchTo(name)  // switch to first once it starts
+    if (index === 0) switchTo(name)
   }, index * CONNECT_DELAY_MS)
 })
 
-
+// ── Command registry ──────────────────────────────────────────────────────────
 const COMMANDS = {
-  '/chat': 'Alternative to chatting, so therefore you can do commmands like /help without using client side one',
-  '/disconnect': 'Disconnects the current bot, but doesnt exit the other bots, or just use dc as an alias',
-  '/clear': 'Clear the current bot\'s log view',
-  '/help': 'List all available commands',
-  '/status': 'Show active bot connection, position, health, ping, uptime',
-  '/inv': 'List active bot\'s inventory contents',
-  '/players': 'List players online (from active bot\'s perspective)',
-  '/exit': 'Disconnect all bots and close the program',
-  '/reconnect': 'Reconnect the active bot',
-  '/new-bot [username] [host] [port] [version]': 'Create and connect a new bot (host/port/version optional, defaults to the main server)',
-  '/switch [username]': 'Switch the TUI view to a different connected bot (does not disconnect anything)',
-  'anything else': 'Sent directly as a chat message/command from the active bot'
+  '/all <cmd>':      'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
+  '/overview':       'Dashboard of every bot\'s health, food, ping, and shard count',
+  '/list':           'Compact one-line-per-bot status list (online / offline / last kick)',
+  '/chat <msg>':     'Send a chat message from the active bot (avoids triggering local commands)',
+  '/disconnect':     'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
+  '/clear':          'Clear the active bot\'s log view',
+  '/help':           'List all available commands',
+  '/status':         'Show active bot\'s connection, position, health, ping, uptime',
+  '/inv':            'List active bot\'s inventory',
+  '/players':        'List players online from the active bot\'s perspective',
+  '/exit':           'Disconnect all bots and close the program',
+  '/reconnect':      'Reconnect the active bot',
+  '/reconnect-all':  'Reconnect every currently disconnected bot',
+  '/new-bot <name> [host] [port] [ver]': 'Create and connect a new bot',
+  '/switch <id>':    'Switch view to a different bot by name or number',
+  '/uptime':         'Show uptime for all bots',
+  'anything else':   'Sent directly as a chat message/command from the active bot'
+}
+
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dc', '/reconnect']
+
+function runLocalCommandForBot(id, cmd) {
+  const entry = bots[id]
+  if (!entry) return false
+  const { bot } = entry
+
+  switch (cmd) {
+    case '/status': {
+      if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+      const pos = bot.entity.position
+      const uptimeSec = entry.spawnTime ? Math.floor((Date.now() - entry.spawnTime) / 1000) : 0
+      logFor(id, `{cyan-fg}› Status for ${id}:{/cyan-fg}`)
+      logFor(id, `  Server: ${entry.host}:${entry.port} (v${entry.version})`)
+      logFor(id, `  Position: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`)
+      logFor(id, `  Health: ${bot.health ?? 'N/A'}  Food: ${bot.food ?? 'N/A'}`)
+      logFor(id, `  Ping: ${bot.player?.ping ?? 'N/A'}ms`)
+      logFor(id, `  Uptime: ${uptimeSec}s`)
+      return true
+    }
+
+    case '/inv': {
+      if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+      const items = bot.inventory.items()
+      if (items.length === 0) {
+        logFor(id, `{cyan-fg}› Inventory is empty.{/cyan-fg}`)
+      } else {
+        logFor(id, `{cyan-fg}› Inventory for ${id}:{/cyan-fg}`)
+        items.forEach(item => logFor(id, `  ${item.count}x ${sanitize(item.displayName || item.name)} (slot ${item.slot})`))
+      }
+      return true
+    }
+
+    case '/players': {
+      if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+      const players = Object.keys(bot.players)
+      logFor(id, `{cyan-fg}› Players online (${players.length}):{/cyan-fg}`)
+      players.forEach(name => logFor(id, `  ${sanitize(name)}`))
+      return true
+    }
+
+    case '/clear': {
+      entry.logs = []
+      if (id === activeId) { logBox.setContent(''); debouncedRender() }
+      return true
+    }
+
+    case '/disconnect':
+    case '/dc': {
+      logFor(id, `{yellow-fg}⚠ Disconnecting ${id}…{/yellow-fg}`)
+      try { entry.disconnectManually() } catch (_) {}
+      return true
+    }
+
+    case '/reconnect': {
+      const { host, port, version } = entry
+      logFor(id, `{yellow-fg}⚠ Reconnecting ${id}…{/yellow-fg}`)
+      try { entry.disconnectManually() } catch (_) {}
+      setTimeout(() => createBotInstance(id, host, port, version), 1000)
+      return true
+    }
+
+    default:
+      return false
+  }
+}
+
+function queryShards(id, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const entry = bots[id]
+    if (!entry?.bot?.entity) { resolve(null); return }
+    const bot = entry.bot
+
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      bot.removeListener('message', onMessage)
+      clearTimeout(timer)
+      resolve(value)
+    }
+
+    const onMessage = (jsonMsg) => {
+      try {
+        const text = jsonMsg.toString()
+        const match = text.match(/Shards.{0,10}Balance:?\s*([\d,]+)/i)
+        if (match) finish(parseInt(match[1].replace(/,/g, ''), 10))
+      } catch (_) {}
+    }
+
+    const timer = setTimeout(() => finish(null), timeoutMs)
+    bot.on('message', onMessage)
+    try { bot.chat('/shards') } catch (_) { finish(null) }
+  })
+}
+
+function formatUptime(ms) {
+  if (!ms || ms <= 0) return '0s'
+  const s = Math.floor(ms / 1000)
+  const parts = []
+  if (s >= 3600)       parts.push(`${Math.floor(s / 3600)}h`)
+  if (s % 3600 >= 60)  parts.push(`${Math.floor((s % 3600) / 60)}m`)
+  parts.push(`${s % 60}s`)
+  return parts.join(' ')
 }
 
 function handleCommand(trimmed) {
+  // ── /all ────────────────────────────────────
+  if (trimmed.startsWith('/all ')) {
+    const msg = trimmed.slice(5).trim()
+    if (!msg) { logWarn('Usage: /all <command or message>'); return }
+    const baseCmd = msg.split(' ')[0]
+
+    if (LOCAL_COMMANDS.includes(baseCmd)) {
+      logInfo(`{yellow-fg}Running "${baseCmd}" locally on all bots:{/yellow-fg}`)
+      let count = 0
+      Object.keys(bots).forEach(id => { if (runLocalCommandForBot(id, baseCmd)) count++ })
+      logSuccess(`Ran "${baseCmd}" on ${count} bots.`)
+      return
+    }
+
+    logInfo(`{yellow-fg}Broadcasting to all bots:{/yellow-fg} ${sanitize(msg)}`)
+    let sent = 0
+    Object.entries(bots).forEach(([, { bot }]) => {
+      if (bot?.entity) { try { bot.chat(msg); sent++ } catch (_) {} }
+    })
+    logSuccess(`Broadcasted to ${sent} bots.`)
+    return
+  }
+
+  // ── /overview ───────────────────────────────
+  if (trimmed === '/overview') {
+    const names = Object.keys(bots)
+    logInfo('{bold}── Bot Overview Dashboard ──{/bold}')
+    logInfo('Querying shard counts…')
+
+    Promise.all(names.map(name => {
+      if (!bots[name]?.bot?.entity) return Promise.resolve({ name, shards: null })
+      return queryShards(name).then(shards => ({ name, shards }))
+    })).then(results => {
+      results.forEach(({ name, shards }, idx) => {
+        const b = bots[name]
+        if (b?.bot?.entity) {
+          const hp   = Math.round(b.bot.health || 0)
+          const food = Math.round(b.bot.food || 0)
+          const ping = b.bot.player?.ping ?? '?'
+          const sh   = shards !== null ? shards.toLocaleString() : 'N/A'
+          log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Shards: ${sh}`)
+        } else {
+          log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{/gray-fg}`)
+        }
+      })
+    }).catch(err => logError(`Overview failed: ${sanitize(err.message)}`))
+    return
+  }
+
+  // ── /list ───────────────────────────────────
+  if (trimmed === '/list') {
+    const names = Object.keys(bots)
+    logInfo(`{bold}── Bots (${names.length}) ──{/bold}`)
+    names.forEach((name, idx) => {
+      const b = bots[name]
+      if (b?.bot?.entity) {
+        const up = formatUptime(b.spawnTime ? Date.now() - b.spawnTime : 0)
+        log(`  [${idx + 1}] {cyan-fg}${name}{/cyan-fg}  {green-fg}● Online{/green-fg}  (${up})`)
+      } else {
+        const kick = b?.lastKickReason ? `  — last kick: ${sanitize(b.lastKickReason).slice(0, 60)}` : ''
+        log(`  [${idx + 1}] {cyan-fg}${name}{/cyan-fg}  {red-fg}○ Offline{/red-fg}${kick}`)
+      }
+    })
+    return
+  }
+
+  // ── /uptime ─────────────────────────────────
+  if (trimmed === '/uptime') {
+    const names = Object.keys(bots)
+    logInfo('{bold}── Uptime ──{/bold}')
+    names.forEach((name, idx) => {
+      const b = bots[name]
+      const up = (b?.bot?.entity && b.spawnTime) ? formatUptime(Date.now() - b.spawnTime) : '{gray-fg}offline{/gray-fg}'
+      log(`  [${idx + 1}] {cyan-fg}${name}{/cyan-fg} — ${up}`)
+    })
+    return
+  }
+
+  // ── /reconnect-all ──────────────────────────
+  if (trimmed === '/reconnect-all') {
+    let count = 0
+    Object.entries(bots).forEach(([id, entry]) => {
+      if (!entry.bot?.entity) {
+        const { host, port, version } = entry
+        try { entry.disconnectManually() } catch (_) {}
+        setTimeout(() => createBotInstance(id, host, port, version), 1000 + count * 2000)
+        count++
+      }
+    })
+    if (count === 0) logInfo('All bots are already online.')
+    else logSuccess(`Reconnecting ${count} offline bot(s)…`)
+    return
+  }
+
+
+
+  // ── /chat ───────────────────────────────────
   if (trimmed.startsWith('/chat ')) {
     const msg = trimmed.slice(6).trim()
     if (!activeId) { logWarn('No active bot.'); return }
     if (!msg) { logWarn('Usage: /chat <message>'); return }
-    bots[activeId].bot.chat(msg)
-    log(`{green-fg}❯{/green-fg} Chat: ${msg}`)
+    try { bots[activeId].bot.chat(msg) } catch (err) { logError(`Chat failed: ${sanitize(err.message)}`); return }
+    log(`{green-fg}❯{/green-fg} Chat: ${sanitize(msg)}`)
     return
   }
+
+  // ── /new-bot ────────────────────────────────
   if (trimmed.startsWith('/new-bot ')) {
     const args = trimmed.slice(9).trim().split(/\s+/).filter(Boolean)
     const username = args[0]
-
-    if (!username) { logWarn('Usage: /new-bot [username] [host] [port] [version]'); return }
+    if (!username) { logWarn('Usage: /new-bot <username> [host] [port] [version]'); return }
     if (bots[username]) { logWarn(`Bot "${username}" already exists.`); return }
-
-    const host = args[1] || HOST
-    const port = args[2] ? parseInt(args[2], 10) : PORT
-    const version = args[3] || VERSION
-
-    logInfo(`Creating new bot: ${username} @ ${host}:${port} (v${version})`)
-    createBotInstance(username, host, port, version)
+    const h = args[1] || HOST
+    const p = args[2] ? parseInt(args[2], 10) : PORT
+    const v = args[3] || VERSION
+    logInfo(`Creating new bot: ${username} @ ${h}:${p} (v${v})`)
+    createBotInstance(username, h, p, v)
     return
   }
 
+  // ── /switch ─────────────────────────────────
   if (trimmed.startsWith('/switch ')) {
-    const username = trimmed.slice(8).trim()
-    switchTo(username)
+    const arg = trimmed.slice(8).trim()
+    if (/^\d+$/.test(arg)) {
+      const index = parseInt(arg, 10) - 1
+      const names = Object.keys(bots)
+      if (names[index]) switchTo(names[index])
+      else logWarn(`No bot at index [${arg}]. Valid: 1–${names.length}`)
+    } else {
+      switchTo(arg)
+    }
+    return
+  }
+
+  // ── Single-bot local commands ───────────────
+  if (activeId && LOCAL_COMMANDS.includes(trimmed)) {
+    runLocalCommandForBot(activeId, trimmed)
     return
   }
 
   switch (trimmed) {
-    case '/clear':
-      if (activeId) bots[activeId].logs = []
-      logBox.setContent('')
-      screen.render()
-      break
-
     case '/help':
-      logInfo('Available commands:')
-      Object.entries(COMMANDS).forEach(([cmd, desc]) => {
-        log(`  {cyan-fg}${cmd}{/cyan-fg} — ${desc}`)
-      })
+      logInfo('{bold}Available commands:{/bold}')
+      Object.entries(COMMANDS).forEach(([cmd, desc]) => log(`  {cyan-fg}${cmd}{/cyan-fg} — ${desc}`))
       break
 
-    case '/status': {
-      if (!activeId) { logWarn('No active bot.'); break }
-      const { bot, spawnTime, host, port, version } = bots[activeId]
-      if (!bot.entity) { logWarn(`${activeId} is not currently spawned.`); break }
-      const pos = bot.entity.position
-      const uptimeSec = spawnTime ? Math.floor((Date.now() - spawnTime) / 1000) : 0
-      logInfo(`Status for ${activeId}:`)
-      log(`  Server: ${host}:${port} (v${version})`)
-      log(`  Position: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`)
-      log(`  Health: ${bot.health ?? 'N/A'}  Food: ${bot.food ?? 'N/A'}`)
-      log(`  Ping: ${bot.player?.ping ?? 'N/A'}ms`)
-      log(`  Uptime: ${uptimeSec}s`)
-      break
-    }
-
-        case '/bots': {
-      const names = Object.keys(bots)
-      if (names.length === 0) {
-        logWarn('No bots connected.')
-      } else {
-        logInfo(`Connected bots (${names.length}):`)
-        names.forEach(name => {
-          const marker = name === activeId ? '{yellow-fg}⭐{/yellow-fg} ' : '  '
-          const status = bots[name].spawnTime ? '{green-fg}online{/green-fg}' : '{gray-fg}connecting{/gray-fg}'
-          log(`  ${marker}{cyan-fg}${name}{/cyan-fg} — ${status}`)
-        })
-      }
-      break
-    }
-    case '/inv': {
-      if (!activeId) { logWarn('No active bot.'); break }
-      const items = bots[activeId].bot.inventory.items()
-      if (items.length === 0) {
-        logInfo('Inventory is empty.')
-      } else {
-        logInfo(`Inventory for ${activeId}:`)
-        items.forEach(item => log(`  ${item.count}x ${item.displayName || item.name} (slot ${item.slot})`))
-      }
-      break
-    }
-
-    case '/players': {
-      if (!activeId) { logWarn('No active bot.'); break }
-      const players = Object.keys(bots[activeId].bot.players)
-      logInfo(`Players online (${players.length}):`)
-      players.forEach(name => log(`  ${name}`))
-      break
-    }
-
-    case '/disconnect':
-    case '/dc': { // Allowing /dc as a quick alias
-      if (!activeId) { 
-        logWarn('No active bot to disconnect.')
-        break 
-      }
-      
-      const targetBot = bots[activeId].bot
-      if (targetBot && targetBot._client) {
-        logWarn(`Disconnecting ${activeId}...`)
-        targetBot.quit()
-        // Your existing bot.on('end') event will automatically fire 
-        // to handle state cleanup and log "Disconnected."
-      } else {
-        logWarn(`${activeId} is already disconnected.`)
-      }
-      break
-    }
     case '/exit':
-      logWarn('Exiting all bots...')
-      Object.values(bots).forEach(({ bot }) => bot.quit())
+      logWarn('Exiting all bots…')
+      Object.values(bots).forEach(({ bot }) => { try { bot.quit() } catch (_) {} })
       setTimeout(() => process.exit(0), 300)
       break
 
-    case '/reconnect': {
-      if (!activeId) { logWarn('No active bot.'); break }
-      const idToReconnect = activeId
-      const { host, port, version } = bots[idToReconnect]
-      logWarn(`Reconnecting ${idToReconnect}...`)
-      bots[idToReconnect].bot.removeAllListeners()
-      bots[idToReconnect].bot.quit()
-      setTimeout(() => createBotInstance(idToReconnect, host, port, version), 1000)
-      break
-    }
-
     default:
       if (!activeId) { logWarn('No active bot.'); break }
-      bots[activeId].bot.chat(trimmed)
-      log(`{green-fg}❯{/green-fg} Sent: ${trimmed}`)
+      try { bots[activeId].bot.chat(trimmed) } catch (err) { logError(`Chat failed: ${sanitize(err.message)}`); break }
+      log(`{green-fg}❯{/green-fg} Sent: ${sanitize(trimmed)}`)
   }
 }
 
-// ---- Input handling ----
+// ── Input handling & History ──────────────────────────────────────────────────
+const commandHistory = []
+let historyIndex = -1
+
+inputBox.key('up', () => {
+  if (historyIndex < commandHistory.length - 1) {
+    historyIndex++
+    inputBox.setValue(commandHistory[commandHistory.length - 1 - historyIndex])
+    debouncedRender()
+  }
+})
+
+inputBox.key('down', () => {
+  if (historyIndex > 0) {
+    historyIndex--
+    inputBox.setValue(commandHistory[commandHistory.length - 1 - historyIndex])
+    debouncedRender()
+  } else if (historyIndex === 0) {
+    historyIndex = -1
+    inputBox.setValue('')
+    debouncedRender()
+  }
+})
+
+inputBox.key('tab', () => {
+  const val = inputBox.getValue()
+  if (val.startsWith('/')) {
+    const available = Object.keys(COMMANDS)
+    const prefix = val.split(' ')[0]
+    const matches = available.filter(c => c.startsWith(prefix))
+    if (matches.length === 1) {
+      // Strip parameter hints (e.g. "/warp <place>" → "/warp ")
+      const base = matches[0].replace(/ [<\[].*$/, '')
+      inputBox.setValue(base + ' ')
+      debouncedRender()
+    } else if (matches.length > 1) {
+      logInfo(`{cyan-fg}Matches:{/cyan-fg} ${matches.map(m => m.split(' ')[0]).join(', ')}`)
+    }
+  }
+})
+
 inputBox.on('submit', (input) => {
-  const trimmed = input.trim()
+  const trimmed = (input || '').trim()
   inputBox.clearValue()
   inputBox.focus()
-  screen.render()
-  if (trimmed.length > 0) handleCommand(trimmed)
+  debouncedRender()
+
+  if (trimmed.length > 0) {
+    if (commandHistory[commandHistory.length - 1] !== trimmed) commandHistory.push(trimmed)
+    historyIndex = -1
+    handleCommand(trimmed)
+  }
+})
+
+// Escape key can cause neo-blessed to stop reading input — re-focus immediately
+inputBox.on('cancel', () => {
+  inputBox.clearValue()
+  inputBox.focus()
+  debouncedRender()
 })
 
 screen.render()
-

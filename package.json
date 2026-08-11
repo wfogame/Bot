@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "blessed": "^0.1.81",
+    "dotenv": "^17.4.2",
     "minecraft-data": "^3.113.0",
     "mineflayer": "^4.37.1",
     "mineflayer-armor-manager": "^2.0.1",
