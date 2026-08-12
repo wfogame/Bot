@@ -1,26 +1,28 @@
-
 require('dotenv').config()                        // npm install dotenv
+const net          = require('net')
 const mineflayer   = require('mineflayer')
 const blessed      = require('neo-blessed')
 const armorManager = require('mineflayer-armor-manager')
+let SocksClient
+try { ({ SocksClient } = require('socks')) } catch (_) { /* npm install socks */ }
 
 // ── .env config (with sane defaults) ──────────────────────────────────────────
 const HOST             = process.env.HOST             || 'play.fatalmc.org'
 const PORT             = parseInt(process.env.PORT    || '25565', 10)
 const VERSION          = process.env.VERSION          || '1.21.1'
 const LOGIN_PASSWORD   = process.env.LOGIN_PASSWORD   || '123456'
-const BOT_NAMES_ENV    = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 
-const BOT_NAMES = [
-  'S3gF4ult_0x00',
-  'Hypr_P4ck3t_X',
-  'Nul1_P01nt3r',
-  'H3adl3ss_T1ck',
-  'F1shyShellArch'
-]
-
+// Custom env variable for RTP bot names, with fallback defaults
+const DEFAULT_BOTS     = 'S3gF4ult_0x00, Hypr_P4ck3t_X, Nul1_P01nt3r, H3adl3ss_T1ck, F1shyShellArch'
+const BOT_NAMES        = (process.env.BOT_RTP_BOTS || DEFAULT_BOTS).split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
+
+// ── Outbound proxy config ──────────────────────────────────────────────────────
+const PROXY_HOST       = process.env.PROXY_HOST       || ''
+const PROXY_PORT       = parseInt(process.env.PROXY_PORT || '1080', 10)
+const PROXY_TYPE       = (process.env.PROXY_TYPE || 'socks5').toLowerCase() // 'socks5' | 'http'
+const PROXY_ENABLED    = Boolean(PROXY_HOST)
 
 // ── Discord alert config ──────────────────────────────────────────────────────
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1536063570859786383/fJihPygSzeQfWT5mHHGv8riec0cE0ajbxCotcoHj91AJLqpraOCUwOlrUq5230JCcCVL'
@@ -68,12 +70,6 @@ const RECONNECT_BASE_MS  = 8000
 const RECONNECT_MAX_MS   = 5 * 60_000
 
 // ── Memory limits ─────────────────────────────────────────────────────────────
-// Per-bot log buffer kept in JS.  blessed's logBox has its OWN internal buffer
-// controlled by the `scrollback` option (set on the widget below).  Both must
-// be capped or the process will eventually OOM / crash.
-//
-// 5 000 lines × ~200 bytes × 20 bots ≈ 20 MB in our arrays.
-// blessed's logBox scrollback is set to the same value.
 const MAX_LOG_LINES        = 5000000000000
 const MAX_RTP_HISTORY_SIZE = 5000000000000
 
@@ -96,6 +92,74 @@ async function drainDiscordQueue() {
 function enqueueDiscord(asyncFn) {
   discordQueue.push(asyncFn)
   drainDiscordQueue()
+}
+
+// ── Outbound proxy tunnelling ──────────────────────────────────────────────────
+function makeSocksConnect(targetHost, targetPort, onLog) {
+  return (client) => {
+    if (!SocksClient) {
+      client.emit('error', new Error('PROXY_TYPE=socks5 requires the "socks" package — run: npm install socks'))
+      return
+    }
+    onLog?.(`Tunnelling through SOCKS5 proxy ${PROXY_HOST}:${PROXY_PORT}…`)
+    SocksClient.createConnection({
+      proxy: { host: PROXY_HOST, port: PROXY_PORT, type: 5 },
+      command: 'connect',
+      destination: { host: targetHost, port: targetPort }
+    }).then(({ socket }) => {
+      client.setSocket(socket)
+      client.emit('connect')
+    }).catch(err => {
+      client.emit('error', new Error(`SOCKS5 proxy connection failed: ${err.message}`))
+    })
+  }
+}
+
+function makeHttpConnect(targetHost, targetPort, onLog) {
+  return (client) => {
+    onLog?.(`Tunnelling through HTTP proxy ${PROXY_HOST}:${PROXY_PORT}…`)
+    const socket = net.connect(PROXY_PORT, PROXY_HOST, () => {
+      socket.write(
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+        `Host: ${targetHost}:${targetPort}\r\n` +
+        `Connection: keep-alive\r\n\r\n`
+      )
+    })
+
+    let buffer = ''
+    const onData = (chunk) => {
+      buffer += chunk.toString('latin1')
+      const headerEnd = buffer.indexOf('\r\n\r\n')
+      if (headerEnd === -1) return
+      socket.removeListener('data', onData)
+
+      const statusLine = buffer.slice(0, buffer.indexOf('\r\n'))
+      const match = statusLine.match(/^HTTP\/\d\.\d (\d{3})/)
+      const statusCode = match ? parseInt(match[1], 10) : null
+
+      if (statusCode !== 200) {
+        socket.destroy()
+        client.emit('error', new Error(`HTTP proxy CONNECT failed: ${statusLine || 'no response from proxy'}`))
+        return
+      }
+
+      const leftover = buffer.slice(headerEnd + 4)
+      if (leftover.length) socket.unshift(Buffer.from(leftover, 'latin1'))
+
+      client.setSocket(socket)
+      client.emit('connect')
+    }
+
+    socket.on('data', onData)
+    socket.on('error', (err) => client.emit('error', new Error(`HTTP proxy connection failed: ${err.message}`)))
+  }
+}
+
+function makeProxyConnect(targetHost, targetPort, onLog) {
+  if (!PROXY_ENABLED) return undefined
+  return PROXY_TYPE === 'http'
+    ? makeHttpConnect(targetHost, targetPort, onLog)
+    : makeSocksConnect(targetHost, targetPort, onLog)
 }
 
 // ── Global crash guards ──────────────────────────────────────────────────────
@@ -122,26 +186,19 @@ function sanitize(str) {
 }
 
 // ── TUI setup ────────────────────────────────────────────────────────────────
-const screen = blessed.screen({ smartCSR: true, title: 'Mineflayer Bot Console', fullUnicode: true })
+const screen = blessed.screen({ smartCSR: true, title: 'Mineflayer RTP Console', fullUnicode: true })
 
 function focusCommandInput() {
-  if (screen.focused !== inputBox) {
-    inputBox.focus()
-  }
+  if (screen.focused !== inputBox) inputBox.focus()
 }
+
 screen.on('keypress', (ch, key) => {
   if (!key) return
-
-  // Keep normal keyboard input going to the command box.
-  // Mouse interaction can still be used for the log.
-  if (
-    key.name !== 'mouse' &&
-    key.name !== 'escape' &&
-    screen.focused !== inputBox
-  ) {
+  if (key.name !== 'mouse' && key.name !== 'escape' && screen.focused !== inputBox) {
     inputBox.focus()
   }
 })
+
 let renderQueued = false
 function debouncedRender() {
   if (renderQueued) return
@@ -151,7 +208,7 @@ function debouncedRender() {
 
 const header = blessed.box({
   top: 0, left: 0, width: '100%', height: 3,
-  content: '{center}{bold}⛏  MINEFLAYER BOT CONSOLE{/bold}{/center}',
+  content: '{center}{bold}⛏  MINEFLAYER RTP CONSOLE{/bold}{/center}',
   tags: true,
   style: { fg: 'white', bg: 'blue' }
 })
@@ -165,10 +222,6 @@ const logBox = blessed.log({
   style: { border: { fg: 'gray' }, label: { fg: 'cyan', bold: true } },
   scrollable: true, alwaysScroll: true, mouse: true,
   scrollbar: { ch: '│', style: { fg: 'cyan' } },
-  // ── THIS IS THE KEY CRASH FIX ──
-  // blessed.log keeps its own internal line buffer (_clines).
-  // Without a scrollback cap it grows forever and eventually crashes
-  // when blessed tries to render/diff millions of stored lines.
   scrollback: MAX_LOG_LINES
 })
 
@@ -190,7 +243,6 @@ if (typeof fetch !== 'function') {
   logBox.log('{red-fg}[startup] Global fetch not found — Node 18+ is required for Discord webhook alerts.{/red-fg}')
 }
 
-// Redirect native output into the log box
 process.stderr.write = (chunk) => {
   try {
     const text = (typeof chunk === 'string' ? chunk : chunk.toString('utf8')).trim()
@@ -220,7 +272,8 @@ function updateHeader() {
   const activeLabel = activeId ? `Active: [${activeIndex}] ${activeId}` : 'No active bot'
   const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` : null).filter(Boolean)
   const othersLabel = others.length ? `  |  Others: ${others.join(', ')}` : ''
-  header.setContent(`{center}{bold}⛏  MINEFLAYER BOT CONSOLE{/bold}   —   ${activeLabel}${othersLabel}{/center}`)
+  const proxyLabel = PROXY_ENABLED ? `   —   Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
+  header.setContent(`{center}{bold}⛏  MINEFLAYER RTP CONSOLE{/bold}   —   ${activeLabel}${othersLabel}${proxyLabel}{/center}`)
   debouncedRender()
 }
 
@@ -236,10 +289,6 @@ function switchTo(id) {
   debouncedRender()
 }
 
-// ── Safe log trimming ────────────────────────────────────────────────────────
-// The old code used splice() which is fine, but the real crash was blessed's
-// internal buffer (now capped via scrollback above).  Our per-bot array is
-// trimmed here with a simple reassignment — no risk of crash.
 function logFor(id, msg) {
   if (!bots[id]) return
   const line = `${timestamp()} ${msg}`
@@ -247,10 +296,7 @@ function logFor(id, msg) {
 
   logs.push(line)
 
-  // Trim oldest lines when we exceed the cap
   if (logs.length > MAX_LOG_LINES) {
-    // Keep the newest half when we hit the limit — avoids trimming on every
-    // single log call once the buffer is full (which would be O(n) per log).
     const keep = Math.floor(MAX_LOG_LINES * 0.75)
     bots[id].logs = logs.slice(-keep)
   }
@@ -265,10 +311,8 @@ function logInfo(msg)    { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
 function logWarn(msg)    { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 
 // ── Discord helpers ──────────────────────────────────────────────────────────
-
 function sendDiscordAlert(title, description, color = 0x5865F2) {
   if (!DISCORD_WEBHOOK_URL) return
-
   enqueueDiscord(async () => {
     try {
       await fetch(DISCORD_WEBHOOK_URL, {
@@ -277,12 +321,7 @@ function sendDiscordAlert(title, description, color = 0x5865F2) {
         body: JSON.stringify({
           content: DISCORD_USER_ID ? `<@${DISCORD_USER_ID}>` : undefined,
           allowed_mentions: DISCORD_USER_ID ? { users: [DISCORD_USER_ID] } : undefined,
-          embeds: [{
-            title,
-            description,
-            color,
-            timestamp: new Date().toISOString()
-          }]
+          embeds: [{ title, description, color, timestamp: new Date().toISOString() }]
         })
       })
     } catch (err) {
@@ -296,7 +335,6 @@ const rtpDiscordMessageIds = new Map()
 
 function updateDiscordRtpLog(botId, x, y, z) {
   if (!DISCORD_WEBHOOK_URL) return
-
   enqueueDiscord(async () => {
     const title = '📜 RTP LOG'
     const description = `**${botId}** latest RTP location:\n\`${x}, ${y}, ${z}\``
@@ -307,9 +345,7 @@ function updateDiscordRtpLog(botId, x, y, z) {
         const res = await fetch(DISCORD_WEBHOOK_URL + '?wait=true', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            embeds: [{ title, description, color: 0x3498DB, timestamp: new Date().toISOString() }]
-          })
+          body: JSON.stringify({ embeds: [{ title, description, color: 0x3498DB, timestamp: new Date().toISOString() }] })
         })
         if (!res.ok) throw new Error(`Discord POST failed: ${res.status} ${await res.text()}`)
         const data = await res.json()
@@ -318,9 +354,7 @@ function updateDiscordRtpLog(botId, x, y, z) {
         const res = await fetch(`${DISCORD_WEBHOOK_URL}/messages/${existingId}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            embeds: [{ title, description, color: 0x3498DB, timestamp: new Date().toISOString() }]
-          })
+          body: JSON.stringify({ embeds: [{ title, description, color: 0x3498DB, timestamp: new Date().toISOString() }] })
         })
         if (!res.ok) throw new Error(`Discord PATCH failed: ${res.status} ${await res.text()}`)
       }
@@ -334,32 +368,27 @@ function updateDiscordRtpLog(botId, x, y, z) {
 }
 
 // ── Base-finding helpers ─────────────────────────────────────────────────────
-
 const BASE_INDICATORS = [
   'ender_chest', 'anvil', 'chipped_anvil', 'damaged_anvil',
   'smithing_table', 'furnace', 'blast_furnace', 'smoker', 'enchanting_table'
 ]
-
 const storageIdCache = new WeakMap()
 
 function getStorageBlockIds(bot) {
   if (!bot.registry) return []
   if (storageIdCache.has(bot.registry)) return storageIdCache.get(bot.registry)
-
   const ids = Object.keys(bot.registry.blocksByName)
     .filter(name =>
       name === 'chest' || name === 'trapped_chest' || name === 'barrel' ||
       BASE_INDICATORS.includes(name) || name.endsWith('shulker_box')
     )
     .map(name => bot.registry.blocksByName[name].id)
-
   storageIdCache.set(bot.registry, ids)
   return ids
 }
 
 function scanForBase(bot, id) {
   if (!bot.entity) return
-
   const state = bots[id]
   if (!state) return
 
@@ -367,12 +396,7 @@ function scanForBase(bot, id) {
     const ids = getStorageBlockIds(bot)
     if (ids.length === 0) return
 
-    const positions = bot.findBlocks({
-      matching: ids,
-      maxDistance: BASE_SCAN_RADIUS,
-      count: 4096
-    })
-
+    const positions = bot.findBlocks({ matching: ids, maxDistance: BASE_SCAN_RADIUS, count: 4096 })
     if (positions.length < BASE_ALERT_THRESHOLD) return
 
     const buckets = new Map()
@@ -397,7 +421,6 @@ function scanForBase(bot, id) {
       }
 
       if (!hasIndicator) continue
-
       state.alertedBases.add(key)
 
       const cx = Math.round(blockPositions.reduce((sum, p) => sum + p.x, 0) / blockPositions.length)
@@ -417,7 +440,6 @@ function scanForBase(bot, id) {
 
 function manageTotems(bot, id) {
   if (!bot.entity || !bot.registry) return
-
   const state = bots[id]
   if (!state) return
 
@@ -444,7 +466,6 @@ function manageTotems(bot, id) {
         logFor(id, '{yellow-fg}⚠ Out of totems!{/yellow-fg}')
       }
     }
-
     state.lastOffhandWasTotem = hasOffhandTotem
   } catch (err) {
     logFor(id, `{red-fg}[totem] Error: ${sanitize(err.message)}{/red-fg}`)
@@ -453,13 +474,11 @@ function manageTotems(bot, id) {
 
 function checkNearbyPlayers(bot, id) {
   if (!bot.entity) return
-
   const state = bots[id]
   if (!state) return
 
   try {
     const now = Date.now()
-
     for (const [name, player] of Object.entries(bot.players)) {
       if (name === id || bots[name]) continue
       if (!player.entity) continue
@@ -471,7 +490,6 @@ function checkNearbyPlayers(bot, id) {
       if (now - lastAlert < PLAYER_PROXIMITY_COOLDOWN_MS) continue
 
       state.lastPlayerAlert.set(name, now)
-
       logFor(id, `{red-fg}{bold}⚠ Player nearby: ${sanitize(name)} (${dist.toFixed(1)} blocks){/bold}{/red-fg}`)
       sendDiscordAlert(`⚠ Player nearby — ${id}`, `${name} is ${dist.toFixed(1)} blocks from ${id}.`, 0xE74C3C)
     }
@@ -482,17 +500,14 @@ function checkNearbyPlayers(bot, id) {
 
 function manageFood(bot, id) {
   if (!bot.entity || !bot.registry) return
-
   const state = bots[id]
   if (!state) return
-
   if (bot.food === undefined || bot.food === null) return
   if (bot.food >= FOOD_EAT_THRESHOLD) return
   if (bot.currentWindow) return
 
   try {
     const edibleItems = bot.inventory.items().filter(item => bot.registry.foodsByName?.[item.name])
-
     if (edibleItems.length === 0) {
       if (!state.noFoodWarned) {
         logFor(id, '{yellow-fg}⚠ Hungry but no food in inventory!{/yellow-fg}')
@@ -502,7 +517,6 @@ function manageFood(bot, id) {
     }
 
     state.noFoodWarned = false
-
     edibleItems.sort((a, b) =>
       (bot.registry.foodsByName[b.name].foodPoints || 0) -
       (bot.registry.foodsByName[a.name].foodPoints || 0)
@@ -519,7 +533,6 @@ function manageFood(bot, id) {
 }
 
 // ── Proxy crash detection ────────────────────────────────────────────────────
-
 function isProxyCrash(reason) {
   if (!reason) return false
   const text = typeof reason === 'string' ? reason : (reason.message || String(reason))
@@ -527,12 +540,20 @@ function isProxyCrash(reason) {
 }
 
 // ── Bot creation ─────────────────────────────────────────────────────────────
+function clearReconnectTimer(id) {
+  const entry = bots[id]
+  if (entry?.reconnectTimer) {
+    clearTimeout(entry.reconnectTimer)
+    entry.reconnectTimer = null
+  }
+}
 
 function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
   const id = username
   let connected = false
   let manualDisconnect = false
-  let reconnectTimer = null
+
+  clearReconnectTimer(id)
 
   const s = (msg) => logFor(id, `{green-fg}✓ ${msg}{/green-fg}`)
   const e = (msg) => logFor(id, `{red-fg}✗ ${msg}{/red-fg}`)
@@ -540,7 +561,6 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   const w = (msg) => logFor(id, `{yellow-fg}⚠ ${msg}{/yellow-fg}`)
   const c = (msg) => logFor(id, `{white-fg}${sanitize(msg)}{/white-fg}`)
 
-  // Clean up previous instance
   if (bots[id]?.bot) {
     try { bots[id].bot.removeAllListeners() } catch (_) {}
     try { if (bots[id].bot._client) bots[id].bot._client.removeAllListeners() } catch (_) {}
@@ -552,7 +572,10 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
   let bot
   try {
-    bot = mineflayer.createBot({ host, port, username: id, version, hideErrors: true })
+    bot = mineflayer.createBot({
+      host, port, username: id, version, hideErrors: true,
+      connect: makeProxyConnect(host, port, i)
+    })
   } catch (err) {
     const fallback = activeId || id
     logFor(fallback, `{red-fg}✗ Failed to create bot "${id}": ${sanitize(err.message)}{/red-fg}`)
@@ -568,6 +591,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
     lastPlayerAlert: new Map(),
     noFoodWarned: false,
     reconnectAttempts: existingReconnectAttempts,
+    reconnectTimer: null,
     lastKickReason: null,
     lastDisconnectReason: null
   }
@@ -586,7 +610,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   const scheduleReconnect = (reason, rawError) => {
     clearAll()
     connected = false
-    if (manualDisconnect || reconnectTimer) return
+    if (manualDisconnect || bots[id]?.reconnectTimer) return
 
     const proxyCrash = isProxyCrash(rawError || reason)
     const attempt = bots[id]?.reconnectAttempts || 0
@@ -601,9 +625,9 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
       w(`${reason}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s (Attempt ${attempt + 1})…`)
     }
 
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null
-      createBotInstance(id, host, port, version)
+    bots[id].reconnectTimer = setTimeout(() => {
+      bots[id].reconnectTimer = null
+      setImmediate(() => createBotInstance(id, host, port, version))
     }, delay)
   }
 
@@ -616,7 +640,6 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   }
 
   // ── RTP scheduling ─────────────────────────────────
-
   let rtpTimer = null
 
   const scheduleRtp = (delay) => {
@@ -659,7 +682,6 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   }
 
   // ── Start roaming mode ─────────────────────────────
-
   const startRoaming = () => {
     i('Entering roam mode: RTP + totem/food management + base & player scanning')
 
@@ -675,12 +697,25 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   }
 
   // ── Lifecycle events ───────────────────────────────
+bot.once('login', () => {
+    i('Connected to server socket. Awaiting chat auth prompts…')
+  })
 
-  let lastRawError = null
+  // Listen to plain text messages to grep for auth requests
+  bot.on('messagestr', (message) => {
+    const text = message.toLowerCase()
 
-  bot.once('login', () => {
-    i('Connected to server socket. Sending auth…')
-    pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 2220 + Math.random() * 400)
+    // Grep for register prompts (e.g., "Please register using /register <password> <password>")
+    if (text.includes('register') && text.includes('/register')) {
+      i('Auth prompt detected: sending /register')
+      pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
+    }
+
+    // Grep for login prompts (e.g., "Please login using /login <password>")
+    else if (text.includes('login') && text.includes('/login')) {
+      i('Auth prompt detected: sending /login')
+      pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
+    }
   })
 
   bot.once('spawn', () => {
@@ -773,7 +808,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
   bots[id].disconnectManually = () => {
     manualDisconnect = true
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+    clearReconnectTimer(id)
     clearAll()
     try { bot.quit() } catch (_) {}
   }
@@ -810,6 +845,7 @@ const COMMANDS = {
   '/new-bot <name> [host] [port] [ver]': 'Create and connect a new bot',
   '/switch <id>':    'Switch view to a different bot by name or number',
   '/uptime':         'Show uptime for all bots',
+  '/proxy':          'Show the currently configured outbound proxy',
   '/mem':            'Show memory usage breakdown',
   'anything else':   'Sent directly as a chat message/command from the active bot'
 }
@@ -838,6 +874,7 @@ function runLocalCommandForBot(id, cmd) {
       const up = entry.spawnTime ? formatUptime(Date.now() - entry.spawnTime) : '0s'
       logFor(id, `{cyan-fg}› Status for ${id}:{/cyan-fg}`)
       logFor(id, `  Server: ${entry.host}:${entry.port} (v${entry.version})`)
+      logFor(id, `  Proxy: ${PROXY_ENABLED ? `${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : 'Direct (no proxy)'}`)
       logFor(id, `  Position: ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}`)
       logFor(id, `  Health: ${bot.health ?? 'N/A'}  Food: ${bot.food ?? 'N/A'}`)
       logFor(id, `  Ping: ${bot.player?.ping ?? 'N/A'}ms`)
@@ -999,6 +1036,15 @@ function handleCommand(trimmed) {
       const up = (b?.bot?.entity && b.spawnTime) ? formatUptime(Date.now() - b.spawnTime) : '{gray-fg}offline{/gray-fg}'
       log(`  [${idx + 1}] {cyan-fg}${name}{/cyan-fg} — ${up}`)
     })
+    return
+  }
+
+  if (trimmed === '/proxy') {
+    if (PROXY_ENABLED) {
+      logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots)`)
+    } else {
+      logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST in .env to enable one.')
+    }
     return
   }
 
