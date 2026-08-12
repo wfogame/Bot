@@ -393,11 +393,25 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   }
 
   // ── Lifecycle events ─────────────────────────────────
-  bot.once('login', () => {
-    i('Connected to server socket. Sending auth…')
+bot.once('login', () => {
+    i('Connected to server socket. Awaiting chat auth prompts…')
+  })
 
-    //pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 2 + Math.random() * 400)
-    pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 2000 + Math.random() * 400)
+  // Listen to plain text messages to grep for auth requests
+  bot.on('messagestr', (message) => {
+    const text = message.toLowerCase()
+
+    // Grep for register prompts (e.g., "Please register using /register <password> <password>")
+    if (text.includes('register') && text.includes('/register')) {
+      i('Auth prompt detected: sending /register')
+      pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
+    }
+
+    // Grep for login prompts (e.g., "Please login using /login <password>")
+    else if (text.includes('login') && text.includes('/login')) {
+      i('Auth prompt detected: sending /login')
+      pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
+    }
   })
 
   bot.once('spawn', () => {
