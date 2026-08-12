@@ -15,7 +15,7 @@
     "dotenv": "^17.4.2",
     "minecraft-data": "^3.113.1",
     "minecraft-protocol": "^1.66.2",
-  "mineflayer": "github:plainprince/mineflayer#fix-velocity-configuration-phase",
+    "mineflayer": "github:plainprince/mineflayer#fix-velocity-configuration-phase",
     "mineflayer-armor-manager": "^2.0.1",
     "neo-blessed": "^0.2.0",
     "prismarine-chunk": "^1.41.0",
