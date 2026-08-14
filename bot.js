@@ -85,6 +85,7 @@ function makeSocksConnect(targetHost, targetPort, onLog) {
   return (client) => {
     if (!SocksClient) {
       client.emit('error', new Error('PROXY_TYPE=socks5 requires the "socks" package — run: npm install socks'))
+      client.emit('end', 'Missing socks package')
       return
     }
     onLog?.(`Tunnelling through SOCKS5 proxy ${PROXY_HOST}:${PROXY_PORT}…`)
@@ -96,7 +97,9 @@ function makeSocksConnect(targetHost, targetPort, onLog) {
       client.setSocket(socket)
       client.emit('connect')
     }).catch(err => {
-      client.emit('error', new Error(`SOCKS5 proxy connection failed: ${err.message}`))
+      const errMsg = `SOCKS5 proxy connection failed: ${err.message}`
+      client.emit('error', new Error(errMsg))
+      client.emit('end', errMsg)
     })
   }
 }
@@ -125,7 +128,9 @@ function makeHttpConnect(targetHost, targetPort, onLog) {
 
       if (statusCode !== 200) {
         socket.destroy()
-        client.emit('error', new Error(`HTTP proxy CONNECT failed: ${statusLine || 'no response from proxy'}`))
+        const errMsg = `HTTP proxy CONNECT failed: ${statusLine || 'no response from proxy'}`
+        client.emit('error', new Error(errMsg))
+        client.emit('end', errMsg)
         return
       }
 
@@ -140,7 +145,11 @@ function makeHttpConnect(targetHost, targetPort, onLog) {
     }
 
     socket.on('data', onData)
-    socket.on('error', (err) => client.emit('error', new Error(`HTTP proxy connection failed: ${err.message}`)))
+    socket.on('error', (err) => {
+      const errMsg = `HTTP proxy connection failed: ${err.message}`
+      client.emit('error', new Error(errMsg))
+      client.emit('end', errMsg)
+    })
   }
 }
 
@@ -630,6 +639,7 @@ const COMMANDS = {
   '/list':           'Compact one-line-per-bot status list (online / offline / last kick)',
   '/chat <msg>':     'Send a chat message from the active bot (avoids triggering local commands)',
   '/disconnect':     'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
+  '/closeBot':       'Disconnect the active bot and completely remove it from the UI',
   '/clear':          'Clear the active bot\'s log view',
   '/help':           'List all available commands',
   '/status':         'Show active bot\'s connection, position, health, ping, uptime',
@@ -652,11 +662,35 @@ const COMMANDS = {
  * 
  * @param {object} bot - The mineflayer bot instance
  */
-async function tpaAndDump(bot) {
+async function tpaAndDump(bot, id) {
   const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
   const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
 
   bot.chat(`/tpa ${tpaTarget}`)
+  logFor(id, `{cyan-fg}› Sent /tpa to ${tpaTarget}. Waiting for teleport...{/cyan-fg}`)
+
+  try {
+    await new Promise((resolve, reject) => {
+      const startPos = bot.entity.position.clone()
+      const timeout = setTimeout(() => {
+        bot.removeListener('move', onMove)
+        reject(new Error('Teleport timed out'))
+      }, 15000)
+
+      function onMove() {
+        if (bot.entity.position.distanceTo(startPos) > 10) {
+          clearTimeout(timeout)
+          bot.removeListener('move', onMove)
+          resolve()
+        }
+      }
+      bot.on('move', onMove)
+    })
+    logFor(id, `{cyan-fg}› Teleport detected! Looking for chests...{/cyan-fg}`)
+    await new Promise(r => setTimeout(r, 2000))
+  } catch (err) {
+    logFor(id, `{yellow-fg}⚠ ${err.message}. Looking for chests nearby anyway...{/yellow-fg}`)
+  }
 
   const chestIds = [
     bot.registry.blocksByName.chest.id,
@@ -670,7 +704,7 @@ async function tpaAndDump(bot) {
   })
 
   if (chestBlocks.length === 0) {
-    console.log(`[!] No chests found within ${scanRadius} blocks.`)
+    logFor(id, `{yellow-fg}⚠ No chests found within ${scanRadius} blocks.{/yellow-fg}`)
     return
   }
 
@@ -704,7 +738,7 @@ async function tpaAndDump(bot) {
     }
   }
 }
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect','/dump', '/dc', '/reconnect', '/crates', '/crates-loop']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/closeBot']
 
 function runLocalCommandForBot(id, cmd) {
   const entry = bots[id]
@@ -738,11 +772,10 @@ function runLocalCommandForBot(id, cmd) {
       return true
     }
     case '/dump': {
-     if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-      logFor(id, `{cyan-fg}› Initiating TPA and inventory dump...{/cyan-fg}`)
-      tpaAndDump(bot) // Call the function here
-    return true
-  }
+      if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+      tpaAndDump(bot, id)
+      return true
+    }
     case '/players': {
       if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
       const players = Object.keys(bot.players)
@@ -761,6 +794,25 @@ function runLocalCommandForBot(id, cmd) {
     case '/dc': {
       logFor(id, `{yellow-fg}⚠ Disconnecting ${id}…{/yellow-fg}`)
       try { entry.disconnectManually() } catch (_) {}
+      return true
+    }
+
+    case '/closeBot': {
+      logFor(id, `{yellow-fg}⚠ Disconnecting and removing ${id}…{/yellow-fg}`)
+      try { entry.disconnectManually() } catch (_) {}
+      delete bots[id]
+      
+      const remainingNames = Object.keys(bots)
+      if (activeId === id) {
+        if (remainingNames.length > 0) {
+          switchTo(remainingNames[remainingNames.length - 1])
+        } else {
+          activeId = null
+          logBox.setContent('')
+          debouncedRender()
+        }
+      }
+      updateHeader()
       return true
     }
 
