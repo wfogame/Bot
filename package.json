@@ -17,6 +17,7 @@
     "minecraft-protocol": "^1.66.2",
     "mineflayer": "github:plainprince/mineflayer#fix-velocity-configuration-phase",
     "mineflayer-armor-manager": "^2.0.1",
+    "mineflayer-pathfinder": "^2.4.5",
     "neo-blessed": "^0.2.0",
     "prismarine-chunk": "^1.41.0",
     "socks": "^2.8.9"

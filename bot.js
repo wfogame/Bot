@@ -1,8 +1,11 @@
 require('dotenv').config()          // npm install dotenv
 const net = require('net')
+const fs = require('fs')
+const path = require('path')
 const mineflayer = require('mineflayer')
 const blessed = require('neo-blessed')
 const armorManager = require('mineflayer-armor-manager')
+const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
 let SocksClient
 try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY_HOST is set and PROXY_TYPE=socks5 — npm install socks */ }
 
@@ -15,6 +18,12 @@ const BOT_NAMES        = (process.env.BOT_NAMES || '').split(',').map(n => n.tri
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
+
+// ── /crates command config ─────────────────────────────────────────────────
+const WARP_CRATES         = process.env.WARP_CRATES_COMMAND || '/warp crates'
+const CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box'
+const CRATE_SCAN_RADIUS   = parseInt(process.env.CRATE_SCAN_RADIUS || '20', 10)
+const CRATE_REACH         = parseFloat(process.env.CRATE_REACH || '3.5')
 
 // ── Outbound proxy config ──────────────────────────────────────────────────────
 // Every bot's Minecraft TCP connection is routed through this single shared
@@ -39,8 +48,7 @@ const PROXY_ENABLED    = Boolean(PROXY_HOST)
 const PROXY_CRASH_PATTERNS = [
   /PartialReadError/i,
   /deserialization/i,
-  /decompress/i,
-  /zlib/i,
+  /decompress/i, /zlib/i,
   /unexpected end/i,
   /Invalid VarInt/i,
   /socket hang up/i,
@@ -145,7 +153,11 @@ function makeProxyConnect(targetHost, targetPort, onLog) {
 
 // ── Global crash guards ───────────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
-  try { logBox.log(`{red-fg}[UNCAUGHT] ${sanitize(err.message)}{/red-fg}`); debouncedRender() }
+  try { 
+    const text = err.stack ? err.stack : err.message;
+    logBox.log(`{red-fg}[UNCAUGHT] ${sanitize(text)}{/red-fg}`); 
+    debouncedRender() 
+  }
   catch (_) { /* blessed may not be ready */ }
 })
 process.on('unhandledRejection', (reason) => {
@@ -159,8 +171,12 @@ process.on('unhandledRejection', (reason) => {
 // Player names / chat / errors can contain {curly braces} that blessed parses
 // as formatting tags → crash.  We escape everything except our own known tags.
 const KNOWN_TAG_RE = /\{(\/?(bold|underline|blink|inverse|red|green|blue|cyan|magenta|yellow|white|gray|grey|black|center|left|right)(-fg|-bg)?)\}/g
+const MAX_SANITIZED_LENGTH = 4000 // hard cap — some servers send oversized/malformed chat as a client-crashing trick
 function sanitize(str) {
   if (typeof str !== 'string') str = String(str ?? '')
+  if (str.length > MAX_SANITIZED_LENGTH) {
+    str = str.slice(0, MAX_SANITIZED_LENGTH) + ` …[truncated, ${str.length - MAX_SANITIZED_LENGTH} more chars]`
+  }
   const tags = []
   const safe = str.replace(KNOWN_TAG_RE, (m) => { tags.push(m); return `\x00T${tags.length - 1}\x00` })
   const escaped = safe.replace(/[{}]/g, c => '\\' + c)
@@ -176,7 +192,16 @@ let renderQueued = false
 function debouncedRender() {
   if (renderQueued) return
   renderQueued = true
-  setImmediate(() => { renderQueued = false; screen.render() })
+  setImmediate(() => {
+    renderQueued = false
+    try {
+      screen.render()
+    } catch (err) {
+      // Render itself failed — don't route this through logBox/console (that's what
+      // just broke), write straight to the real fd so it doesn't loop or get lost.
+      try { require('fs').writeSync(2, `[render error] ${err && err.message}\n`) } catch (_) {}
+    }
+  })
 }
 
 const header = blessed.box({
@@ -240,7 +265,7 @@ setInterval(() => {
 }, 60000) // Runs once every 60 seconds
 const bots = {}       // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
 let activeId = null
-const MAX_LOG_LINES = 50000000000000
+const MAX_LOG_LINES = 5000
 
 function updateHeader() {
   const names = Object.keys(bots)
@@ -277,7 +302,8 @@ function logFor(id, msg) {
   const line = `${timestamp()} ${msg}`
   
   // Store as an object with a timestamp
-  bots[id].logs.push({ text: line, time: Date.now() }) 
+  bots[id].logs.push({ text: line, time: Date.now() })
+  if (bots[id].logs.length > MAX_LOG_LINES) bots[id].logs.splice(0, bots[id].logs.length - MAX_LOG_LINES)
   
   if (id === activeId) { 
     logBox.log(line)
@@ -335,14 +361,16 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   }
 
   bot.loadPlugin(armorManager)
+  bot.loadPlugin(pathfinder)
 
   bots[id] = {
     bot, spawnTime: null, logs: existingLogs, host, port, version,
     reconnectAttempts: existingReconnectAttempts,
     reconnectTimer: null,
     lastKickReason: null,
-    lastDisconnectReason: null      // stores raw error text for transfer-crash classification
-
+    lastDisconnectReason: null,     // stores raw error text for transfer-crash classification
+    crateRoutineRunning: false,     // prevents concurrent /crates runs
+    inCrateRoutine: false           // suppresses windowOpen handler during /crates
   }
 
   // Managed timers — all cleared on disconnect so nothing fires against a dead bot
@@ -360,7 +388,12 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   const scheduleReconnect = (reason, rawError) => {
     clearAll()
     connected = false
-    if (manualDisconnect || bots[id]?.reconnectTimer) return
+    // ADDED CHECK: Prevent recursive calls if already reconnecting or manually disconnected
+    if (manualDisconnect || bots[id]?.reconnectTimer) {
+      // If a reconnect is already scheduled, or if the user manually disconnected,
+      // do not schedule another reconnect.
+      return;
+    }
 
     const proxyCrash = isProxyCrash(rawError || reason)
     const attempt = bots[id]?.reconnectAttempts || 0
@@ -422,42 +455,97 @@ bot.once('login', () => {
     // Stable for 60 s → reset backoff
     pushT(() => { if (connected && bots[id]) bots[id].reconnectAttempts = 0 }, 60_000)
 
+    // Auto-equip best armor immediately on spawn
+    pushT(() => {
+      if (bot.entity) {
+        try { bot.armorManager.equipAll() } catch (_) {}
+      }
+    }, 2000)
+
     pushT(() => {
       i('Right-clicking compass (server selector)…')
       try { bot.activateItem() } catch (err) { e(`activateItem failed: ${sanitize(err.message)}`) }
     }, 3600 + Math.random() * 600)
   })
 
-  bot.on('windowOpen', (window) => {
-    try {
-      const title = window.title?.toString ? window.title.toString() : String(window.title || '')
-      i(`Window opened: ${sanitize(title)} (${window.slots.length} slots)`)
+bot.on('windowOpen', (window) => {
+  try {
+    // Skip the GUI/Fatal Crate handler when a /crates routine opened this window
+    if (bots[id]?.inCrateRoutine) return
 
-      if (GUI_SLOT >= window.slots.length) {
-        w(`Slot ${GUI_SLOT} out of bounds — window only has ${window.slots.length} slots`)
-        return
+    const title = window.title?.toString ? window.title.toString() : String(window.title || '')
+    
+    const getSafeItemString = (item) => {
+      if (!item) return 'null';
+      return `[Item ${item.displayName || item.name} x${item.count || 1}]`;
+    };
+
+    const slotInfo = window.slots.map((slot, index) => {
+      return `Slot ${index}: ${getSafeItemString(slot)}`;
+    }).join('\n');
+    i(`Window opened: ${sanitize(title)}\n${sanitize(slotInfo)}`);
+
+    // Search for "Fatal Crate" OR "Fatal Key"
+    let targetSlot = GUI_SLOT; // Default to slot 11
+    let foundFatalItem = false;
+
+    for (let j = 0; j < window.slots.length; j++) {
+      const slot = window.slots[j];
+      if (!slot) continue;
+      
+      // Stringify safely and make lowercase for case-insensitive search
+      const slotDataStr = getSafeItemString(slot).toLowerCase();
+      
+      // Check if it contains "fatal" AND ("crate" OR "key")
+      const hasFatal = slotDataStr.includes('fatal');
+      const hasCrateOrKey = slotDataStr.includes('crate') || slotDataStr.includes('key');
+
+      if (hasFatal && hasCrateOrKey) {
+        targetSlot = j;
+        foundFatalItem = true;
+        break; // Stop searching once we find it
       }
-      if (!window.slots[GUI_SLOT]) {
-        w(`Slot ${GUI_SLOT} is empty — not clicking.`)
-        return
-      }
+    }
 
-      pushT(async () => {
-        if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
-        try {
-          await bot.clickWindow(GUI_SLOT, 0, 0)
-          i(`Clicked slot ${GUI_SLOT} — waiting for server transfer…`)
-        } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
-      }, 2000 + Math.random() * 1600)
+    if (foundFatalItem) {
+      i(`Found Fatal Crate/Key at slot ${targetSlot}!`);
+    } else {
+      i(`Fatal Crate/Key not found, falling back to GUI_SLOT (${GUI_SLOT}).`);
+    }
 
-      pushT(async () => {
-          bot.chat(WARP_AFK)
-          i(`Warped — waiting for server transfer…`)
-      }, 54000 + Math.random() * 1600)
+    // Validation
+    if (targetSlot >= window.slots.length) {
+      w(`Slot ${targetSlot} out of bounds — window only has ${window.slots.length} slots`)
+      return
+    }
+    if (!window.slots[targetSlot]) {
+      w(`Slot ${targetSlot} is empty — not clicking.`)
+      return
+    }
 
-    } catch (err) { e(`windowOpen handler error: ${sanitize(err.message)}`) }
-  })
+    // Click the decided slot
+    pushT(async () => {
+      if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
+      try {
+        await bot.clickWindow(targetSlot, 0, 0)
+        if(!foundFatalItem ){
+        i(`Clicked slot ${targetSlot} — waiting for server transfer…`)
+        }else{
+          i(`Clicked slot ${targetSlot} — Purchased Fatal key`)
+          }
+      } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
+    }, 2000 + Math.random() * 1600)
 
+    // AFK Warp logic
+    pushT(async () => {
+        if(!foundFatalItem){
+        bot.chat(WARP_AFK)
+        i(`Warped — waiting for server transfer…`)
+        }
+    }, 54000 + Math.random() * 1600)
+
+  } catch (err) { e(`windowOpen handler error: ${sanitize(err.message)}`) }
+})
   bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
 
   bot.on('kicked', (reason) => {
@@ -537,7 +625,9 @@ BOT_NAMES.forEach((name, index) => {
 // ── Command registry ──────────────────────────────────────────────────────────
 const COMMANDS = {
   '/all <cmd>':      'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
-  '/overview':       'Dashboard of every bot\'s health, food, ping, and shard count',
+  '/overview':       'Dashboard of every bot\'s health, food, ping, shards, and coins',
+  '/crates':         `Warp to crates, find + walk to the nearest ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} (within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable`,
+  '/crates-loop [n]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count',
   '/list':           'Compact one-line-per-bot status list (online / offline / last kick)',
   '/chat <msg>':     'Send a chat message from the active bot (avoids triggering local commands)',
   '/disconnect':     'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
@@ -556,7 +646,7 @@ const COMMANDS = {
   'anything else':   'Sent directly as a chat message/command from the active bot'
 }
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dc', '/reconnect']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dc', '/reconnect', '/crates', '/crates-loop']
 
 function runLocalCommandForBot(id, cmd) {
   const entry = bots[id]
@@ -619,12 +709,199 @@ function runLocalCommandForBot(id, cmd) {
       return true
     }
 
+    case '/crates': {
+      if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+      runCrateRoutine(id) // fire-and-forget async routine, logs its own progress
+      return true
+    }
+
+    case '/crates-loop': {
+      if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+      runCrateLoop(id) // fire-and-forget, logs its own progress
+      return true
+    }
+
     default:
       return false
   }
 }
 
-function queryShards(id, timeoutMs = 2000) {
+// ── Anti-cheat safe walk-to-target helper ──────────────────────────────────
+// Since the crate room is flat, mineflayer-pathfinder is overkill and often
+// triggers server anti-cheat rubberbanding (walking in place). This simple
+// loop perfectly mimics a vanilla player walking forward without jumping/sprinting.
+function walkToBlock(bot, targetPos, { reach = 4.5, timeoutMs = 15000 } = {}) {
+  return new Promise(async (resolve) => {
+    if (!bot.entity) { resolve(false); return }
+
+    let timer = null
+    let timeout = null
+    let settled = false
+
+    const stop = () => {
+      if (settled) return
+      settled = true
+      try { bot.clearControlStates() } catch (_) {}
+      if (timer) clearInterval(timer)
+      if (timeout) clearTimeout(timeout)
+    }
+
+    // 1. Inject physics override for GrimAC!
+    // The debug logs showed the bot was standing in a 'light' block with 0.07 velocity.
+    // Mineflayer often has broken physics for non-solid blocks like light and buttons,
+    // applying weird friction or collision that GrimAC instantly flags.
+    try {
+      const mcData = require('minecraft-data')(bot.version)
+      if (mcData.blocksByName.light) mcData.blocksByName.light.boundingBox = 'empty'
+      for (const block of Object.values(mcData.blocksByName)) {
+        if (block.name.includes('button')) block.boundingBox = 'empty'
+      }
+    } catch (_) {}
+
+    // 2. Look smoothly (false) to avoid Aimbot flags
+    // Wrapped in a 1-second timeout because Mineflayer's smooth lookAt has a bug
+    // where it can hang forever if it gets stuck on floating-point precision.
+    try {
+      await Promise.race([
+        bot.lookAt(targetPos.offset(0.5, 0.5, 0.5), false),
+        new Promise(r => setTimeout(r, 1000))
+      ])
+    } catch (_) {}
+
+    if (settled || !bot.entity) { resolve(false); return }
+
+    // 3. Start walking purely vanilla
+    bot.setControlState('forward', true)
+    bot.setControlState('sprint', false)
+    bot.setControlState('jump', false)
+    bot.setControlState('sneak', false)
+
+    timer = setInterval(() => {
+      if (!bot.entity) { stop(); resolve(false); return }
+      
+      const dist = bot.entity.position.distanceTo(targetPos)
+      if (dist <= reach) {
+        stop()
+        resolve(true)
+      }
+    }, 50)
+
+    timeout = setTimeout(() => {
+      stop()
+      if (bot.entity && bot.entity.position.distanceTo(targetPos) <= reach) {
+        resolve(true)
+      } else {
+        resolve(false)
+      }
+    }, timeoutMs)
+  })
+}
+
+// ── /crates routine: warp → scan for red shulker box → walk → right-click ──
+// Runs once per invocation. The inCrateRoutine flag suppresses the generic
+// windowOpen handler so the shulker box GUI doesn't trigger Fatal Crate logic.
+async function runCrateRoutine(id) {
+  const entry = bots[id]
+  if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
+  if (entry.crateRoutineRunning) { logFor(id, `{yellow-fg}⚠ /crates is already running for ${id}.{/yellow-fg}`); return false }
+  entry.crateRoutineRunning = true
+  entry.inCrateRoutine = true
+  const { bot } = entry
+
+  try {
+    logFor(id, `{cyan-fg}› Warping to crates…{/cyan-fg}`)
+    try { bot.chat(WARP_CRATES) } catch (err) {
+      logFor(id, `{red-fg}✗ Failed to send "${sanitize(WARP_CRATES)}": ${sanitize(err.message)}{/red-fg}`)
+      return false
+    }
+
+    // Wait for warp to complete (5 seconds + random 100-600ms)
+    await new Promise(resolve => setTimeout(resolve, 5000 + 100 + Math.random() * 500))
+    if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during warp — aborting.{/red-fg}`); return false }
+
+    const block = bot.findBlock({
+      matching: (b) => b && b.name === CRATE_SHULKER_BLOCK,
+      maxDistance: CRATE_SCAN_RADIUS
+    })
+
+    if (!block) {
+      logFor(id, `{red-fg}✗ No ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} found within ${CRATE_SCAN_RADIUS} blocks — warping to afk instead.{/red-fg}`)
+      try { bot.chat(WARP_AFK) } catch (_) {}
+      return false
+    }
+
+    logFor(id, `{cyan-fg}› Found it at ${block.position.x}, ${block.position.y}, ${block.position.z} — walking over…{/cyan-fg}`)
+
+    const reached = await walkToBlock(bot, block.position, { reach: CRATE_REACH, timeoutMs: 15000 })
+    if (!bot.entity) return false
+
+    if (!reached) {
+      logFor(id, `{red-fg}✗ Couldn't reach the shulker box (timed out/stuck) — warping to afk instead.{/red-fg}`)
+      try { bot.chat(WARP_AFK) } catch (_) {}
+      return false
+    }
+
+    // Re-fetch the block at the target position in case it changed while walking over
+    const freshBlock = bot.blockAt(block.position)
+    if (!freshBlock || freshBlock.name !== CRATE_SHULKER_BLOCK) {
+      logFor(id, `{red-fg}✗ Block at target location changed before I could click it — warping to afk instead.{/red-fg}`)
+      try { bot.chat(WARP_AFK) } catch (_) {}
+      return false
+    }
+
+    try {
+      await bot.lookAt(freshBlock.position.offset(0.5, 0.5, 0.5), true)
+      await bot.activateBlock(freshBlock)
+      logFor(id, `{green-fg}✓ Right-clicked the ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}.{/green-fg}`)
+      return true
+    } catch (err) {
+      logFor(id, `{red-fg}✗ Failed to click shulker box: ${sanitize(err.message)}{/red-fg}`)
+      return false
+    }
+  } finally {
+    if (bots[id]) {
+      bots[id].crateRoutineRunning = false
+      bots[id].inCrateRoutine = false
+    }
+  }
+}
+
+// ── /crates-loop: repeatedly run the crate routine ────────────────────────
+async function runCrateLoop(id, maxIterations = Infinity) {
+  const entry = bots[id]
+  if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return }
+  if (entry.crateLoopRunning) { logFor(id, `{yellow-fg}⚠ /crates-loop is already running for ${id}.{/yellow-fg}`); return }
+  entry.crateLoopRunning = true
+
+  let iteration = 0
+  try {
+    while (iteration < maxIterations) {
+      iteration++
+      logFor(id, `{cyan-fg}› Crate loop iteration ${iteration}${maxIterations < Infinity ? '/' + maxIterations : ''}…{/cyan-fg}`)
+
+      const success = await runCrateRoutine(id)
+      if (!success) {
+        logFor(id, `{yellow-fg}⚠ Crate routine failed on iteration ${iteration} — stopping loop.{/yellow-fg}`)
+        break
+      }
+
+      // Brief pause between iterations to avoid spamming the server
+      await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000))
+      if (!bots[id]?.bot?.entity) {
+        logFor(id, `{red-fg}✗ ${id} despawned during crate loop — stopping.{/red-fg}`)
+        break
+      }
+    }
+    logFor(id, `{green-fg}✓ Crate loop finished after ${iteration} iteration(s).{/green-fg}`)
+  } finally {
+    if (bots[id]) bots[id].crateLoopRunning = false
+  }
+}
+
+// Generalized balance query — works for "/shards" ("Shards | Balance: 1,234")
+// and "/coins" ("Coins | Balance: 10 🪙.") since both follow the same
+// "<Label> ... Balance: <number>" shape.
+function queryBalance(id, label, command, timeoutMs = 2000) {
   return new Promise((resolve) => {
     const entry = bots[id]
     if (!entry?.bot?.entity) { resolve(null); return }
@@ -635,21 +912,28 @@ function queryShards(id, timeoutMs = 2000) {
       if (settled) return
       settled = true
       bot.removeListener('message', onMessage)
+      bot.removeListener('end', onEnd)
       clearTimeout(timer)
       resolve(value)
     }
 
+    const regex = new RegExp(`${label}.{0,10}Balance:?\\s*([\\d,]+)`, 'i')
+
     const onMessage = (jsonMsg) => {
       try {
         const text = jsonMsg.toString()
-        const match = text.match(/Shards.{0,10}Balance:?\s*([\d,]+)/i)
+        const match = text.match(regex)
         if (match) finish(parseInt(match[1].replace(/,/g, ''), 10))
       } catch (_) {}
     }
 
+    // Resolve immediately if the bot disconnects while waiting
+    const onEnd = () => finish(null)
+
     const timer = setTimeout(() => finish(null), timeoutMs)
     bot.on('message', onMessage)
-    try { bot.chat('/shards') } catch (_) { finish(null) }
+    bot.on('end', onEnd)
+    try { bot.chat(command) } catch (_) { finish(null) }
   })
 }
 
@@ -691,20 +975,24 @@ function handleCommand(trimmed) {
   if (trimmed === '/overview') {
     const names = Object.keys(bots)
     logInfo('{bold}── Bot Overview Dashboard ──{/bold}')
-    logInfo('Querying shard counts…')
+    logInfo('Querying shard and coin balances…')
 
     Promise.all(names.map(name => {
-      if (!bots[name]?.bot?.entity) return Promise.resolve({ name, shards: null })
-      return queryShards(name).then(shards => ({ name, shards }))
+      if (!bots[name]?.bot?.entity) return Promise.resolve({ name, shards: null, coins: null })
+      return Promise.all([
+        queryBalance(name, 'Shards', '/shards'),
+        queryBalance(name, 'Coins', '/coins')
+      ]).then(([shards, coins]) => ({ name, shards, coins }))
     })).then(results => {
-      results.forEach(({ name, shards }, idx) => {
+      results.forEach(({ name, shards, coins }, idx) => {
         const b = bots[name]
         if (b?.bot?.entity) {
           const hp   = Math.round(b.bot.health || 0)
           const food = Math.round(b.bot.food || 0)
           const ping = b.bot.player?.ping ?? '?'
           const sh   = shards !== null ? shards.toLocaleString() : 'N/A'
-          log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Shards: ${sh}`)
+          const co   = coins !== null ? coins.toLocaleString() : 'N/A'
+          log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Shards: ${sh} | Coins: ${co}`)
         } else {
           log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{/gray-fg}`)
         }
@@ -808,6 +1096,18 @@ function handleCommand(trimmed) {
     return
   }
 
+  // ── /crates-loop [n] ───
+  if (trimmed === '/crates-loop' || trimmed.startsWith('/crates-loop ')) {
+    if (!activeId) { logWarn('No active bot.'); return }
+    const arg = trimmed.slice('/crates-loop'.length).trim()
+    const count = arg ? parseInt(arg, 10) : Infinity
+    if (arg && (isNaN(count) || count <= 0)) { logWarn('Usage: /crates-loop [n] — n must be a positive number'); return }
+    const entry = bots[activeId]
+    if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); return }
+    runCrateLoop(activeId, count)
+    return
+  }
+
   // ── Single-bot local commands ───────────────
   if (activeId && LOCAL_COMMANDS.includes(trimmed)) {
     runLocalCommandForBot(activeId, trimmed)
@@ -834,8 +1134,21 @@ function handleCommand(trimmed) {
 }
 
 // ── Input handling & History ──────────────────────────────────────────────────
-const commandHistory = []
+const HISTORY_FILE = path.join(__dirname, '.command_history')
+const MAX_HISTORY = 500
+
+// Load persisted history on startup
+const commandHistory = (() => {
+  try {
+    const data = fs.readFileSync(HISTORY_FILE, 'utf8')
+    return data.split('\n').filter(Boolean).slice(-MAX_HISTORY)
+  } catch (_) { return [] }
+})()
 let historyIndex = -1
+
+function saveHistory() {
+  try { fs.writeFileSync(HISTORY_FILE, commandHistory.join('\n') + '\n') } catch (_) {}
+}
 
 inputBox.key('up', () => {
   if (historyIndex < commandHistory.length - 1) {
@@ -881,7 +1194,11 @@ inputBox.on('submit', (input) => {
   debouncedRender()
 
   if (trimmed.length > 0) {
-    if (commandHistory[commandHistory.length - 1] !== trimmed) commandHistory.push(trimmed)
+    if (commandHistory[commandHistory.length - 1] !== trimmed) {
+      commandHistory.push(trimmed)
+      if (commandHistory.length > MAX_HISTORY) commandHistory.shift()
+      saveHistory()
+    }
     historyIndex = -1
     handleCommand(trimmed)
   }
@@ -890,8 +1207,11 @@ inputBox.on('submit', (input) => {
 // Escape key can cause neo-blessed to stop reading input — re-focus immediately
 inputBox.on('cancel', () => {
   inputBox.clearValue()
-  inputBox.focus()
-  debouncedRender()
+  setImmediate(() => {
+    inputBox.focus()
+    debouncedRender()
+  })
 })
 
 screen.render()
+
