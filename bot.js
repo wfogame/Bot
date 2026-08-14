@@ -802,6 +802,7 @@ function walkToBlock(bot, targetPos, { reach = 4.5, timeoutMs = 15000 } = {}) {
 // windowOpen handler so the shulker box GUI doesn't trigger Fatal Crate logic.
 async function runCrateRoutine(id) {
   const entry = bots[id]
+  logFor(id,`Change the version in .env to 1.21.1 to use this mechanic otherwise SKIP it.`)
   if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
   if (entry.crateRoutineRunning) { logFor(id, `{yellow-fg}⚠ /crates is already running for ${id}.{/yellow-fg}`); return false }
   entry.crateRoutineRunning = true
