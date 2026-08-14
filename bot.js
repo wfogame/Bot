@@ -29,10 +29,11 @@ const CRATE_REACH         = parseFloat(process.env.CRATE_REACH || '3.5')
 // Every bot's Minecraft TCP connection is routed through this single shared
 // proxy when PROXY_HOST is set. Leave PROXY_HOST empty/unset to connect
 // directly (default, unchanged behavior). const PROXY_HOST       = process.env.PROXY_HOST       || ''
-const PROXY_PORT       = parseInt(process.env.PROXY_PORT || '1080', 10)
-const PROXY_TYPE       = (process.env.PROXY_TYPE || 'socks5').toLowerCase() // 'socks5' | 'http'
-const PROXY_ENABLED    = Boolean(PROXY_HOST)
 
+const PROXY_HOST       = process.env.PROXY_HOST       || ''
+const PROXY_ENABLED    = Boolean(PROXY_HOST)
+const PROXY_PORT       = parseInt(process.env.PROXY_PORT || '1080', 10)
+const PROXY_TYPE       = (process.env.PROXY_TYPE || 'socks5').toLowerCase()
 // ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
 // When a Velocity proxy transfers a player between backend servers, mineflayer's
 // protocol layer can receive partial / malformed packets mid-transfer.  This
@@ -445,77 +446,6 @@ bot.once('login', () => {
       pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
     }
   })
-/**
- * Sends a TPA command based on an .env variable, then finds the nearest chests
- * within a configured radius and dumps the bot's inventory into them.
- * 
- * @param {object} bot - The mineflayer bot instance
- */
-async function tpaAndDump(bot) {
-  // 1. Fetch variables from .env with fallbacks
-  const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
-  const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
-
-  // 2. Send the TPA request
-  bot.chat(`/tpa ${tpaTarget}`)
-
-  // 3. Define what constitutes a "chest" and scan the area
-  const chestIds = [
-    bot.registry.blocksByName.chest.id,
-    bot.registry.blocksByName.trapped_chest.id
-  ]
-
-  const chestBlocks = bot.findBlocks({
-    matching: chestIds,
-    maxDistance: scanRadius,
-    count: 50 // Limit to 50 to avoid massive performance hits
-  })
-
-  if (chestBlocks.length === 0) {
-    // Note: If porting strictly into the provided bot.js, you may want to change 
-    // console.log to logFor(bot.username, '...') to utilize the TUI log box.
-    console.log(`[!] No chests found within ${scanRadius} blocks.`)
-    return
-  }
-
-  // 4. Sort the found chests by proximity to the bot
-  chestBlocks.sort((a, b) => {
-    return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b)
-  })
-
-  // 5. Iterate through the closest chests and deposit items
-  for (const chestPos of chestBlocks) {
-    const itemsToDump = bot.inventory.items()
-    
-    // Break entirely if the bot has nothing left to store
-    if (itemsToDump.length === 0) return 
-
-    const chestBlock = bot.blockAt(chestPos)
-    let chestContainer
-
-    try {
-      chestContainer = await bot.openContainer(chestBlock)
-
-      for (const item of itemsToDump) {
-        try {
-          // Attempt to deposit the full stack of the current item
-          await chestContainer.deposit(item.type, item.metadata, item.count)
-        } catch (err) {
-          // If deposit fails, the chest is likely full.
-          // Break the item loop to close this chest and move to the next one.
-          break 
-        }
-      }
-      
-      await chestContainer.close()
-    } catch (err) {
-      // Catch errors related to opening/interacting with the chest (e.g., blocked chests)
-      if (chestContainer) {
-        try { await chestContainer.close() } catch (_) {}
-      }
-    }
-  }
-}
   bot.once('spawn', () => {
     connected = true
     if (bots[id]) bots[id].spawnTime = Date.now()
@@ -566,8 +496,8 @@ bot.on('windowOpen', (window) => {
       const slotDataStr = getSafeItemString(slot).toLowerCase();
       
       // Check if it contains "fatal" AND ("crate" OR "key")
-      const hasFatal = slotDataStr.includes('fatal');
-      const hasCrateOrKey = slotDataStr.includes('crate') || slotDataStr.includes('key');
+      const hasFatal = slotDataStr.includes('fatal') || slotDataStr.includes('red');
+      const hasCrateOrKey = slotDataStr.includes('crate') || slotDataStr.includes('key') || slotDataStr.includes('Key') || slotDataStr.includes('candle');
 
       if (hasFatal && hasCrateOrKey) {
         targetSlot = j;
@@ -712,10 +642,69 @@ const COMMANDS = {
   '/switch <id>':    'Switch view to a different bot by name or number',
   '/uptime':         'Show uptime for all bots',
   '/proxy':          'Show the currently configured outbound proxy',
-  'anything else':   'Sent directly as a chat message/command from the active bot'
+  'anything else':   'Sent directly as a chat message/command from the active bot',
+  '/dump':   'dump gear to chest'
 }
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dc', '/reconnect', '/crates', '/crates-loop']
+/**
+ * Sends a TPA command based on an .env variable, then finds the nearest chests
+ * within a configured radius and dumps the bot's inventory into them.
+ * 
+ * @param {object} bot - The mineflayer bot instance
+ */
+async function tpaAndDump(bot) {
+  const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
+  const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
+
+  bot.chat(`/tpa ${tpaTarget}`)
+
+  const chestIds = [
+    bot.registry.blocksByName.chest.id,
+    bot.registry.blocksByName.trapped_chest.id
+  ]
+
+  const chestBlocks = bot.findBlocks({
+    matching: chestIds,
+    maxDistance: scanRadius,
+    count: 50
+  })
+
+  if (chestBlocks.length === 0) {
+    console.log(`[!] No chests found within ${scanRadius} blocks.`)
+    return
+  }
+
+  chestBlocks.sort((a, b) => {
+    return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b)
+  })
+
+  for (const chestPos of chestBlocks) {
+    const itemsToDump = bot.inventory.items()
+    if (itemsToDump.length === 0) return
+
+    const chestBlock = bot.blockAt(chestPos)
+    let chestContainer
+
+    try {
+      chestContainer = await bot.openContainer(chestBlock)
+
+      for (const item of itemsToDump) {
+        try {
+          await chestContainer.deposit(item.type, item.metadata, item.count)
+        } catch (err) {
+          break
+        }
+      }
+
+      await chestContainer.close()
+    } catch (err) {
+      if (chestContainer) {
+        try { await chestContainer.close() } catch (_) {}
+      }
+    }
+  }
+}
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect','/dump', '/dc', '/reconnect', '/crates', '/crates-loop']
 
 function runLocalCommandForBot(id, cmd) {
   const entry = bots[id]
@@ -748,12 +737,12 @@ function runLocalCommandForBot(id, cmd) {
       }
       return true
     }
-case '/dump': {
-  if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-  logFor(id, `{cyan-fg}› Initiating TPA and inventory dump...{/cyan-fg}`)
-  tpaAndDump(bot) // Call the function here
-  return true
-}
+    case '/dump': {
+     if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+      logFor(id, `{cyan-fg}› Initiating TPA and inventory dump...{/cyan-fg}`)
+      tpaAndDump(bot) // Call the function here
+    return true
+  }
     case '/players': {
       if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
       const players = Object.keys(bot.players)
