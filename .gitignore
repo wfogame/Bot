@@ -1,0 +1,6 @@
+.env
+auto-hack.js
+botnames.txt
+passwords.txt
+node_modules
+.command_history
