@@ -1,5 +1,7 @@
 require('dotenv').config()                        // npm install dotenv
 const net          = require('net')
+const fs           = require('fs')
+const path         = require('path')
 const mineflayer   = require('mineflayer')
 const blessed      = require('neo-blessed')
 const armorManager = require('mineflayer-armor-manager')
@@ -33,9 +35,9 @@ const MODE                    = process.env.MODE               || 'roam'
 const RTP_COMMAND             = process.env.RTP_COMMAND        || '/rtp world world'
 const RTP_INTERVAL_MS         = parseFloat(process.env.RTP_INTERVAL_MS || '34800')
 const BASE_SCAN_INTERVAL_MS   = parseInt(process.env.BASE_SCAN_INTERVAL_MS || '12000', 10)
-const BASE_SCAN_RADIUS        = parseInt(process.env.BASE_SCAN_RADIUS     || '256', 10)
+const BASE_SCAN_RADIUS        = parseInt(process.env.BASE_SCAN_RADIUS     || '192', 10)
 const BASE_ALERT_THRESHOLD    = parseInt(process.env.BASE_ALERT_THRESHOLD || '4', 10)
-const RTP_PAUSE_ON_BASE_MS    = parseInt(process.env.RTP_PAUSE_ON_BASE_MS || '600000', 25)
+const RTP_PAUSE_ON_BASE_MS    = parseInt(process.env.RTP_PAUSE_ON_BASE_MS || '600000', 10)
 
 // ── Player proximity config ──────────────────────────────────────────────────
 const PLAYER_PROXIMITY_RADIUS      = parseInt(process.env.PLAYER_PROXIMITY_RADIUS      || '32', 10)
@@ -70,8 +72,8 @@ const RECONNECT_BASE_MS  = 8000
 const RECONNECT_MAX_MS   = 5 * 60_000
 
 // ── Memory limits ─────────────────────────────────────────────────────────────
-const MAX_LOG_LINES        = 5000000000000
-const MAX_RTP_HISTORY_SIZE = 5000000000000
+const MAX_LOG_LINES        = 5000
+const MAX_RTP_HISTORY_SIZE = 5000
 
 // ── Discord rate limiting ────────────────────────────────────────────────────
 const discordQueue = []
@@ -110,7 +112,7 @@ function makeSocksConnect(targetHost, targetPort, onLog) {
       client.setSocket(socket)
       client.emit('connect')
     }).catch(err => {
-      client.emit('error', new Error(`SOCKS5 proxy connection failed: ${err.message}`))
+      client.emit('end', `SOCKS5 proxy connection failed: ${err.message}`)
     })
   }
 }
@@ -139,7 +141,7 @@ function makeHttpConnect(targetHost, targetPort, onLog) {
 
       if (statusCode !== 200) {
         socket.destroy()
-        client.emit('error', new Error(`HTTP proxy CONNECT failed: ${statusLine || 'no response from proxy'}`))
+        client.emit('end', `HTTP proxy CONNECT failed: ${statusLine || 'no response from proxy'}`)
         return
       }
 
@@ -151,7 +153,7 @@ function makeHttpConnect(targetHost, targetPort, onLog) {
     }
 
     socket.on('data', onData)
-    socket.on('error', (err) => client.emit('error', new Error(`HTTP proxy connection failed: ${err.message}`)))
+    socket.on('error', (err) => client.emit('end', `HTTP proxy connection failed: ${err.message}`))
   }
 }
 
@@ -191,13 +193,6 @@ const screen = blessed.screen({ smartCSR: true, title: 'Mineflayer RTP Console',
 function focusCommandInput() {
   if (screen.focused !== inputBox) inputBox.focus()
 }
-
-screen.on('keypress', (ch, key) => {
-  if (!key) return
-  if (key.name !== 'mouse' && key.name !== 'escape' && screen.focused !== inputBox) {
-    inputBox.focus()
-  }
-})
 
 let renderQueued = false
 function debouncedRender() {
@@ -256,6 +251,24 @@ console.warn  = (...a) => { logBox.log(`{yellow-fg}[warn] ${sanitize(a.join(' ')
 console.error = (...a) => { logBox.log(`{red-fg}[error] ${sanitize(a.join(' '))}{/red-fg}`);       debouncedRender() }
 
 screen.key(['C-c'], () => process.exit(0))
+
+// Automatically refocus the input box if the user clicks the log box
+logBox.on('click', () => {
+  inputBox.focus()
+})
+
+// Automatically refocus if the user starts typing while defocused
+screen.on('keypress', (ch, key) => {
+  if (key && key.ctrl && key.name === 'c') return // preserve ctrl+c
+  if (!inputBox.focused) {
+    inputBox.focus()
+    // If they typed a normal character, add it so it doesn't get lost
+    if (ch && ch.length === 1 && !key.ctrl && !key.meta) {
+      inputBox.setValue(inputBox.getValue() + ch)
+    }
+    screen.render()
+  }
+})
 
 function timestamp() {
   return `{gray-fg}${new Date().toLocaleTimeString()}{/gray-fg}`
@@ -374,30 +387,83 @@ const BASE_INDICATORS = [
 ]
 const storageIdCache = new WeakMap()
 
-function getStorageBlockIds(bot) {
-  if (!bot.registry) return []
-  if (storageIdCache.has(bot.registry)) return storageIdCache.get(bot.registry)
-  const ids = Object.keys(bot.registry.blocksByName)
-    .filter(name =>
-      name === 'chest' || name === 'trapped_chest' || name === 'barrel' ||
-      BASE_INDICATORS.includes(name) || name.endsWith('shulker_box')
-    )
-    .map(name => bot.registry.blocksByName[name].id)
-  storageIdCache.set(bot.registry, ids)
-  return ids
-}
+const { Vec3 } = require('vec3')
 
-function scanForBase(bot, id) {
+async function scanForBase(bot, id) {
   if (!bot.entity) return
   const state = bots[id]
   if (!state) return
 
+  // Prevent concurrent scans running at the same time
+  if (state.isScanningBase) return
+  state.isScanningBase = true
+
   try {
     const ids = getStorageBlockIds(bot)
-    if (ids.length === 0) return
+    if (ids.length === 0) {
+      state.isScanningBase = false
+      return
+    }
 
-    const positions = bot.findBlocks({ matching: ids, maxDistance: BASE_SCAN_RADIUS, count: 4096 })
-    if (positions.length < BASE_ALERT_THRESHOLD) return
+    const r = BASE_SCAN_RADIUS
+    const botPos = bot.entity.position.floored()
+    const positions = []
+    const seen = new Set()
+
+    // We scan using a 3D grid of small spheres to avoid freezing the main thread.
+    // A 48x48x48 box is fully covered by a sphere of radius 34 from its center.
+    const step = 48
+    const scanRadius = 34
+
+    const minX = botPos.x - r, maxX = botPos.x + r
+    const minZ = botPos.z - r, maxZ = botPos.z + r
+    const minY = bot.game?.minY ?? -64
+    const maxY = (bot.game?.minY ?? -64) + (bot.game?.height ?? 384) - 1
+
+    for (let x = minX; x <= maxX; x += step) {
+      for (let z = minZ; z <= maxZ; z += step) {
+        // Quick check if any chunk in this 48x48 vertical column is loaded
+        const cx = Math.floor(x / 16)
+        const cz = Math.floor(z / 16)
+        let isLoaded = false
+        for (let dcx = 0; dcx <= 3; dcx++) {
+          for (let dcz = 0; dcz <= 3; dcz++) {
+            if (bot.world.getColumn(cx + dcx, cz + dcz)) isLoaded = true
+          }
+        }
+        if (!isLoaded) continue
+
+        for (let y = minY; y <= maxY; y += step) {
+          const center = new Vec3(x + step / 2, y + step / 2, z + step / 2)
+          
+          // Optimization: skip if this grid box is completely outside the master scan radius
+          if (center.distanceTo(botPos) > r + scanRadius) continue
+
+          const found = bot.findBlocks({
+            matching: ids,
+            maxDistance: scanRadius,
+            point: center,
+            count: 4096
+          })
+
+          for (const p of found) {
+            const key = `${p.x},${p.y},${p.z}`
+            if (!seen.has(key)) {
+              seen.add(key)
+              positions.push(p)
+            }
+          }
+
+          // Yield to the event loop so the bot doesn't freeze or lag out
+          await new Promise(resolve => setImmediate(resolve))
+        }
+      }
+    }
+
+    if (positions.length < BASE_ALERT_THRESHOLD) {
+      state.isScanningBase = false
+      return
+    }
 
     const buckets = new Map()
     for (const pos of positions) {
@@ -435,6 +501,8 @@ function scanForBase(bot, id) {
     }
   } catch (err) {
     logFor(id, `{red-fg}[scan] Error: ${sanitize(err.message)}{/red-fg}`)
+  } finally {
+    state.isScanningBase = false
   }
 }
 
@@ -833,6 +901,7 @@ const COMMANDS = {
   '/list':           'Compact one-line-per-bot status list (online / offline / last kick)',
   '/chat <msg>':     'Send a chat message from the active bot (avoids triggering local commands)',
   '/disconnect':     'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
+  '/closeBot':       'Disconnect the active bot and completely remove it from the UI',
   '/clear':          'Clear the active bot\'s log view',
   '/help':           'List all available commands',
   '/status':         'Show active bot\'s connection, position, health, ping, uptime',
@@ -850,7 +919,7 @@ const COMMANDS = {
   'anything else':   'Sent directly as a chat message/command from the active bot'
 }
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/rtp', '/clear', '/disconnect', '/dc', '/reconnect']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/rtp', '/clear', '/disconnect', '/dc', '/reconnect', '/closeBot']
 
 function formatUptime(ms) {
   if (!ms || ms <= 0) return '0s'
@@ -919,6 +988,25 @@ function runLocalCommandForBot(id, cmd) {
     case '/dc': {
       logFor(id, `{yellow-fg}⚠ Disconnecting ${id}…{/yellow-fg}`)
       try { entry.disconnectManually() } catch (_) {}
+      return true
+    }
+
+    case '/closeBot': {
+      logFor(id, `{yellow-fg}⚠ Disconnecting and removing ${id}…{/yellow-fg}`)
+      try { entry.disconnectManually() } catch (_) {}
+      delete bots[id]
+      
+      const remainingNames = Object.keys(bots)
+      if (activeId === id) {
+        if (remainingNames.length > 0) {
+          switchTo(remainingNames[remainingNames.length - 1])
+        } else {
+          activeId = null
+          logBox.setContent('')
+          debouncedRender()
+        }
+      }
+      updateHeader()
       return true
     }
 
@@ -1142,8 +1230,21 @@ function handleCommand(trimmed) {
 // INPUT HANDLING & HISTORY
 // ════════════════════════════════════════════════════════════════════════════
 
-const commandHistory = []
+const HISTORY_FILE = path.join(__dirname, '.command_history')
+const MAX_HISTORY = 500
+
+const commandHistory = (() => {
+  try {
+    const data = fs.readFileSync(HISTORY_FILE, 'utf8')
+    return data.split('\n').filter(Boolean).slice(-MAX_HISTORY)
+  } catch (_) { return [] }
+})()
+
 let historyIndex = -1
+
+function saveHistory() {
+  try { fs.writeFileSync(HISTORY_FILE, commandHistory.join('\n') + '\n') } catch (_) {}
+}
 
 inputBox.key('up', () => {
   if (historyIndex < commandHistory.length - 1) {
@@ -1188,7 +1289,10 @@ inputBox.on('submit', (input) => {
   debouncedRender()
 
   if (trimmed.length > 0) {
-    if (commandHistory[commandHistory.length - 1] !== trimmed) commandHistory.push(trimmed)
+    if (commandHistory[commandHistory.length - 1] !== trimmed) {
+      commandHistory.push(trimmed)
+      saveHistory()
+    }
     historyIndex = -1
     handleCommand(trimmed)
   }
