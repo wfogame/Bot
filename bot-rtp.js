@@ -26,9 +26,9 @@ const PROXY_PORT       = parseInt(process.env.PROXY_PORT || '1080', 10)
 const PROXY_TYPE       = (process.env.PROXY_TYPE || 'socks5').toLowerCase() // 'socks5' | 'http'
 const PROXY_ENABLED    = Boolean(PROXY_HOST)
 
-// ── Discord alert config ──────────────────────────────────────────────────────
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1536063570859786383/fJihPygSzeQfWT5mHHGv8riec0cE0ajbxCotcoHj91AJLqpraOCUwOlrUq5230JCcCVL'
-const DISCORD_USER_ID     = process.env.DISCORD_USER_ID     || '1262159132887093339'
+// ── Discord alert config (Fixed: Hardcoded secrets removed) ────────────────
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || ''
+const DISCORD_USER_ID     = process.env.DISCORD_USER_ID     || ''
 
 // ── Roam / base-finding config ────────────────────────────────────────────────
 const MODE                    = process.env.MODE               || 'roam'
@@ -387,6 +387,31 @@ const BASE_INDICATORS = [
 ]
 const storageIdCache = new WeakMap()
 
+// ── Fixed: Inserted missing getStorageBlockIds function ──────────────────────
+function getStorageBlockIds(bot) {
+  if (!bot.registry) return []
+  const cached = storageIdCache.get(bot.registry)
+  if (cached) return cached
+
+  const storageNames = [
+    'chest', 'trapped_chest', 'barrel', 'ender_chest', 'anvil', 
+    'chipped_anvil', 'damaged_anvil', 'smithing_table', 'furnace', 
+    'blast_furnace', 'smoker', 'enchanting_table', 'shulker_box',
+    'white_shulker_box', 'orange_shulker_box', 'magenta_shulker_box',
+    'light_blue_shulker_box', 'yellow_shulker_box', 'lime_shulker_box',
+    'pink_shulker_box', 'gray_shulker_box', 'light_gray_shulker_box',
+    'cyan_shulker_box', 'purple_shulker_box', 'blue_shulker_box',
+    'brown_shulker_box', 'green_shulker_box', 'red_shulker_box', 'black_shulker_box'
+  ]
+
+  const ids = storageNames
+    .map(name => bot.registry.blocksByName[name]?.id)
+    .filter(id => id !== undefined)
+
+  storageIdCache.set(bot.registry, ids)
+  return ids
+}
+
 const { Vec3 } = require('vec3')
 
 async function scanForBase(bot, id) {
@@ -620,6 +645,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   const id = username
   let connected = false
   let manualDisconnect = false
+  let lastRawError = null // ── Fixed: Localised error scope per bot ──
 
   clearReconnectTimer(id)
 
@@ -751,6 +777,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
   // ── Start roaming mode ─────────────────────────────
   const startRoaming = () => {
+    clearAll() // ── Fixed: Prevent interval stacking and CPU starvation ──
     i('Entering roam mode: RTP + totem/food management + base & player scanning')
 
     safeChat(RTP_COMMAND)
