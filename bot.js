@@ -2,6 +2,7 @@ require('dotenv').config()          // npm install dotenv
 const net = require('net')
 const fs = require('fs')
 const path = require('path')
+const { exec } = require('child_process')
 const mineflayer = require('mineflayer')
 const blessed = require('neo-blessed')
 const armorManager = require('mineflayer-armor-manager')
@@ -25,6 +26,12 @@ const CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box'
 const CRATE_SCAN_RADIUS   = parseInt(process.env.CRATE_SCAN_RADIUS || '20', 10)
 const CRATE_REACH         = parseFloat(process.env.CRATE_REACH || '3.5')
 
+// ── /crates-all: shardshop → crates → dump chain across multiple bots ───────
+const SHARDSHOP_COMMAND             = process.env.SHARDSHOP_COMMAND            || '/shardshop' // ⚠ verify this matches your server's actual shardshop command
+const CRATES_ALL_STAGGER_MS         = parseInt(process.env.CRATES_ALL_STAGGER_MS        || '30000', 10) // delay between each bot starting its sequence
+const CRATES_ALL_SHARDSHOP_WAIT_MS  = parseInt(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS || '4000', 10)  // wait after shardshop before starting crates
+const CRATES_ALL_STEP_WAIT_MS       = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS      || '3000', 10)  // wait after crates before dump
+
 // ── Outbound proxy config ──────────────────────────────────────────────────────
 // Every bot's Minecraft TCP connection is routed through this single shared
 // proxy when PROXY_HOST is set. Leave PROXY_HOST empty/unset to connect
@@ -34,6 +41,25 @@ const PROXY_HOST       = process.env.PROXY_HOST       || ''
 const PROXY_ENABLED    = Boolean(PROXY_HOST)
 const PROXY_PORT       = parseInt(process.env.PROXY_PORT || '1080', 10)
 const PROXY_TYPE       = (process.env.PROXY_TYPE || 'socks5').toLowerCase()
+
+// ── Proxy stall watchdog ────────────────────────────────────────────────────
+// A stalled Tor circuit (or any proxy) often does NOT throw an error or close
+// the socket — it just stops delivering bytes. mineflayer/node-minecraft-protocol
+// has no idea anything is wrong in that case, so the normal 'end'/'error'-driven
+// reconnect logic never fires and a bot just sits there silently dead.
+// We track the last time each bot actually received a packet, and if a spawned
+// bot goes quiet for too long, we force-kill its socket so the existing
+// scheduleReconnect() path takes over. If MOST bots go quiet at the same time,
+// that points at the shared proxy itself (not any one bot) — in that case we
+// optionally restart the local proxy service before forcing reconnects.
+const PROXY_STALL_ENABLED       = PROXY_ENABLED && process.env.PROXY_STALL_WATCHDOG !== '0'
+const PROXY_STALL_TIMEOUT_MS    = parseInt(process.env.PROXY_STALL_TIMEOUT_MS || '90000', 10)   // no packets for this long while spawned = assume stalled
+const PROXY_STALL_CHECK_MS      = parseInt(process.env.PROXY_STALL_CHECK_MS   || '20000', 10)   // how often to scan for stalls
+const PROXY_STALL_RATIO         = parseFloat(process.env.PROXY_STALL_RATIO    || '0.5')          // fraction of spawned bots stalling at once => treat as shared-proxy failure
+const PROXY_IS_LOCAL            = /^(127\.0\.0\.1|localhost|::1)$/i.test(PROXY_HOST)
+const PROXY_RESTART_CMD         = process.env.PROXY_RESTART_CMD || (PROXY_IS_LOCAL ? 'brew services restart tor' : '')
+const PROXY_RESTART_COOLDOWN_MS = parseInt(process.env.PROXY_RESTART_COOLDOWN_MS || '120000', 10) // don't restart more than once per this window
+let lastProxyRestart = 0
 // ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
 // When a Velocity proxy transfers a player between backend servers, mineflayer's
 // protocol layer can receive partial / malformed packets mid-transfer.  This
@@ -260,6 +286,24 @@ console.error = (...a) => { logBox.log(`{red-fg}[error] ${sanitize(a.join(' '))}
 
 screen.key(['C-c'], () => process.exit(0))
 
+// Automatically refocus the input box if the user clicks the log box
+logBox.on('click', () => {
+  inputBox.focus()
+})
+
+// Automatically refocus if the user starts typing while defocused
+screen.on('keypress', (ch, key) => {
+  if (key && key.ctrl && key.name === 'c') return // preserve ctrl+c
+  if (!inputBox.focused) {
+    inputBox.focus()
+    // If they typed a normal character, add it so it doesn't get lost
+    if (ch && ch.length === 1 && !key.ctrl && !key.meta) {
+      inputBox.setValue(inputBox.getValue() + ch)
+    }
+    screen.render()
+  }
+})
+
 function timestamp() {
   return `{gray-fg}${new Date().toLocaleTimeString()}{/gray-fg}`
 }
@@ -379,7 +423,17 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
     lastKickReason: null,
     lastDisconnectReason: null,     // stores raw error text for transfer-crash classification
     crateRoutineRunning: false,     // prevents concurrent /crates runs
-    inCrateRoutine: false           // suppresses windowOpen handler during /crates
+    inCrateRoutine: false,          // suppresses windowOpen handler during /crates
+    lastActivity: Date.now(),       // updated on every inbound packet — used by the proxy stall watchdog
+    forceKilled: false              // set by the watchdog so scheduleReconnect logs it distinctly
+  }
+
+  // Any inbound packet (of any kind) proves the tunnel is actually delivering bytes.
+  // This is the generic liveness signal the stall watchdog relies on.
+  if (PROXY_STALL_ENABLED && bot._client) {
+    bot._client.on('packet', () => {
+      if (bots[id]) bots[id].lastActivity = Date.now()
+    })
   }
 
   // Managed timers — all cleared on disconnect so nothing fires against a dead bot
@@ -630,12 +684,58 @@ BOT_NAMES.forEach((name, index) => {
   }, index * CONNECT_DELAY_MS)
 })
 
+// ── Proxy stall watchdog ─────────────────────────────────────────────────────
+// Force-kills sockets for bots that have gone silent while spawned (see config
+// block near the top), so they fall through to the existing reconnect logic
+// instead of sitting there dead forever. If a large fraction of bots stall at
+// once, restarts the local proxy service first since that points at the shared
+// tunnel rather than any individual bot.
+function restartProxyService() {
+  if (!PROXY_RESTART_CMD) return
+  const now = Date.now()
+  if (now - lastProxyRestart < PROXY_RESTART_COOLDOWN_MS) return
+  lastProxyRestart = now
+  console.warn(`[proxy-watchdog] Multiple bots stalled at once — restarting local proxy: ${PROXY_RESTART_CMD}`)
+  exec(PROXY_RESTART_CMD, (err, stdout, stderr) => {
+    if (err) console.error(`[proxy-watchdog] Restart command failed: ${sanitize(err.message)}`)
+    else console.warn(`[proxy-watchdog] Restart command completed.`)
+  })
+}
+
+if (PROXY_STALL_ENABLED) {
+  setInterval(() => {
+    const now = Date.now()
+    const spawned = Object.entries(bots).filter(([, entry]) => entry.bot?.entity && entry.spawnTime)
+    const stalled = spawned.filter(([, entry]) => now - entry.lastActivity > PROXY_STALL_TIMEOUT_MS)
+    if (stalled.length === 0) return
+
+    // Shared-proxy failure: a big chunk of bots went quiet at the same time.
+    if (spawned.length >= 2 && stalled.length / spawned.length >= PROXY_STALL_RATIO) {
+      restartProxyService()
+    }
+
+    stalled.forEach(([id, entry]) => {
+      console.warn(`[proxy-watchdog] "${id}" has received nothing for ${Math.round((now - entry.lastActivity) / 1000)}s — forcing reconnect.`)
+      entry.forceKilled = true
+      entry.lastActivity = now // avoid re-triggering every scan while the kill/reconnect is in flight
+      try {
+        // Destroy the raw socket directly (not bot.quit()) — a graceful quit
+        // still has to write bytes down the same stalled tunnel and can hang too.
+        const sock = entry.bot?._client?.socket
+        if (sock && !sock.destroyed) sock.destroy(new Error('proxy-watchdog: no activity, forcing reconnect'))
+        else entry.bot?.emit('end', 'proxy-watchdog: forced')
+      } catch (_) {}
+    })
+  }, PROXY_STALL_CHECK_MS)
+}
+
 // ── Command registry ──────────────────────────────────────────────────────────
 const COMMANDS = {
   '/all <cmd>':      'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
   '/overview':       'Dashboard of every bot\'s health, food, ping, shards, and coins',
   '/crates':         `Warp to crates, find + walk to the nearest ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} (within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable`,
   '/crates-loop [n]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count',
+  '/crates-all [n]': `Run shardshop → crates → dump on bots 1 through n (default: all bots), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
   '/list':           'Compact one-line-per-bot status list (online / offline / last kick)',
   '/chat <msg>':     'Send a chat message from the active bot (avoids triggering local commands)',
   '/disconnect':     'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
@@ -1014,6 +1114,70 @@ async function runCrateLoop(id, maxIterations = Infinity) {
   }
 }
 
+// ── /crates-all: shardshop → crates → dump, staggered across bots ──────────
+let cratesAllRunning = false
+
+async function runCratesAllSequenceForBot(id) {
+  const entry = bots[id]
+  if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned — skipping /crates-all.{/yellow-fg}`); return }
+  if (entry.crateRoutineRunning || entry.crateLoopRunning) {
+    logFor(id, `{yellow-fg}⚠ ${id} is already busy with a crate routine — skipping /crates-all.{/yellow-fg}`)
+    return
+  }
+  const { bot } = entry
+  logFor(id, `{cyan-fg}› /crates-all: starting sequence (shardshop → crates → dump)…{/cyan-fg}`)
+
+  // 1. /shardshop — sell off before making room for more
+  try {
+    bot.chat(SHARDSHOP_COMMAND)
+    logFor(id, `{cyan-fg}› Sent "${sanitize(SHARDSHOP_COMMAND)}".{/cyan-fg}`)
+  } catch (err) {
+    logFor(id, `{red-fg}✗ Failed to send shardshop command: ${sanitize(err.message)}{/red-fg}`)
+  }
+  await new Promise(r => setTimeout(r, CRATES_ALL_SHARDSHOP_WAIT_MS))
+  if (!bots[id]?.bot?.entity) { logFor(id, `{red-fg}✗ ${id} despawned during shardshop — aborting sequence.{/red-fg}`); return }
+
+  // 2. /crates
+  const crateOk = await runCrateRoutine(id)
+  logFor(id, crateOk
+    ? `{green-fg}✓ Crate step done — moving on to dump.{/green-fg}`
+    : `{yellow-fg}⚠ Crate step failed — continuing to dump anyway.{/yellow-fg}`)
+  await new Promise(r => setTimeout(r, CRATES_ALL_STEP_WAIT_MS))
+  if (!bots[id]?.bot?.entity) { logFor(id, `{red-fg}✗ ${id} despawned before dump — aborting sequence.{/red-fg}`); return }
+
+  // 3. /dump
+  try {
+    await tpaAndDump(bot, id)
+    logFor(id, `{green-fg}✓ /crates-all: sequence complete for ${id}.{/green-fg}`)
+  } catch (err) {
+    logFor(id, `{red-fg}✗ Dump step failed: ${sanitize(err.message)}{/red-fg}`)
+  }
+}
+
+// Runs the shardshop → crates → dump sequence on bots 1..maxBots (insertion
+// order, matching /list and /switch numbering), starting one bot every
+// CRATES_ALL_STAGGER_MS so they don't all warp/click/TPA at the exact same
+// moment. maxBots omitted/Infinity = every bot currently registered.
+async function runCratesAll(maxBots = Infinity) {
+  if (cratesAllRunning) { logWarn('/crates-all is already running.'); return }
+  const ids = Object.keys(bots).slice(0, maxBots)
+  if (ids.length === 0) { logWarn('No bots to run /crates-all on.'); return }
+
+  cratesAllRunning = true
+  logInfo(`Starting /crates-all for ${ids.length} bot(s) [1–${ids.length}], ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart…`)
+
+  try {
+    await Promise.allSettled(
+      ids.map((id, idx) => new Promise((resolve) => {
+        setTimeout(() => { runCratesAllSequenceForBot(id).finally(resolve) }, idx * CRATES_ALL_STAGGER_MS)
+      }))
+    )
+    logSuccess(`/crates-all finished for all ${ids.length} bot(s).`)
+  } finally {
+    cratesAllRunning = false
+  }
+}
+
 // Generalized balance query — works for "/shards" ("Shards | Balance: 1,234")
 // and "/coins" ("Coins | Balance: 10 🪙.") since both follow the same
 // "<Label> ... Balance: <number>" shape.
@@ -1150,6 +1314,12 @@ function handleCommand(trimmed) {
   if (trimmed === '/proxy') {
     if (PROXY_ENABLED) {
       logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots)`)
+      if (PROXY_STALL_ENABLED) {
+        const restartInfo = PROXY_RESTART_CMD ? `restart cmd: "${PROXY_RESTART_CMD}"` : 'no restart cmd (proxy isn\'t local — set PROXY_RESTART_CMD in .env if you want auto-restart)'
+        logInfo(`{bold}Stall watchdog:{/bold} on — stall timeout ${(PROXY_STALL_TIMEOUT_MS / 1000).toFixed(0)}s, checked every ${(PROXY_STALL_CHECK_MS / 1000).toFixed(0)}s, ${restartInfo}`)
+      } else {
+        logInfo('{bold}Stall watchdog:{/bold} off (set PROXY_STALL_WATCHDOG=1, or unset PROXY_STALL_WATCHDOG=0, in .env)')
+      }
     } else {
       logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST in .env to enable one.')
     }
@@ -1221,6 +1391,15 @@ function handleCommand(trimmed) {
     const entry = bots[activeId]
     if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); return }
     runCrateLoop(activeId, count)
+    return
+  }
+
+  // ── /crates-all [n] ───
+  if (trimmed === '/crates-all' || trimmed.startsWith('/crates-all ')) {
+    const arg = trimmed.slice('/crates-all'.length).trim()
+    const maxBots = arg ? parseInt(arg, 10) : Infinity
+    if (arg && (isNaN(maxBots) || maxBots <= 0)) { logWarn('Usage: /crates-all [n] — n must be a positive number'); return }
+    runCratesAll(maxBots)
     return
   }
 
@@ -1330,4 +1509,3 @@ inputBox.on('cancel', () => {
 })
 
 screen.render()
-
