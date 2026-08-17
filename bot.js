@@ -17,6 +17,7 @@ const VERSION          = process.env.VERSION          || '1.21.2'
 const LOGIN_PASSWORD   = process.env.LOGIN_PASSWORD   || '123456'
 const BOT_NAMES        = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
+const MAX_RECONNECT     = parseInt(process.env.MAX_RECONNECT     || '17',   10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
 
@@ -425,7 +426,8 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
     crateRoutineRunning: false,     // prevents concurrent /crates runs
     inCrateRoutine: false,          // suppresses windowOpen handler during /crates
     lastActivity: Date.now(),       // updated on every inbound packet — used by the proxy stall watchdog
-    forceKilled: false              // set by the watchdog so scheduleReconnect logs it distinctly
+    forceKilled: false,             // set by the watchdog so scheduleReconnect logs it distinctly
+    manualDisconnect: false         // mirrors the closure-local flag so the watchdog (outside this closure) can see it too
   }
 
   // Any inbound packet (of any kind) proves the tunnel is actually delivering bytes.
@@ -460,6 +462,13 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
     const proxyCrash = isProxyCrash(rawError || reason)
     const attempt = bots[id]?.reconnectAttempts || 0
+
+    // Check max reconnect limit (only for non-proxy-crash disconnects; proxy crashes reset the count)
+    if (!proxyCrash && attempt >= MAX_RECONNECT) {
+      if (bots[id]) bots[id].reconnectTimer = null
+      e(`${id} reached max reconnects (${MAX_RECONNECT}). Disconnected permanently. Use /reconnect to try again.`)
+      return
+    }
 
     let delay
     if (proxyCrash) {
@@ -666,6 +675,10 @@ bot.on('windowOpen', (window) => {
 
   bots[id].disconnectManually = () => {
     manualDisconnect = true
+    if (bots[id]) {
+      bots[id].manualDisconnect = true // let the watchdog (outside this closure) know this was intentional
+      bots[id].spawnTime = null        // stop looking "spawned" to the watchdog now that we're intentionally offline
+    }
     clearReconnectTimer(id)
     clearAll()
     try { bot.quit() } catch (_) {}
@@ -705,7 +718,7 @@ function restartProxyService() {
 if (PROXY_STALL_ENABLED) {
   setInterval(() => {
     const now = Date.now()
-    const spawned = Object.entries(bots).filter(([, entry]) => entry.bot?.entity && entry.spawnTime)
+    const spawned = Object.entries(bots).filter(([, entry]) => entry.bot?.entity && entry.spawnTime && !entry.manualDisconnect)
     const stalled = spawned.filter(([, entry]) => now - entry.lastActivity > PROXY_STALL_TIMEOUT_MS)
     if (stalled.length === 0) return
 
@@ -732,7 +745,7 @@ if (PROXY_STALL_ENABLED) {
 // ── Command registry ──────────────────────────────────────────────────────────
 const COMMANDS = {
   '/all <cmd>':      'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
-  '/overview':       'Dashboard of every bot\'s health, food, ping, shards, and coins',
+  '/overview':       'Dashboard of every bot\'s health, food, ping, shards, coins, and balance',
   '/crates':         `Warp to crates, find + walk to the nearest ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} (within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable`,
   '/crates-loop [n]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count',
   '/crates-all [n]': `Run shardshop → crates → dump on bots 1 through n (default: all bots), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
@@ -1178,9 +1191,10 @@ async function runCratesAll(maxBots = Infinity) {
   }
 }
 
-// Generalized balance query — works for "/shards" ("Shards | Balance: 1,234")
-// and "/coins" ("Coins | Balance: 10 🪙.") since both follow the same
-// "<Label> ... Balance: <number>" shape.
+// Generalized balance query — works for "/shards" ("Shards | Balance: 1,234"),
+// "/coins" ("Coins | Balance: 10 🪙."), and the money command "/bal" (which
+// replies with a bare "Balance: $0.40" — no "Shards"/"Coins" label in front,
+// and a decimal dollar amount instead of a whole number).
 function queryBalance(id, label, command, timeoutMs = 2000) {
   return new Promise((resolve) => {
     const entry = bots[id]
@@ -1197,13 +1211,21 @@ function queryBalance(id, label, command, timeoutMs = 2000) {
       resolve(value)
     }
 
-    const regex = new RegExp(`${label}.{0,10}Balance:?\\s*([\\d,]+)`, 'i')
+    const isMoney = label.toLowerCase() === 'balance'
+    // Money replies as a bare "Balance: $0.40" (no leading label, decimal amount).
+    // Shards/Coins reply as "<Label> ... Balance: <whole number>".
+    const regex = isMoney
+      ? /Balance:?\s*\$?\s*([\d,]+(?:\.\d+)?)/i
+      : new RegExp(`${label}.{0,10}Balance:?\\s*\\$?\\s*([\\d,]+(?:\\.\\d+)?)`, 'i')
 
     const onMessage = (jsonMsg) => {
       try {
         const text = jsonMsg.toString()
+        // The Shards/Coins replies also contain the word "Balance:" — don't let
+        // the money listener grab those instead of the real /bal reply.
+        if (isMoney && /shards|coins/i.test(text)) return
         const match = text.match(regex)
-        if (match) finish(parseInt(match[1].replace(/,/g, ''), 10))
+        if (match) finish(parseFloat(match[1].replace(/,/g, '')))
       } catch (_) {}
     }
 
@@ -1255,16 +1277,17 @@ function handleCommand(trimmed) {
   if (trimmed === '/overview') {
     const names = Object.keys(bots)
     logInfo('{bold}── Bot Overview Dashboard ──{/bold}')
-    logInfo('Querying shard and coin balances…')
+    logInfo('Querying shard, coin, and money balances…')
 
     Promise.all(names.map(name => {
-      if (!bots[name]?.bot?.entity) return Promise.resolve({ name, shards: null, coins: null })
+      if (!bots[name]?.bot?.entity) return Promise.resolve({ name, shards: null, coins: null, money: null })
       return Promise.all([
         queryBalance(name, 'Shards', '/shards'),
-        queryBalance(name, 'Coins', '/coins')
-      ]).then(([shards, coins]) => ({ name, shards, coins }))
+        queryBalance(name, 'Coins', '/coins'),
+        queryBalance(name, 'Balance', '/bal')
+      ]).then(([shards, coins, money]) => ({ name, shards, coins, money }))
     })).then(results => {
-      results.forEach(({ name, shards, coins }, idx) => {
+      results.forEach(({ name, shards, coins, money }, idx) => {
         const b = bots[name]
         if (b?.bot?.entity) {
           const hp   = Math.round(b.bot.health || 0)
@@ -1272,7 +1295,8 @@ function handleCommand(trimmed) {
           const ping = b.bot.player?.ping ?? '?'
           const sh   = shards !== null ? shards.toLocaleString() : 'N/A'
           const co   = coins !== null ? coins.toLocaleString() : 'N/A'
-          log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Shards: ${sh} | Coins: ${co}`)
+          const mo   = money !== null ? `$${money.toFixed(2)}` : 'N/A'
+          log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Shards: ${sh} | Coins: ${co} | Balance: ${mo}`)
         } else {
           log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{/gray-fg}`)
         }
