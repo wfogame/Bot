@@ -2,28 +2,25 @@
   "name": "afk-bot",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "bot.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node bot.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "blessed": "^0.1.81",
-    "express": "^4.19.2",
-"socket.io": "^4.7.5",
-⁠"express-basic-auth": "^1.2.1"⁠,
-
     "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "express-basic-auth": "^1.2.1",
     "minecraft-data": "^3.113.1",
     "minecraft-protocol": "^1.66.2",
     "mineflayer": "github:plainprince/mineflayer#fix-velocity-configuration-phase",
     "mineflayer-armor-manager": "^2.0.1",
     "mineflayer-pathfinder": "^2.4.5",
-    "neo-blessed": "^0.2.0",
     "prismarine-chunk": "^1.41.0",
+    "socket.io": "^4.7.5",
     "socks": "^2.8.9"
   }
 }
