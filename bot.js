@@ -54,9 +54,21 @@ const PROXY_RESTART_CMD         = process.env.PROXY_RESTART_CMD || (PROXY_IS_LOC
 const PROXY_RESTART_COOLDOWN_MS = parseInt(process.env.PROXY_RESTART_COOLDOWN_MS || '120000', 10)
 let lastProxyRestart = 0
 const basicAuth = require('express-basic-auth')
+const crypto = require('crypto')
 
-// Web GUI Authentication Protection
-
+// ── Web GUI Authentication Protection ──────────────────────────────────────
+// SECURITY: don't fall back to a hardcoded password that's sitting in plain
+// sight in this source file. If GUI_PASSWORD isn't set, generate a random
+// one for this process and print it once so the operator can still log in.
+let GUI_PASSWORD = process.env.GUI_PASSWORD
+if (!GUI_PASSWORD) {
+  GUI_PASSWORD = crypto.randomBytes(12).toString('hex')
+  console.warn(`[security] GUI_PASSWORD not set in .env — generated one-time password: ${GUI_PASSWORD}`)
+  console.warn('[security] Set GUI_PASSWORD in your .env for a stable password across restarts.')
+}
+if (!process.env.LOGIN_PASSWORD) {
+  console.warn('[security] LOGIN_PASSWORD not set in .env — using the weak built-in default. Set it to protect the Minecraft account.')
+}
 
 // ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
 const PROXY_CRASH_PATTERNS = [
@@ -89,11 +101,24 @@ if (BOT_NAMES.length === 0) {
 const app = express()
 const server = http.createServer(app)
 const io = new Server(server)
-app.use(basicAuth({
-    users: { 'admin': process.env.GUI_PASSWORD || 'ChangeMe123!' },
+
+// Shared Basic Auth middleware for the web console. Applied to BOTH the
+// plain Express routes AND the Socket.IO engine below — Socket.IO's
+// handshake/polling/websocket traffic bypasses Express entirely, so
+// app.use() alone would leave the real control channel (the "command"
+// socket event that drives every bot) completely unauthenticated even
+// though the HTML page itself is password-protected.
+const guiAuth = basicAuth({
+    users: { 'admin': GUI_PASSWORD },
     challenge: true,
-    unauthorizedResponse: (req) => 'Access denied: Invalid credentials.'
-}))
+    unauthorizedResponse: () => 'Access denied: Invalid credentials.'
+})
+app.use(guiAuth)
+// Requires socket.io >= 4.6.0. This is the critical line: without it,
+// anyone who can reach this server can open a socket connection and issue
+// /exit, /chat, /new-bot, etc. with no credentials at all.
+io.engine.use(guiAuth)
+
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -336,7 +361,12 @@ setInterval(() => {
     botState.logs = botState.logs.filter(log => log.time > cutoff)
   })
 }, 60000)
-const bots = {}
+// Object.create(null) — a plain `{}` inherits from Object.prototype, which
+// has a special `__proto__` accessor. Since bot IDs (usernames) can come
+// from an authenticated /new-bot command, an id of "__proto__" against a
+// normal object could pollute the shared prototype instead of creating an
+// own property. A null-prototype object closes that off entirely.
+const bots = Object.create(null)
 let activeId = null
 let currentHeader = ''
 const MAX_LOG_LINES = 5000
@@ -1270,6 +1300,7 @@ function handleCommand(trimmed) {
     const args = trimmed.slice(9).trim().split(/\s+/).filter(Boolean)
     const username = args[0]
     if (!username) { logWarn('Usage: /new-bot <username> [host] [port] [version]'); return }
+    if (!/^[A-Za-z0-9_]{1,16}$/.test(username)) { logWarn('Invalid username — letters, numbers, underscore only, max 16 chars.'); return }
     if (bots[username]) { logWarn(`Bot "${username}" already exists.`); return }
     const h = args[1] || HOST
     const p = args[2] ? parseInt(args[2], 10) : PORT
