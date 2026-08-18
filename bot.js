@@ -20,6 +20,11 @@ const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const MAX_RECONNECT     = parseInt(process.env.MAX_RECONNECT     || '17',   10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
+const http = require('http');
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('Bot is running');
+}).listen(process.env.PORT || 3000);
 
 // ── /crates command config ─────────────────────────────────────────────────
 const WARP_CRATES         = process.env.WARP_CRATES_COMMAND || '/warp crates'
