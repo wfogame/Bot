@@ -53,6 +53,14 @@ const PROXY_IS_LOCAL            = /^(127\.0\.0\.1|localhost|::1)$/i.test(PROXY_H
 const PROXY_RESTART_CMD         = process.env.PROXY_RESTART_CMD || (PROXY_IS_LOCAL ? 'brew services restart tor' : '')
 const PROXY_RESTART_COOLDOWN_MS = parseInt(process.env.PROXY_RESTART_COOLDOWN_MS || '120000', 10)
 let lastProxyRestart = 0
+const basicAuth = require('express-basic-auth')
+
+// Web GUI Authentication Protection
+app.use(basicAuth({
+    users: { 'admin': process.env.GUI_PASSWORD || 'ChangeMe123!' },
+    challenge: true,
+    unauthorizedResponse: (req) => 'Access denied: Invalid credentials.'
+}))
 
 // ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
 const PROXY_CRASH_PATTERNS = [
