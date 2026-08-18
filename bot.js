@@ -56,11 +56,7 @@ let lastProxyRestart = 0
 const basicAuth = require('express-basic-auth')
 
 // Web GUI Authentication Protection
-app.use(basicAuth({
-    users: { 'admin': process.env.GUI_PASSWORD || 'ChangeMe123!' },
-    challenge: true,
-    unauthorizedResponse: (req) => 'Access denied: Invalid credentials.'
-}))
+
 
 // ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
 const PROXY_CRASH_PATTERNS = [
@@ -93,7 +89,11 @@ if (BOT_NAMES.length === 0) {
 const app = express()
 const server = http.createServer(app)
 const io = new Server(server)
-
+app.use(basicAuth({
+    users: { 'admin': process.env.GUI_PASSWORD || 'ChangeMe123!' },
+    challenge: true,
+    unauthorizedResponse: (req) => 'Access denied: Invalid credentials.'
+}))
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
