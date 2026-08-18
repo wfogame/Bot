@@ -4,9 +4,14 @@ const fs = require('fs')
 const path = require('path')
 const { exec } = require('child_process')
 const mineflayer = require('mineflayer')
-const blessed = require('neo-blessed')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
+
+// Web GUI dependencies
+const express = require('express')
+const http = require('http')
+const { Server } = require('socket.io')
+
 let SocksClient
 try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY_HOST is set and PROXY_TYPE=socks5 — npm install socks */ }
 
@@ -20,11 +25,6 @@ const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const MAX_RECONNECT     = parseInt(process.env.MAX_RECONNECT     || '17',   10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
-const http = require('http');
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('Bot is running');
-}).listen(process.env.PORT || 3000);
 
 // ── /crates command config ─────────────────────────────────────────────────
 const WARP_CRATES         = process.env.WARP_CRATES_COMMAND || '/warp crates'
@@ -33,50 +33,28 @@ const CRATE_SCAN_RADIUS   = parseInt(process.env.CRATE_SCAN_RADIUS || '20', 10)
 const CRATE_REACH         = parseFloat(process.env.CRATE_REACH || '3.5')
 
 // ── /crates-all: shardshop → crates → dump chain across multiple bots ───────
-const SHARDSHOP_COMMAND             = process.env.SHARDSHOP_COMMAND            || '/shardshop' // ⚠ verify this matches your server's actual shardshop command
-const CRATES_ALL_STAGGER_MS         = parseInt(process.env.CRATES_ALL_STAGGER_MS        || '30000', 10) // delay between each bot starting its sequence
-const CRATES_ALL_SHARDSHOP_WAIT_MS  = parseInt(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS || '4000', 10)  // wait after shardshop before starting crates
-const CRATES_ALL_STEP_WAIT_MS       = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS      || '3000', 10)  // wait after crates before dump
+const SHARDSHOP_COMMAND             = process.env.SHARDSHOP_COMMAND            || '/shardshop'
+const CRATES_ALL_STAGGER_MS         = parseInt(process.env.CRATES_ALL_STAGGER_MS        || '30000', 10)
+const CRATES_ALL_SHARDSHOP_WAIT_MS  = parseInt(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS || '4000', 10)
+const CRATES_ALL_STEP_WAIT_MS       = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS      || '3000', 10)
 
 // ── Outbound proxy config ──────────────────────────────────────────────────────
-// Every bot's Minecraft TCP connection is routed through this single shared
-// proxy when PROXY_HOST is set. Leave PROXY_HOST empty/unset to connect
-// directly (default, unchanged behavior). const PROXY_HOST       = process.env.PROXY_HOST       || ''
-
 const PROXY_HOST       = process.env.PROXY_HOST       || ''
 const PROXY_ENABLED    = Boolean(PROXY_HOST)
 const PROXY_PORT       = parseInt(process.env.PROXY_PORT || '1080', 10)
 const PROXY_TYPE       = (process.env.PROXY_TYPE || 'socks5').toLowerCase()
 
 // ── Proxy stall watchdog ────────────────────────────────────────────────────
-// A stalled Tor circuit (or any proxy) often does NOT throw an error or close
-// the socket — it just stops delivering bytes. mineflayer/node-minecraft-protocol
-// has no idea anything is wrong in that case, so the normal 'end'/'error'-driven
-// reconnect logic never fires and a bot just sits there silently dead.
-// We track the last time each bot actually received a packet, and if a spawned
-// bot goes quiet for too long, we force-kill its socket so the existing
-// scheduleReconnect() path takes over. If MOST bots go quiet at the same time,
-// that points at the shared proxy itself (not any one bot) — in that case we
-// optionally restart the local proxy service before forcing reconnects.
 const PROXY_STALL_ENABLED       = PROXY_ENABLED && process.env.PROXY_STALL_WATCHDOG !== '0'
-const PROXY_STALL_TIMEOUT_MS    = parseInt(process.env.PROXY_STALL_TIMEOUT_MS || '90000', 10)   // no packets for this long while spawned = assume stalled
-const PROXY_STALL_CHECK_MS      = parseInt(process.env.PROXY_STALL_CHECK_MS   || '20000', 10)   // how often to scan for stalls
-const PROXY_STALL_RATIO         = parseFloat(process.env.PROXY_STALL_RATIO    || '0.5')          // fraction of spawned bots stalling at once => treat as shared-proxy failure
+const PROXY_STALL_TIMEOUT_MS    = parseInt(process.env.PROXY_STALL_TIMEOUT_MS || '90000', 10)
+const PROXY_STALL_CHECK_MS      = parseInt(process.env.PROXY_STALL_CHECK_MS   || '20000', 10)
+const PROXY_STALL_RATIO         = parseFloat(process.env.PROXY_STALL_RATIO    || '0.5')
 const PROXY_IS_LOCAL            = /^(127\.0\.0\.1|localhost|::1)$/i.test(PROXY_HOST)
 const PROXY_RESTART_CMD         = process.env.PROXY_RESTART_CMD || (PROXY_IS_LOCAL ? 'brew services restart tor' : '')
-const PROXY_RESTART_COOLDOWN_MS = parseInt(process.env.PROXY_RESTART_COOLDOWN_MS || '120000', 10) // don't restart more than once per this window
+const PROXY_RESTART_COOLDOWN_MS = parseInt(process.env.PROXY_RESTART_COOLDOWN_MS || '120000', 10)
 let lastProxyRestart = 0
+
 // ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
-// When a Velocity proxy transfers a player between backend servers, mineflayer's
-// protocol layer can receive partial / malformed packets mid-transfer.  This
-// causes deserialization errors, zlib failures, or abrupt socket resets that
-// look like crashes but are actually recoverable — just reconnect fast.
-//
-// We match error messages against these patterns to distinguish "proxy transfer
-// crash" (fast 3 s reconnect, no backoff) from "real kick" (exponential backoff).
-// NOTE: this is unrelated to PROXY_HOST/PROXY_PORT above — this section is about
-// the Minecraft server's own backend proxy (Velocity/Bungee), not our outbound
-// SOCKS5/HTTP proxy.
 const PROXY_CRASH_PATTERNS = [
   /PartialReadError/i,
   /deserialization/i,
@@ -92,27 +70,124 @@ const PROXY_CRASH_PATTERNS = [
   /Missing (packet|field)/i,
   /buffer length/i,
   /not enough (data|bytes)/i,
-  /Cannot read propert/i,        // "Cannot read properties of null" from half-torn-down state
+  /Cannot read propert/i,
 ]
-const FAST_RECONNECT_MS = 10400        // flat delay for proxy transfer crashes
-const RECONNECT_BASE_MS = 10400        // base delay for real kicks / errors
-const RECONNECT_MAX_MS  = 5 * 60_000  // ceiling for exponential backoff
+const FAST_RECONNECT_MS = 10400
+const RECONNECT_BASE_MS = 10400
+const RECONNECT_MAX_MS  = 5 * 60_000
 
 if (BOT_NAMES.length === 0) {
   console.error('No BOT_NAMES defined in .env — nothing to connect.')
   process.exit(1)
 }
 
+// ── Web GUI Setup (Replaces neo-blessed) ──────────────────────────────────────
+const app = express()
+const server = http.createServer(app)
+const io = new Server(server)
+
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Mineflayer AFK Console</title>
+      <style>
+        body { background: #1e1e1e; color: #c5c8c6; font-family: monospace; margin: 0; padding: 20px; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+        #header { background: #0000aa; color: white; padding: 10px; font-weight: bold; text-align: center; border-radius: 4px; margin-bottom: 10px; }
+        #logs { flex: 1; background: #000; border: 1px solid #555; padding: 10px; overflow-y: auto; border-radius: 4px; margin-bottom: 10px; white-space: pre-wrap; word-wrap: break-word; }
+        #input-container { display: flex; }
+        #cmd { flex: 1; padding: 10px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; font-family: monospace; font-size: 14px; }
+        #cmd:focus { outline: none; border-color: #00aa00; }
+        .log-line { padding: 2px 0; border-bottom: 1px solid #222; }
+      </style>
+    </head>
+    <body>
+      <div id="header">⛏ MINEFLAYER AFK CONSOLE (Loading...)</div>
+      <div id="logs"></div>
+      <div id="input-container">
+        <input type="text" id="cmd" placeholder="Enter command (e.g. /status, /help, /chat hello) ..." autocomplete="off" />
+      </div>
+      
+      <script src="/socket.io/socket.io.js"></script>
+      <script>
+        const socket = io();
+        const logsDiv = document.getElementById('logs');
+        const cmdInput = document.getElementById('cmd');
+        const headerDiv = document.getElementById('header');
+
+        let history = [];
+        let historyIndex = -1;
+
+        function parseTags(text) {
+          return text
+            .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/\\{([a-z]+)-fg\\}/gi, '<span style="color: $1;">')
+            .replace(/\\{\\/([a-z]+)-fg\\}/gi, '</span>')
+            .replace(/\\{bold\\}/gi, '<strong>').replace(/\\{\\/bold\\}/gi, '</strong>')
+            .replace(/\\{center\\}/gi, '<div style="text-align:center;">').replace(/\\{\\/center\\}/gi, '</div>');
+        }
+
+        socket.on('header', (html) => {
+          headerDiv.innerHTML = parseTags(html);
+        });
+
+        socket.on('log', (msg) => {
+          const div = document.createElement('div');
+          div.className = 'log-line';
+          div.innerHTML = parseTags(msg);
+          logsDiv.appendChild(div);
+          logsDiv.scrollTop = logsDiv.scrollHeight;
+        });
+
+        socket.on('clear', () => {
+          logsDiv.innerHTML = '';
+        });
+
+        cmdInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && cmdInput.value.trim() !== '') {
+            const val = cmdInput.value.trim();
+            socket.emit('command', val);
+            history.push(val);
+            historyIndex = history.length;
+            cmdInput.value = '';
+          } else if (e.key === 'ArrowUp') {
+            if (historyIndex > 0) {
+              historyIndex--;
+              cmdInput.value = history[historyIndex];
+            }
+          } else if (e.key === 'ArrowDown') {
+            if (historyIndex < history.length - 1) {
+              historyIndex++;
+              cmdInput.value = history[historyIndex];
+            } else {
+              historyIndex = history.length;
+              cmdInput.value = '';
+            }
+          }
+        });
+      </script>
+    </body>
+    </html>
+  `)
+})
+
+io.on('connection', (socket) => {
+  socket.emit('header', currentHeader)
+  if (activeId && bots[activeId]) {
+    bots[activeId].logs.forEach(l => socket.emit('log', l.text))
+  }
+  socket.on('command', (cmd) => {
+    handleCommand(cmd)
+  })
+})
+
+const WEB_PORT = process.env.PORT || 3000
+server.listen(WEB_PORT, () => {
+  console.log(\`Web GUI active and listening on port \${WEB_PORT}\`)
+})
+
 // ── Outbound proxy tunnelling ──────────────────────────────────────────────────
-// node-minecraft-protocol (which mineflayer builds on) lets you override how the
-// raw socket is opened via the `connect` option passed to createBot/createClient.
-// We use that hook to tunnel every bot's connection through a single SOCKS5 or
-// HTTP CONNECT proxy instead of dialing the Minecraft server directly.
-//
-// Important: because the tunnel socket is already open by the time we hand it
-// to the client, the underlying socket's native 'connect' event has already
-// fired and won't fire again — so we must manually emit 'connect' on the
-// client itself to kick off the handshake/login sequence.
 function makeSocksConnect(targetHost, targetPort, onLog) {
   return (client) => {
     if (!SocksClient) {
@@ -166,9 +241,6 @@ function makeHttpConnect(targetHost, targetPort, onLog) {
         return
       }
 
-      // Any bytes after the CONNECT response headers are already Minecraft
-      // protocol data trickling in — push them back onto the socket before
-      // handing it off so nothing gets lost.
       const leftover = buffer.slice(headerEnd + 4)
       if (leftover.length) socket.unshift(Buffer.from(leftover, 'latin1'))
 
@@ -196,23 +268,19 @@ function makeProxyConnect(targetHost, targetPort, onLog) {
 process.on('uncaughtException', (err) => {
   try { 
     const text = err.stack ? err.stack : err.message;
-    logBox.log(`{red-fg}[UNCAUGHT] ${sanitize(text)}{/red-fg}`); 
-    debouncedRender() 
-  }
-  catch (_) { /* blessed may not be ready */ }
+    broadcastLog(`{red-fg}[UNCAUGHT] ${sanitize(text)}{/red-fg}`); 
+  } catch (_) {}
 })
 process.on('unhandledRejection', (reason) => {
   try {
     const msg = reason instanceof Error ? reason.message : String(reason)
-    logBox.log(`{red-fg}[UNHANDLED REJECTION] ${sanitize(msg)}{/red-fg}`); debouncedRender()
+    broadcastLog(`{red-fg}[UNHANDLED REJECTION] ${sanitize(msg)}{/red-fg}`);
   } catch (_) {}
 })
 
-// ── Blessed tag sanitiser ─────────────────────────────────────────────────────
-// Player names / chat / errors can contain {curly braces} that blessed parses
-// as formatting tags → crash.  We escape everything except our own known tags.
+// ── Tag sanitiser ─────────────────────────────────────────────────────────────
 const KNOWN_TAG_RE = /\{(\/?(bold|underline|blink|inverse|red|green|blue|cyan|magenta|yellow|white|gray|grey|black|center|left|right)(-fg|-bg)?)\}/g
-const MAX_SANITIZED_LENGTH = 4000 // hard cap — some servers send oversized/malformed chat as a client-crashing trick
+const MAX_SANITIZED_LENGTH = 4000
 function sanitize(str) {
   if (typeof str !== 'string') str = String(str ?? '')
   if (str.length > MAX_SANITIZED_LENGTH) {
@@ -224,106 +292,42 @@ function sanitize(str) {
   return escaped.replace(/\x00T(\d+)\x00/g, (_, i) => tags[+i])
 }
 
-// ── TUI setup ─────────────────────────────────────────────────────────────────
-const screen = blessed.screen({ smartCSR: true, title: 'Mineflayer AFK Console', fullUnicode: true })
-
-// Debounced render — the single biggest fix for input lag.
-// Without this, every chat line from 14 bots triggers a full synchronous repaint.
-let renderQueued = false
-function debouncedRender() {
-  if (renderQueued) return
-  renderQueued = true
-  setImmediate(() => {
-    renderQueued = false
-    try {
-      screen.render()
-    } catch (err) {
-      // Render itself failed — don't route this through logBox/console (that's what
-      // just broke), write straight to the real fd so it doesn't loop or get lost.
-      try { require('fs').writeSync(2, `[render error] ${err && err.message}\n`) } catch (_) {}
-    }
-  })
+// ── Logging System ────────────────────────────────────────────────────────────
+function broadcastLog(msg) {
+  io.emit('log', msg)
+  // Also dump to actual terminal so render logs still get output natively
+  process.stdout.write(msg.replace(/\{.*?\}/g, '') + '\n') 
 }
 
-const header = blessed.box({
-  top: 0, left: 0, width: '100%', height: 3,
-  content: '{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}{/center}',
-  tags: true,
-  style: { fg: 'white', bg: 'blue' }
-})
-
-const logBox = blessed.log({
-  top: 3, left: 0, width: '100%', height: '100%-6',
-  border: { type: 'line' },
-  label: ' Activity Log ',
-  tags: true,
-  padding: { left: 1, right: 1 },
-  style: { border: { fg: 'gray' }, label: { fg: 'cyan', bold: true } },
-  scrollable: true, alwaysScroll: true, mouse: true,
-  scrollbar: { ch: '│', style: { fg: 'cyan' } }
-})
-
-const inputBox = blessed.textbox({
-  bottom: 0, left: 0, width: '100%', height: 3,
-  border: { type: 'line' },
-  tags: true,
-  style: { border: { fg: 'green' }, fg: 'white' },
-  inputOnFocus: true
-})
-inputBox.setLabel(' {green-fg}{bold}❯{/bold}{/green-fg} Command ')
-
-screen.append(header)
-screen.append(logBox)
-screen.append(inputBox)
-inputBox.focus()
-
-// Redirect native output into the log box — nothing leaks to raw terminal
 process.stderr.write = (chunk) => {
   try {
     const text = (typeof chunk === 'string' ? chunk : chunk.toString('utf8')).trim()
-    if (text) logBox.log(`{gray-fg}[stderr] ${sanitize(text)}{/gray-fg}`)
-    debouncedRender()
+    if (text) broadcastLog(`{gray-fg}[stderr] ${sanitize(text)}{/gray-fg}`)
   } catch (_) {}
   return true
 }
-console.log   = (...a) => { logBox.log(`{gray-fg}${sanitize(a.join(' '))}{/gray-fg}`);            debouncedRender() }
-console.warn  = (...a) => { logBox.log(`{yellow-fg}[warn] ${sanitize(a.join(' '))}{/yellow-fg}`);  debouncedRender() }
-console.error = (...a) => { logBox.log(`{red-fg}[error] ${sanitize(a.join(' '))}{/red-fg}`);       debouncedRender() }
-
-screen.key(['C-c'], () => process.exit(0))
-
-// Automatically refocus the input box if the user clicks the log box
-logBox.on('click', () => {
-  inputBox.focus()
-})
-
-// Automatically refocus if the user starts typing while defocused
-screen.on('keypress', (ch, key) => {
-  if (key && key.ctrl && key.name === 'c') return // preserve ctrl+c
-  if (!inputBox.focused) {
-    inputBox.focus()
-    // If they typed a normal character, add it so it doesn't get lost
-    if (ch && ch.length === 1 && !key.ctrl && !key.meta) {
-      inputBox.setValue(inputBox.getValue() + ch)
-    }
-    screen.render()
-  }
-})
+console.log   = (...a) => { broadcastLog(`{gray-fg}${sanitize(a.join(' '))}{/gray-fg}`) }
+console.warn  = (...a) => { broadcastLog(`{yellow-fg}[warn] ${sanitize(a.join(' '))}{/yellow-fg}`) }
+console.error = (...a) => { broadcastLog(`{red-fg}[error] ${sanitize(a.join(' '))}{/red-fg}`) }
 
 function timestamp() {
   return `{gray-fg}${new Date().toLocaleTimeString()}{/gray-fg}`
 }
 
+function debouncedRender() {
+  // Stubbed out - no longer needed without blessed
+}
+
 // ── Multi-bot state ───────────────────────────────────────────────────────────
 setInterval(() => {
-  const cutoff = Date.now() - (20 * 60 * 1000) // 20 minutes ago
+  const cutoff = Date.now() - (20 * 60 * 1000)
   Object.values(bots).forEach(botState => {
-    // Filter out anything older than the cutoff
     botState.logs = botState.logs.filter(log => log.time > cutoff)
   })
-}, 60000) // Runs once every 60 seconds
-const bots = {}       // username → { bot, spawnTime, logs[], host, port, version, reconnectAttempts, … }
+}, 60000)
+const bots = {}
 let activeId = null
+let currentHeader = ''
 const MAX_LOG_LINES = 5000
 
 function updateHeader() {
@@ -333,40 +337,31 @@ function updateHeader() {
   const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` : null).filter(Boolean)
   const othersLabel = others.length ? `  |  Others: ${others.join(', ')}` : ''
   const proxyLabel = PROXY_ENABLED ? `   —   Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
-  header.setContent(`{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}   —   ${activeLabel}${othersLabel}${proxyLabel}{/center}`)
-  debouncedRender()
+  currentHeader = `{center}{bold}⛏  MINEFLAYER AFK CONSOLE{/bold}   —   ${activeLabel}${othersLabel}${proxyLabel}{/center}`
+  io.emit('header', currentHeader)
 }
 
 function switchTo(id) {
   if (!bots[id]) { log(`{red-fg}✗ No bot named "${sanitize(id)}"{/red-fg}`); return }
   activeId = id
   
-  logBox.setContent('')
-  logBox.scrollTo(0)
+  io.emit('clear')
   
-  // Map the objects back to strings to render them
   if (bots[id].logs.length > 0) {
-    logBox.setContent(bots[id].logs.map(l => l.text).join('\n'))
+    bots[id].logs.forEach(l => io.emit('log', l.text))
   }
-  
   updateHeader()
-  const bottom = logBox.getScrollHeight()
-  if (bottom > 0) logBox.scrollTo(bottom)
-  debouncedRender()
 }
 
 function logFor(id, msg) {
   if (!bots[id]) return
   
   const line = `${timestamp()} ${msg}`
-  
-  // Store as an object with a timestamp
   bots[id].logs.push({ text: line, time: Date.now() })
   if (bots[id].logs.length > MAX_LOG_LINES) bots[id].logs.splice(0, bots[id].logs.length - MAX_LOG_LINES)
   
   if (id === activeId) { 
-    logBox.log(line)
-    debouncedRender() 
+    broadcastLog(line)
   }
 }
 function log(msg)        { if (activeId) logFor(activeId, msg) }
@@ -389,7 +384,6 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   let connected = false
   let manualDisconnect = false
 
-  // Cancel any pending reconnect from a previous instance (timer lives on bots[id], not in closure)
   clearReconnectTimer(id)
 
   const s = (msg) => logFor(id, `{green-fg}✓ ${msg}{/green-fg}`)
@@ -398,7 +392,6 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   const w = (msg) => logFor(id, `{yellow-fg}⚠ ${msg}{/yellow-fg}`)
   const c = (msg) => logFor(id, `{white-fg}${sanitize(msg)}{/white-fg}`)
 
-  // Clean up previous instance
   if (bots[id]?.bot) {
     try { bots[id].bot.removeAllListeners() } catch (_) {}
     try { if (bots[id].bot._client) bots[id].bot._client.removeAllListeners() } catch (_) {}
@@ -427,28 +420,24 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
     reconnectAttempts: existingReconnectAttempts,
     reconnectTimer: null,
     lastKickReason: null,
-    lastDisconnectReason: null,     // stores raw error text for transfer-crash classification
-    crateRoutineRunning: false,     // prevents concurrent /crates runs
-    inCrateRoutine: false,          // suppresses windowOpen handler during /crates
-    lastActivity: Date.now(),       // updated on every inbound packet — used by the proxy stall watchdog
-    forceKilled: false,             // set by the watchdog so scheduleReconnect logs it distinctly
-    manualDisconnect: false         // mirrors the closure-local flag so the watchdog (outside this closure) can see it too
+    lastDisconnectReason: null,
+    crateRoutineRunning: false,
+    inCrateRoutine: false,
+    lastActivity: Date.now(),
+    forceKilled: false,
+    manualDisconnect: false
   }
 
-  // Any inbound packet (of any kind) proves the tunnel is actually delivering bytes.
-  // This is the generic liveness signal the stall watchdog relies on.
   if (PROXY_STALL_ENABLED && bot._client) {
     bot._client.on('packet', () => {
       if (bots[id]) bots[id].lastActivity = Date.now()
     })
   }
 
-  // Managed timers — all cleared on disconnect so nothing fires against a dead bot
   const timeouts = []
   const pushT = (fn, delay) => { const t = setTimeout(fn, delay); timeouts.push(t); return t }
   const clearAll = () => { timeouts.forEach(clearTimeout); timeouts.length = 0 }
 
-  // Detect whether a disconnect was caused by a Velocity proxy transfer crash
   function isProxyCrash(reason) {
     if (!reason) return false
     const text = typeof reason === 'string' ? reason : (reason.message || String(reason))
@@ -458,17 +447,13 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   const scheduleReconnect = (reason, rawError) => {
     clearAll()
     connected = false
-    // ADDED CHECK: Prevent recursive calls if already reconnecting or manually disconnected
     if (manualDisconnect || bots[id]?.reconnectTimer) {
-      // If a reconnect is already scheduled, or if the user manually disconnected,
-      // do not schedule another reconnect.
       return;
     }
 
     const proxyCrash = isProxyCrash(rawError || reason)
     const attempt = bots[id]?.reconnectAttempts || 0
 
-    // Check max reconnect limit (only for non-proxy-crash disconnects; proxy crashes reset the count)
     if (!proxyCrash && attempt >= MAX_RECONNECT) {
       if (bots[id]) bots[id].reconnectTimer = null
       e(`${id} reached max reconnects (${MAX_RECONNECT}). Disconnected permanently. Use /reconnect to try again.`)
@@ -477,11 +462,9 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
     let delay
     if (proxyCrash) {
-      // Proxy transfer crash → fast flat reconnect, don't increment backoff
       delay = FAST_RECONNECT_MS
       w(`${reason} (proxy transfer crash detected). Reconnecting in ${(delay / 1000).toFixed(1)}s…`)
     } else {
-      // Real kick / unknown error → exponential backoff
       delay = Math.min(RECONNECT_BASE_MS * Math.pow(1.3, attempt), RECONNECT_MAX_MS)
       if (bots[id]) bots[id].reconnectAttempts = attempt + 1
       w(`${reason}. Auto-reconnecting in ${(delay / 1000).toFixed(1)}s (Attempt ${attempt + 1})…`)
@@ -489,49 +472,32 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 
     bots[id].reconnectTimer = setTimeout(() => {
       bots[id].reconnectTimer = null
-      // Defer to next tick so reconnect never runs inside the disconnect/create call stack
       setImmediate(() => createBotInstance(id, host, port, version))
     }, delay)
   }
 
-  const safeChat = (msg) => {
-    if (!connected || !bot.entity) return false
-    try { bot.chat(msg); return true } catch (err) {
-      logFor(id, `{red-fg}[chat] Failed: ${sanitize(err.message)}{/red-fg}`)
-      return false
-    }
-  }
-
-  // ── Lifecycle events ─────────────────────────────────
-bot.once('login', () => {
+  bot.once('login', () => {
     i('Connected to server socket. Awaiting chat auth prompts…')
   })
 
-  // Listen to plain text messages to grep for auth requests
   bot.on('messagestr', (message) => {
     const text = message.toLowerCase()
-
-    // Grep for register prompts (e.g., "Please register using /register <password> <password>")
     if (text.includes('register') && text.includes('/register')) {
       i('Auth prompt detected: sending /register')
       pushT(() => bot.chat(`/register ${LOGIN_PASSWORD} ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
-    }
-
-    // Grep for login prompts (e.g., "Please login using /login <password>")
-    else if (text.includes('login') && text.includes('/login')) {
+    } else if (text.includes('login') && text.includes('/login')) {
       i('Auth prompt detected: sending /login')
       pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
     }
   })
+
   bot.once('spawn', () => {
     connected = true
     if (bots[id]) bots[id].spawnTime = Date.now()
     s(`Spawned on ${host}:${port} (v${version}).`)
 
-    // Stable for 60 s → reset backoff
     pushT(() => { if (connected && bots[id]) bots[id].reconnectAttempts = 0 }, 60_000)
 
-    // Auto-equip best armor immediately on spawn
     pushT(() => {
       if (bot.entity) {
         try { bot.armorManager.equipAll() } catch (_) {}
@@ -544,84 +510,76 @@ bot.once('login', () => {
     }, 3600 + Math.random() * 600)
   })
 
-bot.on('windowOpen', (window) => {
-  try {
-    // Skip the GUI/Fatal Crate handler when a /crates routine opened this window
-    if (bots[id]?.inCrateRoutine) return
+  bot.on('windowOpen', (window) => {
+    try {
+      if (bots[id]?.inCrateRoutine) return
 
-    const title = window.title?.toString ? window.title.toString() : String(window.title || '')
-    
-    const getSafeItemString = (item) => {
-      if (!item) return 'null';
-      return `[Item ${item.displayName || item.name} x${item.count || 1}]`;
-    };
+      const title = window.title?.toString ? window.title.toString() : String(window.title || '')
+      const getSafeItemString = (item) => {
+        if (!item) return 'null';
+        return `[Item ${item.displayName || item.name} x${item.count || 1}]`;
+      };
 
-    const slotInfo = window.slots.map((slot, index) => {
-      return `Slot ${index}: ${getSafeItemString(slot)}`;
-    }).join('\n');
-    i(`Window opened: ${sanitize(title)}\n${sanitize(slotInfo)}`);
+      const slotInfo = window.slots.map((slot, index) => {
+        return `Slot ${index}: ${getSafeItemString(slot)}`;
+      }).join('\n');
+      i(`Window opened: ${sanitize(title)}\n${sanitize(slotInfo)}`);
 
-    // Search for "Fatal Crate" OR "Fatal Key"
-    let targetSlot = GUI_SLOT; // Default to slot 11
-    let foundFatalItem = false;
+      let targetSlot = GUI_SLOT;
+      let foundFatalItem = false;
 
-    for (let j = 0; j < window.slots.length; j++) {
-      const slot = window.slots[j];
-      if (!slot) continue;
-      
-      // Stringify safely and make lowercase for case-insensitive search
-      const slotDataStr = getSafeItemString(slot).toLowerCase();
-      
-      // Check if it contains "fatal" AND ("crate" OR "key")
-      const hasFatal = slotDataStr.includes('fatal') || slotDataStr.includes('red');
-      const hasCrateOrKey = slotDataStr.includes('crate') || slotDataStr.includes('key') || slotDataStr.includes('Key') || slotDataStr.includes('candle');
+      for (let j = 0; j < window.slots.length; j++) {
+        const slot = window.slots[j];
+        if (!slot) continue;
+        
+        const slotDataStr = getSafeItemString(slot).toLowerCase();
+        const hasFatal = slotDataStr.includes('fatal') || slotDataStr.includes('red');
+        const hasCrateOrKey = slotDataStr.includes('crate') || slotDataStr.includes('key') || slotDataStr.includes('candle');
 
-      if (hasFatal && hasCrateOrKey) {
-        targetSlot = j;
-        foundFatalItem = true;
-        break; // Stop searching once we find it
-      }
-    }
-
-    if (foundFatalItem) {
-      i(`Found Fatal Crate/Key at slot ${targetSlot}!`);
-    } else {
-      i(`Fatal Crate/Key not found, falling back to GUI_SLOT (${GUI_SLOT}).`);
-    }
-
-    // Validation
-    if (targetSlot >= window.slots.length) {
-      w(`Slot ${targetSlot} out of bounds — window only has ${window.slots.length} slots`)
-      return
-    }
-    if (!window.slots[targetSlot]) {
-      w(`Slot ${targetSlot} is empty — not clicking.`)
-      return
-    }
-
-    // Click the decided slot
-    pushT(async () => {
-      if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
-      try {
-        await bot.clickWindow(targetSlot, 0, 0)
-        if(!foundFatalItem ){
-        i(`Clicked slot ${targetSlot} — waiting for server transfer…`)
-        }else{
-          i(`Clicked slot ${targetSlot} — Purchased Fatal key`)
-          }
-      } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
-    }, 2000 + Math.random() * 1600)
-
-    // AFK Warp logic
-    pushT(async () => {
-        if(!foundFatalItem){
-        bot.chat(WARP_AFK)
-        i(`Warped — waiting for server transfer…`)
+        if (hasFatal && hasCrateOrKey) {
+          targetSlot = j;
+          foundFatalItem = true;
+          break;
         }
-    }, 54000 + Math.random() * 1600)
+      }
 
-  } catch (err) { e(`windowOpen handler error: ${sanitize(err.message)}`) }
-})
+      if (foundFatalItem) {
+        i(`Found Fatal Crate/Key at slot ${targetSlot}!`);
+      } else {
+        i(`Fatal Crate/Key not found, falling back to GUI_SLOT (${GUI_SLOT}).`);
+      }
+
+      if (targetSlot >= window.slots.length) {
+        w(`Slot ${targetSlot} out of bounds — window only has ${window.slots.length} slots`)
+        return
+      }
+      if (!window.slots[targetSlot]) {
+        w(`Slot ${targetSlot} is empty — not clicking.`)
+        return
+      }
+
+      pushT(async () => {
+        if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
+        try {
+          await bot.clickWindow(targetSlot, 0, 0)
+          if(!foundFatalItem ){
+            i(`Clicked slot ${targetSlot} — waiting for server transfer…`)
+          }else{
+            i(`Clicked slot ${targetSlot} — Purchased Fatal key`)
+          }
+        } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
+      }, 2000 + Math.random() * 1600)
+
+      pushT(async () => {
+          if(!foundFatalItem){
+          bot.chat(WARP_AFK)
+          i(`Warped — waiting for server transfer…`)
+          }
+      }, 54000 + Math.random() * 1600)
+
+    } catch (err) { e(`windowOpen handler error: ${sanitize(err.message)}`) }
+  })
+
   bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
 
   bot.on('kicked', (reason) => {
@@ -634,13 +592,6 @@ bot.on('windowOpen', (window) => {
     e(`Kicked: ${sanitize(text)}`)
   })
 
-  // ── Velocity / proxy packet-level error interception ────────────────────────
-  // Mineflayer's high-level 'error' event only fires for some failures.
-  // Protocol-layer crashes (partial packets, bad decompression) surface on the
-  // raw _client *before* the bot 'end' event.  We catch them here to:
-  //   1. Log them clearly instead of crashing
-  //   2. Store the raw error so scheduleReconnect can classify it as a
-  //      proxy transfer crash and use the fast reconnect path.
   let lastRawError = null
 
   bot.on('error', (err) => {
@@ -654,8 +605,6 @@ bot.on('windowOpen', (window) => {
     }
   })
 
-  // Intercept _client-level errors — these fire for deserialization / zlib
-  // failures that don't always propagate to the bot 'error' event.
   if (bot._client) {
     bot._client.on('error', (err) => {
       lastRawError = err
@@ -673,7 +622,6 @@ bot.on('windowOpen', (window) => {
     connected = false
     const reasonText = reason ? String(reason) : ''
     w(`Disconnected${reasonText ? ': ' + sanitize(reasonText) : ''}.`)
-    // Pass the last captured raw error so the reconnect logic can classify it
     scheduleReconnect('Connection lost', lastRawError || reasonText)
     lastRawError = null
   })
@@ -681,8 +629,8 @@ bot.on('windowOpen', (window) => {
   bots[id].disconnectManually = () => {
     manualDisconnect = true
     if (bots[id]) {
-      bots[id].manualDisconnect = true // let the watchdog (outside this closure) know this was intentional
-      bots[id].spawnTime = null        // stop looking "spawned" to the watchdog now that we're intentionally offline
+      bots[id].manualDisconnect = true
+      bots[id].spawnTime = null
     }
     clearReconnectTimer(id)
     clearAll()
@@ -703,11 +651,6 @@ BOT_NAMES.forEach((name, index) => {
 })
 
 // ── Proxy stall watchdog ─────────────────────────────────────────────────────
-// Force-kills sockets for bots that have gone silent while spawned (see config
-// block near the top), so they fall through to the existing reconnect logic
-// instead of sitting there dead forever. If a large fraction of bots stall at
-// once, restarts the local proxy service first since that points at the shared
-// tunnel rather than any individual bot.
 function restartProxyService() {
   if (!PROXY_RESTART_CMD) return
   const now = Date.now()
@@ -727,7 +670,6 @@ if (PROXY_STALL_ENABLED) {
     const stalled = spawned.filter(([, entry]) => now - entry.lastActivity > PROXY_STALL_TIMEOUT_MS)
     if (stalled.length === 0) return
 
-    // Shared-proxy failure: a big chunk of bots went quiet at the same time.
     if (spawned.length >= 2 && stalled.length / spawned.length >= PROXY_STALL_RATIO) {
       restartProxyService()
     }
@@ -735,10 +677,8 @@ if (PROXY_STALL_ENABLED) {
     stalled.forEach(([id, entry]) => {
       console.warn(`[proxy-watchdog] "${id}" has received nothing for ${Math.round((now - entry.lastActivity) / 1000)}s — forcing reconnect.`)
       entry.forceKilled = true
-      entry.lastActivity = now // avoid re-triggering every scan while the kill/reconnect is in flight
+      entry.lastActivity = now
       try {
-        // Destroy the raw socket directly (not bot.quit()) — a graceful quit
-        // still has to write bytes down the same stalled tunnel and can hang too.
         const sock = entry.bot?._client?.socket
         if (sock && !sock.destroyed) sock.destroy(new Error('proxy-watchdog: no activity, forcing reconnect'))
         else entry.bot?.emit('end', 'proxy-watchdog: forced')
@@ -751,12 +691,12 @@ if (PROXY_STALL_ENABLED) {
 const COMMANDS = {
   '/all <cmd>':      'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
   '/overview':       'Dashboard of every bot\'s health, food, ping, shards, coins, and balance',
-  '/crates':         `Warp to crates, find + walk to the nearest ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} (within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable`,
+  '/crates':         `Warp to crates, find + walk to the nearest ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}`,
   '/crates-loop [n]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count',
-  '/crates-all [n]': `Run shardshop → crates → dump on bots 1 through n (default: all bots), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
-  '/list':           'Compact one-line-per-bot status list (online / offline / last kick)',
-  '/chat <msg>':     'Send a chat message from the active bot (avoids triggering local commands)',
-  '/disconnect':     'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
+  '/crates-all [n]': `Run shardshop → crates → dump on bots 1 through n (default: all bots)`,
+  '/list':           'Compact one-line-per-bot status list',
+  '/chat <msg>':     'Send a chat message from the active bot',
+  '/disconnect':     'Disconnect the active bot. Alias: /dc',
   '/closeBot':       'Disconnect the active bot and completely remove it from the UI',
   '/clear':          'Clear the active bot\'s log view',
   '/help':           'List all available commands',
@@ -766,20 +706,13 @@ const COMMANDS = {
   '/exit':           'Disconnect all bots and close the program',
   '/reconnect':      'Reconnect the active bot',
   '/reconnect-all':  'Reconnect every currently disconnected bot',
-  '/new-bot <name> [host] [port] [ver]': 'Create and connect a new bot',
+  '/new-bot <name>': 'Create and connect a new bot',
   '/switch <id>':    'Switch view to a different bot by name or number',
   '/uptime':         'Show uptime for all bots',
   '/proxy':          'Show the currently configured outbound proxy',
-  'anything else':   'Sent directly as a chat message/command from the active bot',
-  '/dump':   'dump gear to chest'
+  '/dump':           'dump gear to chest'
 }
 
-/**
- * Sends a TPA command based on an .env variable, then finds the nearest chests
- * within a configured radius and dumps the bot's inventory into them.
- * 
- * @param {object} bot - The mineflayer bot instance
- */
 async function tpaAndDump(bot, id) {
   const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
   const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
@@ -839,23 +772,16 @@ async function tpaAndDump(bot, id) {
 
     try {
       chestContainer = await bot.openContainer(chestBlock)
-
       for (const item of itemsToDump) {
-        try {
-          await chestContainer.deposit(item.type, item.metadata, item.count)
-        } catch (err) {
-          break
-        }
+        try { await chestContainer.deposit(item.type, item.metadata, item.count) } catch (err) { break }
       }
-
       await chestContainer.close()
     } catch (err) {
-      if (chestContainer) {
-        try { await chestContainer.close() } catch (_) {}
-      }
+      if (chestContainer) { try { await chestContainer.close() } catch (_) {} }
     }
   }
 }
+
 const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/closeBot']
 
 function runLocalCommandForBot(id, cmd) {
@@ -904,7 +830,7 @@ function runLocalCommandForBot(id, cmd) {
 
     case '/clear': {
       entry.logs = []
-      if (id === activeId) { logBox.setContent(''); debouncedRender() }
+      if (id === activeId) { io.emit('clear') }
       return true
     }
 
@@ -926,8 +852,7 @@ function runLocalCommandForBot(id, cmd) {
           switchTo(remainingNames[remainingNames.length - 1])
         } else {
           activeId = null
-          logBox.setContent('')
-          debouncedRender()
+          io.emit('clear')
         }
       }
       updateHeader()
@@ -944,13 +869,13 @@ function runLocalCommandForBot(id, cmd) {
 
     case '/crates': {
       if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-      runCrateRoutine(id) // fire-and-forget async routine, logs its own progress
+      runCrateRoutine(id)
       return true
     }
 
     case '/crates-loop': {
       if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-      runCrateLoop(id) // fire-and-forget, logs its own progress
+      runCrateLoop(id)
       return true
     }
 
@@ -959,10 +884,6 @@ function runLocalCommandForBot(id, cmd) {
   }
 }
 
-// ── Anti-cheat safe walk-to-target helper ──────────────────────────────────
-// Since the crate room is flat, mineflayer-pathfinder is overkill and often
-// triggers server anti-cheat rubberbanding (walking in place). This simple
-// loop perfectly mimics a vanilla player walking forward without jumping/sprinting.
 function walkToBlock(bot, targetPos, { reach = 4.5, timeoutMs = 15000 } = {}) {
   return new Promise(async (resolve) => {
     if (!bot.entity) { resolve(false); return }
@@ -979,10 +900,6 @@ function walkToBlock(bot, targetPos, { reach = 4.5, timeoutMs = 15000 } = {}) {
       if (timeout) clearTimeout(timeout)
     }
 
-    // 1. Inject physics override for GrimAC!
-    // The debug logs showed the bot was standing in a 'light' block with 0.07 velocity.
-    // Mineflayer often has broken physics for non-solid blocks like light and buttons,
-    // applying weird friction or collision that GrimAC instantly flags.
     try {
       const mcData = require('minecraft-data')(bot.version)
       if (mcData.blocksByName.light) mcData.blocksByName.light.boundingBox = 'empty'
@@ -991,9 +908,6 @@ function walkToBlock(bot, targetPos, { reach = 4.5, timeoutMs = 15000 } = {}) {
       }
     } catch (_) {}
 
-    // 2. Look smoothly (false) to avoid Aimbot flags
-    // Wrapped in a 1-second timeout because Mineflayer's smooth lookAt has a bug
-    // where it can hang forever if it gets stuck on floating-point precision.
     try {
       await Promise.race([
         bot.lookAt(targetPos.offset(0.5, 0.5, 0.5), false),
@@ -1003,7 +917,6 @@ function walkToBlock(bot, targetPos, { reach = 4.5, timeoutMs = 15000 } = {}) {
 
     if (settled || !bot.entity) { resolve(false); return }
 
-    // 3. Start walking purely vanilla
     bot.setControlState('forward', true)
     bot.setControlState('sprint', false)
     bot.setControlState('jump', false)
@@ -1011,28 +924,18 @@ function walkToBlock(bot, targetPos, { reach = 4.5, timeoutMs = 15000 } = {}) {
 
     timer = setInterval(() => {
       if (!bot.entity) { stop(); resolve(false); return }
-      
       const dist = bot.entity.position.distanceTo(targetPos)
-      if (dist <= reach) {
-        stop()
-        resolve(true)
-      }
+      if (dist <= reach) { stop(); resolve(true) }
     }, 50)
 
     timeout = setTimeout(() => {
       stop()
-      if (bot.entity && bot.entity.position.distanceTo(targetPos) <= reach) {
-        resolve(true)
-      } else {
-        resolve(false)
-      }
+      if (bot.entity && bot.entity.position.distanceTo(targetPos) <= reach) resolve(true)
+      else resolve(false)
     }, timeoutMs)
   })
 }
 
-// ── /crates routine: warp → scan for red shulker box → walk → right-click ──
-// Runs once per invocation. The inCrateRoutine flag suppresses the generic
-// windowOpen handler so the shulker box GUI doesn't trigger Fatal Crate logic.
 async function runCrateRoutine(id) {
   const entry = bots[id]
   logFor(id,`Change the version in .env to 1.21.1 to use this mechanic otherwise SKIP it.`)
@@ -1049,7 +952,6 @@ async function runCrateRoutine(id) {
       return false
     }
 
-    // Wait for warp to complete (5 seconds + random 100-600ms)
     await new Promise(resolve => setTimeout(resolve, 5000 + 100 + Math.random() * 500))
     if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during warp — aborting.{/red-fg}`); return false }
 
@@ -1075,7 +977,6 @@ async function runCrateRoutine(id) {
       return false
     }
 
-    // Re-fetch the block at the target position in case it changed while walking over
     const freshBlock = bot.blockAt(block.position)
     if (!freshBlock || freshBlock.name !== CRATE_SHULKER_BLOCK) {
       logFor(id, `{red-fg}✗ Block at target location changed before I could click it — warping to afk instead.{/red-fg}`)
@@ -1100,7 +1001,6 @@ async function runCrateRoutine(id) {
   }
 }
 
-// ── /crates-loop: repeatedly run the crate routine ────────────────────────
 async function runCrateLoop(id, maxIterations = Infinity) {
   const entry = bots[id]
   if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return }
@@ -1119,7 +1019,6 @@ async function runCrateLoop(id, maxIterations = Infinity) {
         break
       }
 
-      // Brief pause between iterations to avoid spamming the server
       await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000))
       if (!bots[id]?.bot?.entity) {
         logFor(id, `{red-fg}✗ ${id} despawned during crate loop — stopping.{/red-fg}`)
@@ -1132,7 +1031,6 @@ async function runCrateLoop(id, maxIterations = Infinity) {
   }
 }
 
-// ── /crates-all: shardshop → crates → dump, staggered across bots ──────────
 let cratesAllRunning = false
 
 async function runCratesAllSequenceForBot(id) {
@@ -1145,7 +1043,6 @@ async function runCratesAllSequenceForBot(id) {
   const { bot } = entry
   logFor(id, `{cyan-fg}› /crates-all: starting sequence (shardshop → crates → dump)…{/cyan-fg}`)
 
-  // 1. /shardshop — sell off before making room for more
   try {
     bot.chat(SHARDSHOP_COMMAND)
     logFor(id, `{cyan-fg}› Sent "${sanitize(SHARDSHOP_COMMAND)}".{/cyan-fg}`)
@@ -1155,7 +1052,6 @@ async function runCratesAllSequenceForBot(id) {
   await new Promise(r => setTimeout(r, CRATES_ALL_SHARDSHOP_WAIT_MS))
   if (!bots[id]?.bot?.entity) { logFor(id, `{red-fg}✗ ${id} despawned during shardshop — aborting sequence.{/red-fg}`); return }
 
-  // 2. /crates
   const crateOk = await runCrateRoutine(id)
   logFor(id, crateOk
     ? `{green-fg}✓ Crate step done — moving on to dump.{/green-fg}`
@@ -1163,7 +1059,6 @@ async function runCratesAllSequenceForBot(id) {
   await new Promise(r => setTimeout(r, CRATES_ALL_STEP_WAIT_MS))
   if (!bots[id]?.bot?.entity) { logFor(id, `{red-fg}✗ ${id} despawned before dump — aborting sequence.{/red-fg}`); return }
 
-  // 3. /dump
   try {
     await tpaAndDump(bot, id)
     logFor(id, `{green-fg}✓ /crates-all: sequence complete for ${id}.{/green-fg}`)
@@ -1172,10 +1067,6 @@ async function runCratesAllSequenceForBot(id) {
   }
 }
 
-// Runs the shardshop → crates → dump sequence on bots 1..maxBots (insertion
-// order, matching /list and /switch numbering), starting one bot every
-// CRATES_ALL_STAGGER_MS so they don't all warp/click/TPA at the exact same
-// moment. maxBots omitted/Infinity = every bot currently registered.
 async function runCratesAll(maxBots = Infinity) {
   if (cratesAllRunning) { logWarn('/crates-all is already running.'); return }
   const ids = Object.keys(bots).slice(0, maxBots)
@@ -1196,10 +1087,6 @@ async function runCratesAll(maxBots = Infinity) {
   }
 }
 
-// Generalized balance query — works for "/shards" ("Shards | Balance: 1,234"),
-// "/coins" ("Coins | Balance: 10 🪙."), and the money command "/bal" (which
-// replies with a bare "Balance: $0.40" — no "Shards"/"Coins" label in front,
-// and a decimal dollar amount instead of a whole number).
 function queryBalance(id, label, command, timeoutMs = 2000) {
   return new Promise((resolve) => {
     const entry = bots[id]
@@ -1217,8 +1104,6 @@ function queryBalance(id, label, command, timeoutMs = 2000) {
     }
 
     const isMoney = label.toLowerCase() === 'balance'
-    // Money replies as a bare "Balance: $0.40" (no leading label, decimal amount).
-    // Shards/Coins reply as "<Label> ... Balance: <whole number>".
     const regex = isMoney
       ? /Balance:?\s*\$?\s*([\d,]+(?:\.\d+)?)/i
       : new RegExp(`${label}.{0,10}Balance:?\\s*\\$?\\s*([\\d,]+(?:\\.\\d+)?)`, 'i')
@@ -1226,17 +1111,13 @@ function queryBalance(id, label, command, timeoutMs = 2000) {
     const onMessage = (jsonMsg) => {
       try {
         const text = jsonMsg.toString()
-        // The Shards/Coins replies also contain the word "Balance:" — don't let
-        // the money listener grab those instead of the real /bal reply.
         if (isMoney && /shards|coins/i.test(text)) return
         const match = text.match(regex)
         if (match) finish(parseFloat(match[1].replace(/,/g, '')))
       } catch (_) {}
     }
 
-    // Resolve immediately if the bot disconnects while waiting
     const onEnd = () => finish(null)
-
     const timer = setTimeout(() => finish(null), timeoutMs)
     bot.on('message', onMessage)
     bot.on('end', onEnd)
@@ -1255,7 +1136,6 @@ function formatUptime(ms) {
 }
 
 function handleCommand(trimmed) {
-  // ── /all ────────────────────────────────────
   if (trimmed.startsWith('/all ')) {
     const msg = trimmed.slice(5).trim()
     if (!msg) { logWarn('Usage: /all <command or message>'); return }
@@ -1278,7 +1158,6 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /overview ───────────────────────────────
   if (trimmed === '/overview') {
     const names = Object.keys(bots)
     logInfo('{bold}── Bot Overview Dashboard ──{/bold}')
@@ -1310,7 +1189,6 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /list ───────────────────────────────────
   if (trimmed === '/list') {
     const names = Object.keys(bots)
     logInfo(`{bold}── Bots (${names.length}) ──{/bold}`)
@@ -1327,7 +1205,6 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /uptime ─────────────────────────────────
   if (trimmed === '/uptime') {
     const names = Object.keys(bots)
     logInfo('{bold}── Uptime ──{/bold}')
@@ -1339,23 +1216,21 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /proxy ──────────────────────────────────
   if (trimmed === '/proxy') {
     if (PROXY_ENABLED) {
       logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots)`)
       if (PROXY_STALL_ENABLED) {
-        const restartInfo = PROXY_RESTART_CMD ? `restart cmd: "${PROXY_RESTART_CMD}"` : 'no restart cmd (proxy isn\'t local — set PROXY_RESTART_CMD in .env if you want auto-restart)'
+        const restartInfo = PROXY_RESTART_CMD ? `restart cmd: "${PROXY_RESTART_CMD}"` : 'no restart cmd (proxy isn\'t local)'
         logInfo(`{bold}Stall watchdog:{/bold} on — stall timeout ${(PROXY_STALL_TIMEOUT_MS / 1000).toFixed(0)}s, checked every ${(PROXY_STALL_CHECK_MS / 1000).toFixed(0)}s, ${restartInfo}`)
       } else {
-        logInfo('{bold}Stall watchdog:{/bold} off (set PROXY_STALL_WATCHDOG=1, or unset PROXY_STALL_WATCHDOG=0, in .env)')
+        logInfo('{bold}Stall watchdog:{/bold} off')
       }
     } else {
-      logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST in .env to enable one.')
+      logInfo('No outbound proxy configured — bots connect directly.')
     }
     return
   }
 
-  // ── /reconnect-all ──────────────────────────
   if (trimmed === '/reconnect-all') {
     let count = 0
     Object.entries(bots).forEach(([id, entry]) => {
@@ -1371,9 +1246,6 @@ function handleCommand(trimmed) {
     return
   }
 
-
-
-  // ── /chat ───────────────────────────────────
   if (trimmed.startsWith('/chat ')) {
     const msg = trimmed.slice(6).trim()
     if (!activeId) { logWarn('No active bot.'); return }
@@ -1383,7 +1255,6 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /new-bot ────────────────────────────────
   if (trimmed.startsWith('/new-bot ')) {
     const args = trimmed.slice(9).trim().split(/\s+/).filter(Boolean)
     const username = args[0]
@@ -1397,7 +1268,6 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /switch ─────────────────────────────────
   if (trimmed.startsWith('/switch ')) {
     const arg = trimmed.slice(8).trim()
     if (/^\d+$/.test(arg)) {
@@ -1411,7 +1281,6 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /crates-loop [n] ───
   if (trimmed === '/crates-loop' || trimmed.startsWith('/crates-loop ')) {
     if (!activeId) { logWarn('No active bot.'); return }
     const arg = trimmed.slice('/crates-loop'.length).trim()
@@ -1423,7 +1292,6 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /crates-all [n] ───
   if (trimmed === '/crates-all' || trimmed.startsWith('/crates-all ')) {
     const arg = trimmed.slice('/crates-all'.length).trim()
     const maxBots = arg ? parseInt(arg, 10) : Infinity
@@ -1432,7 +1300,6 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── Single-bot local commands ───────────────
   if (activeId && LOCAL_COMMANDS.includes(trimmed)) {
     runLocalCommandForBot(activeId, trimmed)
     return
@@ -1456,85 +1323,3 @@ function handleCommand(trimmed) {
       log(`{green-fg}❯{/green-fg} Sent: ${sanitize(trimmed)}`)
   }
 }
-
-// ── Input handling & History ──────────────────────────────────────────────────
-const HISTORY_FILE = path.join(__dirname, '.command_history')
-const MAX_HISTORY = 500
-
-// Load persisted history on startup
-const commandHistory = (() => {
-  try {
-    const data = fs.readFileSync(HISTORY_FILE, 'utf8')
-    return data.split('\n').filter(Boolean).slice(-MAX_HISTORY)
-  } catch (_) { return [] }
-})()
-let historyIndex = -1
-
-function saveHistory() {
-  try { fs.writeFileSync(HISTORY_FILE, commandHistory.join('\n') + '\n') } catch (_) {}
-}
-
-inputBox.key('up', () => {
-  if (historyIndex < commandHistory.length - 1) {
-    historyIndex++
-    inputBox.setValue(commandHistory[commandHistory.length - 1 - historyIndex])
-    debouncedRender()
-  }
-})
-
-inputBox.key('down', () => {
-  if (historyIndex > 0) {
-    historyIndex--
-    inputBox.setValue(commandHistory[commandHistory.length - 1 - historyIndex])
-    debouncedRender()
-  } else if (historyIndex === 0) {
-    historyIndex = -1
-    inputBox.setValue('')
-    debouncedRender()
-  }
-})
-
-inputBox.key('tab', () => {
-  const val = inputBox.getValue()
-  if (val.startsWith('/')) {
-    const available = Object.keys(COMMANDS)
-    const prefix = val.split(' ')[0]
-    const matches = available.filter(c => c.startsWith(prefix))
-    if (matches.length === 1) {
-      // Strip parameter hints (e.g. "/warp <place>" → "/warp ")
-      const base = matches[0].replace(/ [<\[].*$/, '')
-      inputBox.setValue(base + ' ')
-      debouncedRender()
-    } else if (matches.length > 1) {
-      logInfo(`{cyan-fg}Matches:{/cyan-fg} ${matches.map(m => m.split(' ')[0]).join(', ')}`)
-    }
-  }
-})
-
-inputBox.on('submit', (input) => {
-  const trimmed = (input || '').trim()
-  inputBox.clearValue()
-  inputBox.focus()
-  debouncedRender()
-
-  if (trimmed.length > 0) {
-    if (commandHistory[commandHistory.length - 1] !== trimmed) {
-      commandHistory.push(trimmed)
-      if (commandHistory.length > MAX_HISTORY) commandHistory.shift()
-      saveHistory()
-    }
-    historyIndex = -1
-    handleCommand(trimmed)
-  }
-})
-
-// Escape key can cause neo-blessed to stop reading input — re-focus immediately
-inputBox.on('cancel', () => {
-  inputBox.clearValue()
-  setImmediate(() => {
-    inputBox.focus()
-    debouncedRender()
-  })
-})
-
-screen.render()
