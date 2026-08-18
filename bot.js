@@ -184,7 +184,10 @@ io.on('connection', (socket) => {
 
 const WEB_PORT = process.env.PORT || 3000
 server.listen(WEB_PORT, () => {
-  console.log(\`Web GUI active and listening on port \${WEB_PORT}\`)
+
+console.log(`Web GUI active and listening on port ${WEB_PORT}`)
+
+
 })
 
 // ── Outbound proxy tunnelling ──────────────────────────────────────────────────
