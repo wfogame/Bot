@@ -33,6 +33,17 @@ const CRATES_ALL_STAGGER_MS         = parseInt(process.env.CRATES_ALL_STAGGER_MS
 const CRATES_ALL_SHARDSHOP_WAIT_MS  = parseInt(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS || '4000', 10)  // wait after shardshop before starting crates
 const CRATES_ALL_STEP_WAIT_MS       = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS      || '3000', 10)  // wait after crates before dump
 
+// ── /shardshop-loop: keep running /shardshop until the server says there's nothing left ──
+// Grepped case-insensitively against a configurable, comma-separated phrase list. Default
+// covers "insufficent fund" (matches both "insufficent fund"/"insufficent funds" as a
+// substring) plus the correctly-spelled "insufficient fund" as a fallback in case the server
+// doesn't have the typo. Adjust SHARDSHOP_STOP_PHRASES in .env if your server's wording differs.
+const SHARDSHOP_STOP_PHRASES    = (process.env.SHARDSHOP_STOP_PHRASES || 'insufficent fund,not enough,insufficient fund,no more shards,more shards')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+const SHARDSHOP_LOOP_DELAY_MS   = parseInt(process.env.SHARDSHOP_LOOP_DELAY_MS   || '4200',  10) // gap between each /shardshop send
+const SHARDSHOP_LOOP_TIMEOUT_MS = parseInt(process.env.SHARDSHOP_LOOP_TIMEOUT_MS || '60000', 10) // safety ceiling if the server never replies with a stop phrase
+const SHARDSHOP_LOOP_MAX_RUNS   = parseInt(process.env.SHARDSHOP_LOOP_MAX_RUNS   || '200',   10) // hard cap on sends so a phrase mismatch can't loop forever
+
 // ── Outbound proxy config ──────────────────────────────────────────────────────
 // Every bot's Minecraft TCP connection is routed through this single shared
 // proxy when PROXY_HOST is set. Leave PROXY_HOST empty/unset to connect
@@ -88,6 +99,9 @@ const PROXY_CRASH_PATTERNS = [
   /buffer length/i,
   /not enough (data|bytes)/i,
   /Cannot read propert/i,        // "Cannot read properties of null" from half-torn-down state
+  /pre-spawn socketClosed/i,     // synthetic marker (set in the 'end' handler below) for a silent
+                                  // socket close with no kick/error text, before the bot ever spawned —
+                                  // the signature of a Tor/SOCKS5 circuit dying under the post-login data burst
 ]
 const FAST_RECONNECT_MS = 10400        // flat delay for proxy transfer crashes
 const RECONNECT_BASE_MS = 10400        // base delay for real kicks / errors
@@ -425,6 +439,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
     lastDisconnectReason: null,     // stores raw error text for transfer-crash classification
     crateRoutineRunning: false,     // prevents concurrent /crates runs
     inCrateRoutine: false,          // suppresses windowOpen handler during /crates
+    shardshopLoopRunning: false,    // prevents concurrent /shardshop-loop runs
     lastActivity: Date.now(),       // updated on every inbound packet — used by the proxy stall watchdog
     forceKilled: false,             // set by the watchdog so scheduleReconnect logs it distinctly
     manualDisconnect: false         // mirrors the closure-local flag so the watchdog (outside this closure) can see it too
@@ -668,8 +683,28 @@ bot.on('windowOpen', (window) => {
     connected = false
     const reasonText = reason ? String(reason) : ''
     w(`Disconnected${reasonText ? ': ' + sanitize(reasonText) : ''}.`)
-    // Pass the last captured raw error so the reconnect logic can classify it
-    scheduleReconnect('Connection lost', lastRawError || reasonText)
+
+    // node-minecraft-protocol's 'end' reason is almost always the generic
+    // string "socketClosed" once the connection has already torn down — it
+    // does NOT carry the actual kick/error text. Prefer the real reason
+    // captured earlier by the 'kicked' / 'error' / client 'error' handlers
+    // (lastDisconnectReason) so classification reflects what actually
+    // happened instead of the useless "socketClosed" placeholder.
+    const hasRealReason = lastRawError || bots[id]?.lastDisconnectReason
+    let classificationReason = hasRealReason || reasonText
+
+    // Special case: a bare socketClosed with NO kick packet and NO protocol
+    // error, before this bot has ever reached spawn, while an outbound proxy
+    // is in use — this is the signature of a Tor/SOCKS5 circuit dying under
+    // the data burst that starts right after auth succeeds (world/chunk/
+    // inventory data), not a real server kick. Treat it as a proxy crash so
+    // it gets the fast, no-backoff reconnect instead of slow exponential
+    // backoff eating into MAX_RECONNECT for something that isn't a real kick.
+    if (!hasRealReason && PROXY_ENABLED && !bots[id]?.spawnTime && (reasonText === 'socketClosed' || !reasonText)) {
+      classificationReason = 'pre-spawn socketClosed (proxy tunnel likely dropped)'
+    }
+
+    scheduleReconnect('Connection lost', classificationReason)
     lastRawError = null
   })
 
@@ -748,7 +783,9 @@ const COMMANDS = {
   '/overview':       'Dashboard of every bot\'s health, food, ping, shards, coins, and balance',
   '/crates':         `Warp to crates, find + walk to the nearest ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} (within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable`,
   '/crates-loop [n]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count',
+  '/shardshop-loop': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap`,
   '/crates-all [n]': `Run shardshop → crates → dump on bots 1 through n (default: all bots), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
+  '/crates-solo [bot]': 'Run shardshop → crates → dump on just one bot (default: active bot) — not all bots',
   '/list':           'Compact one-line-per-bot status list (online / offline / last kick)',
   '/chat <msg>':     'Send a chat message from the active bot (avoids triggering local commands)',
   '/disconnect':     'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
@@ -788,7 +825,7 @@ async function tpaAndDump(bot, id) {
       const timeout = setTimeout(() => {
         bot.removeListener('move', onMove)
         reject(new Error('Teleport timed out'))
-      }, 15000)
+      }, 45000)
 
       function onMove() {
         if (bot.entity.position.distanceTo(startPos) > 10) {
@@ -800,7 +837,7 @@ async function tpaAndDump(bot, id) {
       bot.on('move', onMove)
     })
     logFor(id, `{cyan-fg}› Teleport detected! Looking for chests...{/cyan-fg}`)
-    await new Promise(r => setTimeout(r, 2000))
+    await new Promise(r => setTimeout(r, 2500))
   } catch (err) {
     logFor(id, `{yellow-fg}⚠ ${err.message}. Looking for chests nearby anyway...{/yellow-fg}`)
   }
@@ -851,7 +888,7 @@ async function tpaAndDump(bot, id) {
     }
   }
 }
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/closeBot']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/shardshop-loop', '/closeBot']
 
 function runLocalCommandForBot(id, cmd) {
   const entry = bots[id]
@@ -949,6 +986,12 @@ function runLocalCommandForBot(id, cmd) {
       return true
     }
 
+    case '/shardshop-loop': {
+      if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+      shardshopLoopCommand(id) // fire-and-forget, logs its own progress
+      return true
+    }
+
     default:
       return false
   }
@@ -1025,6 +1068,58 @@ function walkToBlock(bot, targetPos, { reach = 4.5, timeoutMs = 15000 } = {}) {
   })
 }
 
+// ── Crate click loop: keep right-clicking until the server signals "done" ───
+// Each right-click on the shulker box consumes one key and grants a reward.
+// We keep clicking until the server sends a chat message that means "you're
+// out" — grepping for "you do not have a" (out of keys) or "error" (any
+// failure), both case-insensitive — then stop and let the routine continue
+// on (e.g. into the /dump step of /crates-all / /crates-solo). A safety
+// ceiling stops the loop if the server never replies with either.
+const CRATE_STOP_PHRASES     = ['you do not have a', 'error']
+const CRATE_CLICK_DELAY_MS   = parseInt(process.env.CRATE_CLICK_DELAY_MS   || '900',   10) // gap between clicks
+const CRATE_CLICK_TIMEOUT_MS = parseInt(process.env.CRATE_CLICK_TIMEOUT_MS || '60000', 10) // safety ceiling
+
+function clickCrateUntilStopMessage(bot, id, block) {
+  return new Promise((resolve) => {
+    let settled = false
+    let clicks = 0
+    let clickTimer = null
+
+    const finish = (stopReason) => {
+      if (settled) return
+      settled = true
+      bot.removeListener('messagestr', onMessage)
+      clearTimeout(clickTimer)
+      clearTimeout(ceiling)
+      resolve({ clicks, stopReason })
+    }
+
+    // Grep every plain-text server message for the stop phrases, case-insensitively.
+    const onMessage = (message) => {
+      const text = message.toLowerCase()
+      if (CRATE_STOP_PHRASES.some(p => text.includes(p))) finish('message')
+    }
+    bot.on('messagestr', onMessage)
+
+    const ceiling = setTimeout(() => finish('timeout'), CRATE_CLICK_TIMEOUT_MS)
+
+    const clickOnce = async () => {
+      if (settled) return
+      if (!bot.entity) { finish('despawned'); return }
+      const freshBlock = bot.blockAt(block.position)
+      if (!freshBlock || freshBlock.name !== CRATE_SHULKER_BLOCK) { finish('block-gone'); return }
+      try {
+        await bot.lookAt(freshBlock.position.offset(0.5, 0.5, 0.5), true)
+        await bot.activateBlock(freshBlock)
+        clicks++
+      } catch (_) { /* transient click failure — keep trying on the next tick */ }
+      if (!settled) clickTimer = setTimeout(clickOnce, CRATE_CLICK_DELAY_MS)
+    }
+
+    clickOnce()
+  })
+}
+
 // ── /crates routine: warp → scan for red shulker box → walk → right-click ──
 // Runs once per invocation. The inCrateRoutine flag suppresses the generic
 // windowOpen handler so the shulker box GUI doesn't trigger Fatal Crate logic.
@@ -1078,14 +1173,22 @@ async function runCrateRoutine(id) {
       return false
     }
 
-    try {
-      await bot.lookAt(freshBlock.position.offset(0.5, 0.5, 0.5), true)
-      await bot.activateBlock(freshBlock)
-      logFor(id, `{green-fg}✓ Right-clicked the ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}.{/green-fg}`)
-      return true
-    } catch (err) {
-      logFor(id, `{red-fg}✗ Failed to click shulker box: ${sanitize(err.message)}{/red-fg}`)
-      return false
+    logFor(id, `{cyan-fg}› Clicking the ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} until the server says we're out (grep: "you do not have a" / "error")…{/cyan-fg}`)
+    const { clicks, stopReason } = await clickCrateUntilStopMessage(bot, id, freshBlock)
+
+    switch (stopReason) {
+      case 'message':
+        logFor(id, `{green-fg}✓ Clicked ${clicks} time(s) — server said we're out/errored, moving on.{/green-fg}`)
+        return true
+      case 'block-gone':
+        logFor(id, `{yellow-fg}⚠ Shulker box disappeared after ${clicks} click(s) — treating as done.{/yellow-fg}`)
+        return true
+      case 'despawned':
+        logFor(id, `{red-fg}✗ ${id} despawned mid-click after ${clicks} click(s).{/red-fg}`)
+        return false
+      default:
+        logFor(id, `{yellow-fg}⚠ Stopped after ${clicks} click(s) — hit the ${(CRATE_CLICK_TIMEOUT_MS / 1000).toFixed(0)}s safety timeout without a stop message.{/yellow-fg}`)
+        return true
     }
   } finally {
     if (bots[id]) {
@@ -1127,6 +1230,77 @@ async function runCrateLoop(id, maxIterations = Infinity) {
   }
 }
 
+// ── /shardshop-loop: keep sending /shardshop until the server signals "empty" ──
+// Mirrors clickCrateUntilStopMessage's grep-until-stop-phrase approach, but for
+// repeatedly running the shardshop command instead of clicking a block.
+function runShardshopLoop(id) {
+  return new Promise((resolve) => {
+    const entry = bots[id]
+    if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); resolve(null); return }
+    if (entry.shardshopLoopRunning) { logFor(id, `{yellow-fg}⚠ /shardshop-loop is already running for ${id}.{/yellow-fg}`); resolve(null); return }
+    entry.shardshopLoopRunning = true
+    const { bot } = entry
+
+    let settled = false
+    let runs = 0
+    let sendTimer = null
+
+    const finish = (stopReason) => {
+      if (settled) return
+      settled = true
+      bot.removeListener('messagestr', onMessage)
+      clearTimeout(sendTimer)
+      clearTimeout(ceiling)
+      if (bots[id]) bots[id].shardshopLoopRunning = false
+      resolve({ runs, stopReason })
+    }
+
+    // Grep every plain-text server message for the configurable stop phrases.
+    const onMessage = (message) => {
+      const text = message.toLowerCase()
+      if (SHARDSHOP_STOP_PHRASES.some(p => text.includes(p))) finish('message')
+    }
+    bot.on('messagestr', onMessage)
+
+    const ceiling = setTimeout(() => finish('timeout'), SHARDSHOP_LOOP_TIMEOUT_MS)
+
+    const sendOnce = () => {
+      if (settled) return
+      if (!bot.entity) { finish('despawned'); return }
+      if (runs >= SHARDSHOP_LOOP_MAX_RUNS) { finish('max-runs'); return }
+      try {
+        bot.chat(SHARDSHOP_COMMAND)
+        runs++
+        logFor(id, `{cyan-fg}› Sent "${sanitize(SHARDSHOP_COMMAND)}" (run ${runs}).{/cyan-fg}`)
+      } catch (err) {
+        logFor(id, `{red-fg}✗ Failed to send shardshop: ${sanitize(err.message)}{/red-fg}`)
+      }
+      if (!settled) sendTimer = setTimeout(sendOnce, SHARDSHOP_LOOP_DELAY_MS)
+    }
+
+    sendOnce()
+  })
+}
+
+async function shardshopLoopCommand(id) {
+  const result = await runShardshopLoop(id)
+  if (!result) return
+  const { runs, stopReason } = result
+  switch (stopReason) {
+    case 'message':
+      logFor(id, `{green-fg}✓ Ran ${sanitize(SHARDSHOP_COMMAND)} ${runs} time(s) — server signalled empty, stopping.{/green-fg}`)
+      break
+    case 'despawned':
+      logFor(id, `{red-fg}✗ ${id} despawned mid-loop after ${runs} run(s).{/red-fg}`)
+      break
+    case 'max-runs':
+      logFor(id, `{yellow-fg}⚠ Hit the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap after ${runs} run(s) without a stop message — check SHARDSHOP_STOP_PHRASES in .env.{/yellow-fg}`)
+      break
+    default:
+      logFor(id, `{yellow-fg}⚠ Stopped after ${runs} run(s) — hit the ${(SHARDSHOP_LOOP_TIMEOUT_MS / 1000).toFixed(0)}s safety timeout without a stop message.{/yellow-fg}`)
+  }
+}
+
 // ── /crates-all: shardshop → crates → dump, staggered across bots ──────────
 let cratesAllRunning = false
 
@@ -1140,15 +1314,12 @@ async function runCratesAllSequenceForBot(id) {
   const { bot } = entry
   logFor(id, `{cyan-fg}› /crates-all: starting sequence (shardshop → crates → dump)…{/cyan-fg}`)
 
-  // 1. /shardshop — sell off before making room for more
-  try {
-    bot.chat(SHARDSHOP_COMMAND)
-    logFor(id, `{cyan-fg}› Sent "${sanitize(SHARDSHOP_COMMAND)}".{/cyan-fg}`)
-  } catch (err) {
-    logFor(id, `{red-fg}✗ Failed to send shardshop command: ${sanitize(err.message)}{/red-fg}`)
-  }
-  await new Promise(r => setTimeout(r, CRATES_ALL_SHARDSHOP_WAIT_MS))
-  if (!bots[id]?.bot?.entity) { logFor(id, `{red-fg}✗ ${id} despawned during shardshop — aborting sequence.{/red-fg}`); return }
+  // 1. /shardshop-loop — sell off everything before making room for more
+  logFor(id, `{cyan-fg}› Running /shardshop-loop until empty…{/cyan-fg}`)
+  const shardshopResult = await runShardshopLoop(id)
+  if (!shardshopResult) { logFor(id, `{red-fg}✗ /shardshop-loop failed for ${id} — aborting sequence.{/red-fg}`); return }
+  logFor(id, `{green-fg}✓ /shardshop-loop completed (${shardshopResult.runs} runs, stopped: ${shardshopResult.stopReason}).{/green-fg}`)
+  if (!bots[id]?.bot?.entity) { logFor(id, `{red-fg}✗ ${id} despawned during shardshop-loop — aborting sequence.{/red-fg}`); return }
 
   // 2. /crates
   const crateOk = await runCrateRoutine(id)
@@ -1295,7 +1466,7 @@ function handleCommand(trimmed) {
           const ping = b.bot.player?.ping ?? '?'
           const sh   = shards !== null ? shards.toLocaleString() : 'N/A'
           const co   = coins !== null ? coins.toLocaleString() : 'N/A'
-          const mo   = money !== null ? `$${money.toFixed(2)}` : 'N/A'
+          const mo   = money !== null ? `$${money.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : 'N/A'
           log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Shards: ${sh} | Coins: ${co} | Balance: ${mo}`)
         } else {
           log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{/gray-fg}`)
@@ -1418,12 +1589,46 @@ function handleCommand(trimmed) {
     return
   }
 
+  // ── /shardshop-loop ───
+  if (trimmed === '/shardshop-loop') {
+    if (!activeId) { logWarn('No active bot.'); return }
+    const entry = bots[activeId]
+    if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); return }
+    shardshopLoopCommand(activeId)
+    return
+  }
+
   // ── /crates-all [n] ───
   if (trimmed === '/crates-all' || trimmed.startsWith('/crates-all ')) {
     const arg = trimmed.slice('/crates-all'.length).trim()
     const maxBots = arg ? parseInt(arg, 10) : Infinity
     if (arg && (isNaN(maxBots) || maxBots <= 0)) { logWarn('Usage: /crates-all [n] — n must be a positive number'); return }
     runCratesAll(maxBots)
+    return
+  }
+
+  // ── /crates-solo [bot] — same shardshop → crates → dump chain as /crates-all,
+  // but for exactly ONE bot (default: the active one) instead of the whole roster ──
+  if (trimmed === '/crates-solo' || trimmed.startsWith('/crates-solo ')) {
+    const arg = trimmed.slice('/crates-solo'.length).trim()
+    let targetId = activeId
+
+    if (arg) {
+      if (/^\d+$/.test(arg)) {
+        const names = Object.keys(bots)
+        const idx = parseInt(arg, 10) - 1
+        targetId = names[idx]
+        if (!targetId) { logWarn(`No bot at index [${arg}]. Valid: 1–${names.length}`); return }
+      } else {
+        targetId = arg
+      }
+    }
+
+    if (!targetId) { logWarn('No active bot. Usage: /crates-solo [bot name or number]'); return }
+    if (!bots[targetId]) { logWarn(`No bot named "${sanitize(targetId)}".`); return }
+
+    logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}…`)
+    runCratesAllSequenceForBot(targetId)
     return
   }
 
