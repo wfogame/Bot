@@ -1,5 +1,12 @@
-FROM node:20-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends tor \
+FROM node:20-slim
+
+# Nuke the problem directories before apt-get tries to overwrite them
+RUN rm -rf /usr/share/doc/libevent-2.1-7 \
+           /usr/lib/x86_64-linux-gnu/engines-3 \
+           /lib/runit-helper \
+           /etc/apparmor.d \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends tor \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
