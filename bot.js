@@ -558,8 +558,72 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
       return false
     }
   }
+bot._client.on('resource_pack_send', (data) => {
+  const packUuid = data.uuid; 
+  
+  // 1. ACCEPT the resource pack (Result: 3)
+  bot._client.write('resource_pack_receive', {
+    uuid: packUuid,
+    result: 3 
+  });
 
-  // ── Lifecycle events ─────────────────────────────────
+  // 2. Acknowledge it LOADED successfully (Result: 0)
+  setTimeout(() => {
+    bot._client.write('resource_pack_receive', {
+      uuid: packUuid,
+      result: 0 
+    });
+  }, 50); 
+});
+
+if (bot._client) {
+    let sentSettings = false
+
+    bot._client.on('state', (newState) => {
+      logFor(id, `{magenta-fg}[state] -> ${newState}{/magenta-fg}`)
+    })
+
+    bot._client.on('packet', (data, meta) => {
+      if (bot._client.state === 'configuration') {
+        logFor(id, `{blue-fg}[config <-] ${meta.name}{/blue-fg}`)
+
+        if (meta.name === 'cookie_request') {
+          logFor(id, `{yellow-fg}[config ->] cookie_request ${data.cookie}{/yellow-fg}`)
+          bot._client.write('cookie_response', {
+            key: data.cookie,
+            value: undefined
+          })
+        }
+
+        // --- NEW TIMING FIX ---
+        // Wait until the server starts talking to us in the config phase 
+        // before we send our settings, so we know it's ready to listen.
+        if (!sentSettings && (meta.name === 'custom_payload' || meta.name === 'feature_flags' || meta.name === 'keep_alive' || meta.name === 'cookie_request')) {
+          sentSettings = true
+          logFor(id, `{yellow-fg}[config ->] sending delayed client_information (settings){/yellow-fg}`)
+          
+          bot._client.write('settings', {
+            locale: 'en_us',
+            viewDistance: 8,
+            chatFlags: 0,
+            chatColors: true,
+            skinParts: 127,
+            mainHand: 1,
+            enableTextFiltering: false,
+            allowServerListings: true
+          })
+        }
+      }
+    })
+    
+    const origWrite = bot._client.write.bind(bot._client)
+    bot._client.write = (name, params) => {
+      if (bot._client.state === 'configuration') {
+        logFor(id, `{green-fg}[config ->] ${name}{/green-fg}`)
+      }
+      return origWrite(name, params)
+    }
+  }
 bot.once('login', () => {
     i('Connected to server socket. Awaiting chat auth prompts…')
   })
@@ -580,6 +644,10 @@ bot.once('login', () => {
       pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
     }
   })
+bot.on('resourcePack', (url, hash) => {
+  i(`Resource pack requested — auto-accepting…`)
+  try { bot.acceptResourcePack() } catch (err) { e(`acceptResourcePack failed: ${sanitize(err.message)}`) }
+})
   bot.once('spawn', () => {
     connected = true
     if (bots[id]) bots[id].spawnTime = Date.now()
