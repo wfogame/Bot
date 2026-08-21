@@ -467,6 +467,8 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   try {
     bot = mineflayer.createBot({
       host, port, username: id, version, hideErrors: true,
+      auth: 'offline',   // <-- YOU MUST ADD THIS FOR /login SERVERS
+      brand: 'vanilla',  // <-- YOU MUST ADD THIS TO PASS BRAND FILTERS
       connect: makeProxyConnect(host, port, i)
     })
   } catch (err) {
