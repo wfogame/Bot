@@ -1244,12 +1244,13 @@ async function runCrateRoutine(id, blockNameOverride) {
   const { bot } = entry
 
   try {
+    if(CRATES_COMMAND!=false){
     logFor(id, `{cyan-fg}› Warping to crates (targeting ${blockName.replace(/_/g, ' ')})…{/cyan-fg}`)
     try { bot.chat(WARP_CRATES) } catch (err) {
       logFor(id, `{red-fg}✗ Failed to send "${sanitize(WARP_CRATES)}": ${sanitize(err.message)}{/red-fg}`)
       return false
     }
-
+    }
     // Wait for warp to complete (5 seconds + random 100-600ms)
     await new Promise(resolve => setTimeout(resolve, 5000 + 100 + Math.random() * 500))
     if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during warp — aborting.{/red-fg}`); return false }
