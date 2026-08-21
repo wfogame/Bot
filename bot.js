@@ -558,23 +558,7 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
       return false
     }
   }
-bot._client.on('resource_pack_send', (data) => {
-  const packUuid = data.uuid; 
-  
-  // 1. ACCEPT the resource pack (Result: 3)
-  bot._client.write('resource_pack_receive', {
-    uuid: packUuid,
-    result: 3 
-  });
 
-  // 2. Acknowledge it LOADED successfully (Result: 0)
-  setTimeout(() => {
-    bot._client.write('resource_pack_receive', {
-      uuid: packUuid,
-      result: 0 
-    });
-  }, 50); 
-});
 
 if (bot._client) {
     let sentSettings = false
@@ -644,9 +628,19 @@ bot.once('login', () => {
       pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
     }
   })
-bot.on('resourcePack', (url, hash) => {
+bot.on('resourcePack', (url, hashOrUuid) => {
   i(`Resource pack requested — auto-accepting…`)
-  try { bot.acceptResourcePack() } catch (err) { e(`acceptResourcePack failed: ${sanitize(err.message)}`) }
+  try { 
+    if (bot.supportFeature('resourcePackUsesUUID')) {
+      // PERMANENT FIX: Mineflayer's native acceptResourcePack sends a broken object instead of a string.
+      // We manually stringify the UUID and send the packet here to bypass the bug.
+      const uuidStr = hashOrUuid.toString();
+      bot._client.write('resource_pack_receive', { uuid: uuidStr, result: 3 });
+      bot._client.write('resource_pack_receive', { uuid: uuidStr, result: 0 });
+    } else {
+      bot.acceptResourcePack(); // For older versions it still works fine
+    }
+  } catch (err) { e(`acceptResourcePack failed: ${sanitize(err.message)}`) }
 })
   bot.once('spawn', () => {
     connected = true
