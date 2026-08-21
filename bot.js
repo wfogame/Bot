@@ -567,6 +567,21 @@ if (bot._client) {
 
     bot._client.on('state', (newState) => {
       logFor(id, `{magenta-fg}[state] -> ${newState}{/magenta-fg}`)
+
+      // --- RECONFIGURE FIX ---
+      // Some auth plugins (and 1.21+ Velocity backends in general) push the client
+      // BACK into the 'configuration' state after /login or /register (e.g. to resend
+      // registry_data / a resource pack). mineflayer's physics tick has no idea this
+      // happened and keeps writing play-phase 'position' packets every tick regardless
+      // of protocol state, which the backend rejects as a protocol violation and kicks
+      // us for with "An internal error occurred during your connection." Pausing
+      // physics for the duration of any configuration phase (including this mid-game
+      // reconfigure, not just the initial login one) fixes it.
+      if (newState === 'configuration') {
+        bot.physicsEnabled = false
+      } else if (newState === 'play') {
+        bot.physicsEnabled = true
+      }
     })
 
     bot._client.on('packet', (data, meta) => {
@@ -602,9 +617,22 @@ if (bot._client) {
       }
     })
     
+    // Packets that only make sense in the 'play' state. If any of these slip out
+    // while we're in 'configuration' (e.g. a packet already queued the same tick
+    // physicsEnabled got flipped off), the backend/Velocity kicks with an internal
+    // error rather than just ignoring it — so we drop them here as a second line
+    // of defense on top of the physicsEnabled toggle above.
+    const PLAY_ONLY_PACKETS = new Set([
+      'position', 'position_look', 'look', 'vehicle_move', 'entity_action', 'abilities'
+    ])
+
     const origWrite = bot._client.write.bind(bot._client)
     bot._client.write = (name, params) => {
       if (bot._client.state === 'configuration') {
+        if (PLAY_ONLY_PACKETS.has(name)) {
+          logFor(id, `{red-fg}[config ->] BLOCKED play-only packet during configuration: ${name}{/red-fg}`)
+          return
+        }
         logFor(id, `{green-fg}[config ->] ${name}{/green-fg}`)
       }
       return origWrite(name, params)
