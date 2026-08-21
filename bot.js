@@ -20,6 +20,7 @@ const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const MAX_RECONNECT     = parseInt(process.env.MAX_RECONNECT     || '17',   10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
+const AFK_WARP_DELAY_MS = parseInt(process.env.AFK_WARP_DELAY_MS || '15000', 10) // delay after /dump's tpa (before the afk warp)
 
 // ── /crates command config ─────────────────────────────────────────────────
 const WARP_CRATES         = process.env.WARP_CRATES_COMMAND || '/warp crates'
@@ -816,6 +817,14 @@ async function tpaAndDump(bot, id) {
   const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
   const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
 
+  // Waits AFK_WARP_DELAY_MS (default 15s, configurable via .env) then sends the afk warp.
+  const warpAfkAfterDelay = async () => {
+    logFor(id, `{cyan-fg}› Waiting ${(AFK_WARP_DELAY_MS / 1000).toFixed(0)}s before warping to AFK...{/cyan-fg}`)
+    await new Promise(resolve => setTimeout(resolve, AFK_WARP_DELAY_MS))
+    bot.chat(WARP_AFK)
+    logFor(id, `{green-fg}✓ Sent ${WARP_AFK}.{/green-fg}`)
+  }
+
   bot.chat(`/tpa ${tpaTarget}`)
   logFor(id, `{cyan-fg}› Sent /tpa to ${tpaTarget}. Waiting for teleport...{/cyan-fg}`)
 
@@ -855,6 +864,7 @@ async function tpaAndDump(bot, id) {
 
   if (chestBlocks.length === 0) {
     logFor(id, `{yellow-fg}⚠ No chests found within ${scanRadius} blocks.{/yellow-fg}`)
+    await warpAfkAfterDelay()
     return
   }
 
@@ -864,7 +874,7 @@ async function tpaAndDump(bot, id) {
 
   for (const chestPos of chestBlocks) {
     const itemsToDump = bot.inventory.items()
-    if (itemsToDump.length === 0) return
+    if (itemsToDump.length === 0) break
 
     const chestBlock = bot.blockAt(chestPos)
     let chestContainer
@@ -887,6 +897,8 @@ async function tpaAndDump(bot, id) {
       }
     }
   }
+
+  await warpAfkAfterDelay()
 }
 const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/shardshop-loop', '/closeBot']
 

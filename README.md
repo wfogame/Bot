@@ -7,6 +7,7 @@ It connects and manages multiple Minecraft bots at once through a single Termina
 ## Features
 
 ### `bot.js` — AFK Console
+
 - **Interactive TUI** — view logs, send commands, and monitor bots without terminal spam.
 - **Multi-bot management** — connect any number of bots, staggered on startup to avoid anti-bot throttling.
 - **Auto-authentication** — sends `/register` and `/login` automatically before spawning in.
@@ -16,6 +17,7 @@ It connects and manages multiple Minecraft bots at once through a single Termina
 - **Outbound proxy support** — route all bot connections through a SOCKS5 or HTTP proxy.
 
 ### `bot-rtp.js` — RTP + Base Finder
+
 - Everything from `bot.js` **plus**:
 - **Automatic Random Teleport (RTP)** — bots RTP at configurable intervals to explore and gather resources.
 - **Base detection** — scans for storage blocks (chests, barrels, shulker boxes, anvils, enchanting tables) and alerts when a base is found.
@@ -175,6 +177,7 @@ node bot.js
 ```
 
 The console will:
+
 1. Load all `BOT_NAMES` from `.env`
 2. Connect them in staggered intervals (`CONNECT_DELAY_MS`)
 3. Auto-authenticate each bot
@@ -187,6 +190,7 @@ node bot-rtp.js
 ```
 
 Same startup sequence, but after GUI navigation:
+
 - Begins RTP exploration
 - Scans for bases and logs findings to Discord
 - Manages food and totems automatically
@@ -287,10 +291,12 @@ This continues indefinitely; there is no give-up point.
 ### Program exits immediately on startup
 
 **"No BOT_NAMES defined in .env"**
+
 - Create a `.env` file with `BOT_NAMES=Bot1,Bot2`
 - Do not include spaces after commas
 
 **"Failed to load module"**
+
 - Run `npm install` to install dependencies
 - Check that Node.js v18+ is installed: `node --version`
 
@@ -350,7 +356,9 @@ This project is provided as-is. Use it at your own risk on your Minecraft server
 ---
 
 **Questions or issues?** Check the server logs and the bot's activity log in the TUI for error messages. Most issues are related to:
+
 1. Missing or incorrect `.env` file
 2. Wrong server address / port / version
 3. `BOT_NAMES` format (no spaces, comma-separated)
 4. Firewall or proxy blocking connections
+FOR THE RENDER BRANCH MAKE SURE TO SETUP UPTIME bot, to ping it otherwise it will go offline in 15 minutes DW IT IS FREE <https://uptimerobot.com/> NOT SPONSERED set it to 12 minutes not 5 minutes
