@@ -632,11 +632,14 @@ bot.on('resourcePack', (url, hashOrUuid) => {
   i(`Resource pack requested — auto-accepting…`)
   try { 
     if (bot.supportFeature('resourcePackUsesUUID')) {
-      // PERMANENT FIX: Mineflayer's native acceptResourcePack sends a broken object instead of a string.
-      // We manually stringify the UUID and send the packet here to bypass the bug.
       const uuidStr = hashOrUuid.toString();
-      bot._client.write('resource_pack_receive', { uuid: uuidStr, result: 3 });
-      bot._client.write('resource_pack_receive', { uuid: uuidStr, result: 0 });
+      bot._client.write('resource_pack_receive', { uuid: uuidStr, result: 3 }); // ACCEPTED
+      
+      // The server throws an "internal error" if LOADED is sent in the exact same tick.
+      // We must restore the 50ms delay that was in the original code.
+      setTimeout(() => {
+        bot._client.write('resource_pack_receive', { uuid: uuidStr, result: 0 }); // LOADED
+      }, 50);
     } else {
       bot.acceptResourcePack(); // For older versions it still works fine
     }
