@@ -594,13 +594,14 @@ bot.once('login', () => {
         try { bot.armorManager.equipAll() } catch (_) {}
       }
     }, 2000)
-
+if(process.env.CLICK_COMPASS){
     pushT(() => {
       i('Right-clicking compass (server selector)…')
       try { bot.activateItem() } catch (err) { e(`activateItem failed: ${sanitize(err.message)}`) }
     }, 3600 + Math.random() * 600)
   })
 
+}
 bot.on('windowOpen', (window) => {
   try {
     // Skip the GUI/Fatal Crate handler when a /crates routine opened this window
