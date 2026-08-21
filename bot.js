@@ -1244,7 +1244,7 @@ async function runCrateRoutine(id, blockNameOverride) {
   const { bot } = entry
 
   try {
-    if(CRATES_COMMAND!=false){
+    if(WARP_AFK!=false){
     logFor(id, `{cyan-fg}› Warping to crates (targeting ${blockName.replace(/_/g, ' ')})…{/cyan-fg}`)
     try { bot.chat(WARP_CRATES) } catch (err) {
       logFor(id, `{red-fg}✗ Failed to send "${sanitize(WARP_CRATES)}": ${sanitize(err.message)}{/red-fg}`)
