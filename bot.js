@@ -20,13 +20,59 @@ const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const MAX_RECONNECT     = parseInt(process.env.MAX_RECONNECT     || '17',   10)
 const GUI_SLOT         = parseInt(process.env.GUI_SLOT         || '11', 10)
 const WARP_AFK         = process.env.WARP_COMMAND || '/warp afk'
-const AFK_WARP_DELAY_MS = parseInt(process.env.AFK_WARP_DELAY_MS || '15000', 10) // delay after /dump's tpa (before the afk warp)
+
+// ── GUI slot selection: fixed slot (default) vs. search-by-item (opt-in) ────
+// By default the compass GUI always clicks GUI_SLOT. Set GUI_ITEM_SEARCH_ENABLED=true
+// to instead scan every slot for an item matching GUI_ITEM_SEARCH_TERMS and click that
+// slot when found, falling back to GUI_SLOT when no match is found (or when disabled).
+//
+// GUI_ITEM_SEARCH_TERMS syntax: ";" separates AND-groups, "|" separates OR-alternatives
+// within a group — an item matches when EVERY group has at least one alternative present
+// (case-insensitive substring match against its name/displayName). The default preserves
+// the old hardcoded "Fatal Crate/Key" detection for anyone who turns this on without
+// customizing it further.
+//   e.g. "fatal|red;crate|key|candle"  →  (contains "fatal" OR "red") AND (contains "crate" OR "key" OR "candle")
+const GUI_ITEM_SEARCH_ENABLED = /^(1|true|yes|on)$/i.test(process.env.GUI_ITEM_SEARCH_ENABLED || 'false')
+const GUI_ITEM_SEARCH_TERMS   = process.env.GUI_ITEM_SEARCH_TERMS || 'fatal|red;crate|key|candle'
+const GUI_ITEM_SEARCH_GROUPS  = GUI_ITEM_SEARCH_TERMS
+  .split(';').map(g => g.trim()).filter(Boolean)
+  .map(g => g.split('|').map(s => s.trim().toLowerCase()).filter(Boolean))
+  .filter(g => g.length)
+
+function itemMatchesSearchGroups(itemStr) {
+  if (!GUI_ITEM_SEARCH_GROUPS.length) return false
+  return GUI_ITEM_SEARCH_GROUPS.every(group => group.some(term => itemStr.includes(term)))
+}
 
 // ── /crates command config ─────────────────────────────────────────────────
-const WARP_CRATES         = process.env.WARP_CRATES_COMMAND || '/warp crates'
-const CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box'
+// Set CRATE_COMMAND in .env to whatever command /crates should send to warp there
+// (e.g. CRATE_COMMAND=/warp afk). Defaults to '/warp crates' if unset.
+const WARP_CRATES         = process.env.CRATE_COMMAND || '/warp crates'
+const CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box' // default crate color, used when no [color] arg is given
 const CRATE_SCAN_RADIUS   = parseInt(process.env.CRATE_SCAN_RADIUS || '20', 10)
 const CRATE_REACH         = parseFloat(process.env.CRATE_REACH || '3.5')
+
+// ── Crate color customization ──────────────────────────────────────────────
+// /crates, /crates-loop, /crates-all, and /crates-solo all accept an optional
+// trailing [color] argument (e.g. "/crates purple") so a single bot roster can
+// farm different crate colors without editing .env or restarting.
+const SHULKER_COLORS = [
+  'white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink',
+  'gray', 'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black'
+]
+
+// Resolves a user-typed color/block name to a real block id.
+// Accepts "purple", "purple shulker box", or "purple_shulker_box" (case-insensitive).
+// Returns null (not the default) when given something unrecognized, so callers can
+// warn instead of silently farming the wrong crate.
+function resolveCrateBlockName(input) {
+  if (!input) return CRATE_SHULKER_BLOCK
+  const norm = input.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (norm === 'shulker' || norm === 'shulker_box') return CRATE_SHULKER_BLOCK
+  if (norm.endsWith('_shulker_box') && SHULKER_COLORS.includes(norm.replace('_shulker_box', ''))) return norm
+  if (SHULKER_COLORS.includes(norm)) return `${norm}_shulker_box`
+  return null
+}
 
 // ── /crates-all: shardshop → crates → dump chain across multiple bots ───────
 const SHARDSHOP_COMMAND             = process.env.SHARDSHOP_COMMAND            || '/shardshop' // ⚠ verify this matches your server's actual shardshop command
@@ -572,32 +618,30 @@ bot.on('windowOpen', (window) => {
     }).join('\n');
     i(`Window opened: ${sanitize(title)}\n${sanitize(slotInfo)}`);
 
-    // Search for "Fatal Crate" OR "Fatal Key"
-    let targetSlot = GUI_SLOT; // Default to slot 11
-    let foundFatalItem = false;
+    // Slot selection: fixed GUI_SLOT by default, or search-by-item when GUI_ITEM_SEARCH_ENABLED
+    let targetSlot = GUI_SLOT; // Default to GUI_SLOT
+    let foundTargetItem = false;
 
-    for (let j = 0; j < window.slots.length; j++) {
-      const slot = window.slots[j];
-      if (!slot) continue;
-      
-      // Stringify safely and make lowercase for case-insensitive search
-      const slotDataStr = getSafeItemString(slot).toLowerCase();
-      
-      // Check if it contains "fatal" AND ("crate" OR "key")
-      const hasFatal = slotDataStr.includes('fatal') || slotDataStr.includes('red');
-      const hasCrateOrKey = slotDataStr.includes('crate') || slotDataStr.includes('key') || slotDataStr.includes('Key') || slotDataStr.includes('candle');
+    if (GUI_ITEM_SEARCH_ENABLED) {
+      for (let j = 0; j < window.slots.length; j++) {
+        const slot = window.slots[j];
+        if (!slot) continue;
 
-      if (hasFatal && hasCrateOrKey) {
-        targetSlot = j;
-        foundFatalItem = true;
-        break; // Stop searching once we find it
+        // Stringify safely and make lowercase for case-insensitive search
+        const slotDataStr = getSafeItemString(slot).toLowerCase();
+
+        if (itemMatchesSearchGroups(slotDataStr)) {
+          targetSlot = j;
+          foundTargetItem = true;
+          break; // Stop searching once we find it
+        }
       }
-    }
 
-    if (foundFatalItem) {
-      i(`Found Fatal Crate/Key at slot ${targetSlot}!`);
-    } else {
-      i(`Fatal Crate/Key not found, falling back to GUI_SLOT (${GUI_SLOT}).`);
+      if (foundTargetItem) {
+        i(`Item search matched "${GUI_ITEM_SEARCH_TERMS}" at slot ${targetSlot}!`);
+      } else {
+        i(`Item search enabled but no match for "${GUI_ITEM_SEARCH_TERMS}" — falling back to GUI_SLOT (${GUI_SLOT}).`);
+      }
     }
 
     // Validation
@@ -615,17 +659,17 @@ bot.on('windowOpen', (window) => {
       if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
       try {
         await bot.clickWindow(targetSlot, 0, 0)
-        if(!foundFatalItem ){
+        if(!foundTargetItem ){
         i(`Clicked slot ${targetSlot} — waiting for server transfer…`)
         }else{
-          i(`Clicked slot ${targetSlot} — Purchased Fatal key`)
+          i(`Clicked slot ${targetSlot} — matched configured item search`)
           }
       } catch (err) { e(`Click failed: ${sanitize(err.message || String(err))}`) }
     }, 2000 + Math.random() * 1600)
 
     // AFK Warp logic
     pushT(async () => {
-        if(!foundFatalItem){
+        if(!foundTargetItem){
         bot.chat(WARP_AFK)
         i(`Warped — waiting for server transfer…`)
         }
@@ -782,11 +826,11 @@ if (PROXY_STALL_ENABLED) {
 const COMMANDS = {
   '/all <cmd>':      'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
   '/overview':       'Dashboard of every bot\'s health, food, ping, shards, coins, and balance',
-  '/crates':         `Warp to crates, find + walk to the nearest ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} (within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable`,
-  '/crates-loop [n]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count',
+  '/crates [color]':         `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
+  '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
   '/shardshop-loop': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap`,
-  '/crates-all [n]': `Run shardshop → crates → dump on bots 1 through n (default: all bots), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
-  '/crates-solo [bot]': 'Run shardshop → crates → dump on just one bot (default: active bot) — not all bots',
+  '/crates-all [n] [color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
+  '/crates-solo [bot] [color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots',
   '/list':           'Compact one-line-per-bot status list (online / offline / last kick)',
   '/chat <msg>':     'Send a chat message from the active bot (avoids triggering local commands)',
   '/disconnect':     'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
@@ -816,14 +860,6 @@ const COMMANDS = {
 async function tpaAndDump(bot, id) {
   const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
   const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
-
-  // Waits AFK_WARP_DELAY_MS (default 15s, configurable via .env) then sends the afk warp.
-  const warpAfkAfterDelay = async () => {
-    logFor(id, `{cyan-fg}› Waiting ${(AFK_WARP_DELAY_MS / 1000).toFixed(0)}s before warping to AFK...{/cyan-fg}`)
-    await new Promise(resolve => setTimeout(resolve, AFK_WARP_DELAY_MS))
-    bot.chat(WARP_AFK)
-    logFor(id, `{green-fg}✓ Sent ${WARP_AFK}.{/green-fg}`)
-  }
 
   bot.chat(`/tpa ${tpaTarget}`)
   logFor(id, `{cyan-fg}› Sent /tpa to ${tpaTarget}. Waiting for teleport...{/cyan-fg}`)
@@ -864,7 +900,6 @@ async function tpaAndDump(bot, id) {
 
   if (chestBlocks.length === 0) {
     logFor(id, `{yellow-fg}⚠ No chests found within ${scanRadius} blocks.{/yellow-fg}`)
-    await warpAfkAfterDelay()
     return
   }
 
@@ -874,7 +909,7 @@ async function tpaAndDump(bot, id) {
 
   for (const chestPos of chestBlocks) {
     const itemsToDump = bot.inventory.items()
-    if (itemsToDump.length === 0) break
+    if (itemsToDump.length === 0) return
 
     const chestBlock = bot.blockAt(chestPos)
     let chestContainer
@@ -897,8 +932,6 @@ async function tpaAndDump(bot, id) {
       }
     }
   }
-
-  await warpAfkAfterDelay()
 }
 const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/shardshop-loop', '/closeBot']
 
@@ -1091,7 +1124,7 @@ const CRATE_STOP_PHRASES     = ['you do not have a', 'error']
 const CRATE_CLICK_DELAY_MS   = parseInt(process.env.CRATE_CLICK_DELAY_MS   || '900',   10) // gap between clicks
 const CRATE_CLICK_TIMEOUT_MS = parseInt(process.env.CRATE_CLICK_TIMEOUT_MS || '60000', 10) // safety ceiling
 
-function clickCrateUntilStopMessage(bot, id, block) {
+function clickCrateUntilStopMessage(bot, id, block, blockName = CRATE_SHULKER_BLOCK) {
   return new Promise((resolve) => {
     let settled = false
     let clicks = 0
@@ -1119,7 +1152,7 @@ function clickCrateUntilStopMessage(bot, id, block) {
       if (settled) return
       if (!bot.entity) { finish('despawned'); return }
       const freshBlock = bot.blockAt(block.position)
-      if (!freshBlock || freshBlock.name !== CRATE_SHULKER_BLOCK) { finish('block-gone'); return }
+      if (!freshBlock || freshBlock.name !== blockName) { finish('block-gone'); return }
       try {
         await bot.lookAt(freshBlock.position.offset(0.5, 0.5, 0.5), true)
         await bot.activateBlock(freshBlock)
@@ -1135,8 +1168,9 @@ function clickCrateUntilStopMessage(bot, id, block) {
 // ── /crates routine: warp → scan for red shulker box → walk → right-click ──
 // Runs once per invocation. The inCrateRoutine flag suppresses the generic
 // windowOpen handler so the shulker box GUI doesn't trigger Fatal Crate logic.
-async function runCrateRoutine(id) {
+async function runCrateRoutine(id, blockNameOverride) {
   const entry = bots[id]
+  const blockName = blockNameOverride || CRATE_SHULKER_BLOCK
   logFor(id,`Change the version in .env to 1.21.1 to use this mechanic otherwise SKIP it.`)
   if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
   if (entry.crateRoutineRunning) { logFor(id, `{yellow-fg}⚠ /crates is already running for ${id}.{/yellow-fg}`); return false }
@@ -1145,7 +1179,7 @@ async function runCrateRoutine(id) {
   const { bot } = entry
 
   try {
-    logFor(id, `{cyan-fg}› Warping to crates…{/cyan-fg}`)
+    logFor(id, `{cyan-fg}› Warping to crates (targeting ${blockName.replace(/_/g, ' ')})…{/cyan-fg}`)
     try { bot.chat(WARP_CRATES) } catch (err) {
       logFor(id, `{red-fg}✗ Failed to send "${sanitize(WARP_CRATES)}": ${sanitize(err.message)}{/red-fg}`)
       return false
@@ -1156,12 +1190,12 @@ async function runCrateRoutine(id) {
     if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during warp — aborting.{/red-fg}`); return false }
 
     const block = bot.findBlock({
-      matching: (b) => b && b.name === CRATE_SHULKER_BLOCK,
+      matching: (b) => b && b.name === blockName,
       maxDistance: CRATE_SCAN_RADIUS
     })
 
     if (!block) {
-      logFor(id, `{red-fg}✗ No ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} found within ${CRATE_SCAN_RADIUS} blocks — warping to afk instead.{/red-fg}`)
+      logFor(id, `{red-fg}✗ No ${blockName.replace(/_/g, ' ')} found within ${CRATE_SCAN_RADIUS} blocks — warping to afk instead.{/red-fg}`)
       try { bot.chat(WARP_AFK) } catch (_) {}
       return false
     }
@@ -1179,14 +1213,14 @@ async function runCrateRoutine(id) {
 
     // Re-fetch the block at the target position in case it changed while walking over
     const freshBlock = bot.blockAt(block.position)
-    if (!freshBlock || freshBlock.name !== CRATE_SHULKER_BLOCK) {
+    if (!freshBlock || freshBlock.name !== blockName) {
       logFor(id, `{red-fg}✗ Block at target location changed before I could click it — warping to afk instead.{/red-fg}`)
       try { bot.chat(WARP_AFK) } catch (_) {}
       return false
     }
 
-    logFor(id, `{cyan-fg}› Clicking the ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')} until the server says we're out (grep: "you do not have a" / "error")…{/cyan-fg}`)
-    const { clicks, stopReason } = await clickCrateUntilStopMessage(bot, id, freshBlock)
+    logFor(id, `{cyan-fg}› Clicking the ${blockName.replace(/_/g, ' ')} until the server says we're out (grep: "you do not have a" / "error")…{/cyan-fg}`)
+    const { clicks, stopReason } = await clickCrateUntilStopMessage(bot, id, freshBlock, blockName)
 
     switch (stopReason) {
       case 'message':
@@ -1211,7 +1245,7 @@ async function runCrateRoutine(id) {
 }
 
 // ── /crates-loop: repeatedly run the crate routine ────────────────────────
-async function runCrateLoop(id, maxIterations = Infinity) {
+async function runCrateLoop(id, maxIterations = Infinity, blockNameOverride) {
   const entry = bots[id]
   if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return }
   if (entry.crateLoopRunning) { logFor(id, `{yellow-fg}⚠ /crates-loop is already running for ${id}.{/yellow-fg}`); return }
@@ -1223,7 +1257,7 @@ async function runCrateLoop(id, maxIterations = Infinity) {
       iteration++
       logFor(id, `{cyan-fg}› Crate loop iteration ${iteration}${maxIterations < Infinity ? '/' + maxIterations : ''}…{/cyan-fg}`)
 
-      const success = await runCrateRoutine(id)
+      const success = await runCrateRoutine(id, blockNameOverride)
       if (!success) {
         logFor(id, `{yellow-fg}⚠ Crate routine failed on iteration ${iteration} — stopping loop.{/yellow-fg}`)
         break
@@ -1316,7 +1350,7 @@ async function shardshopLoopCommand(id) {
 // ── /crates-all: shardshop → crates → dump, staggered across bots ──────────
 let cratesAllRunning = false
 
-async function runCratesAllSequenceForBot(id) {
+async function runCratesAllSequenceForBot(id, blockNameOverride) {
   const entry = bots[id]
   if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned — skipping /crates-all.{/yellow-fg}`); return }
   if (entry.crateRoutineRunning || entry.crateLoopRunning) {
@@ -1334,7 +1368,7 @@ async function runCratesAllSequenceForBot(id) {
   if (!bots[id]?.bot?.entity) { logFor(id, `{red-fg}✗ ${id} despawned during shardshop-loop — aborting sequence.{/red-fg}`); return }
 
   // 2. /crates
-  const crateOk = await runCrateRoutine(id)
+  const crateOk = await runCrateRoutine(id, blockNameOverride)
   logFor(id, crateOk
     ? `{green-fg}✓ Crate step done — moving on to dump.{/green-fg}`
     : `{yellow-fg}⚠ Crate step failed — continuing to dump anyway.{/yellow-fg}`)
@@ -1354,7 +1388,7 @@ async function runCratesAllSequenceForBot(id) {
 // order, matching /list and /switch numbering), starting one bot every
 // CRATES_ALL_STAGGER_MS so they don't all warp/click/TPA at the exact same
 // moment. maxBots omitted/Infinity = every bot currently registered.
-async function runCratesAll(maxBots = Infinity) {
+async function runCratesAll(maxBots = Infinity, blockNameOverride) {
   if (cratesAllRunning) { logWarn('/crates-all is already running.'); return }
   const ids = Object.keys(bots).slice(0, maxBots)
   if (ids.length === 0) { logWarn('No bots to run /crates-all on.'); return }
@@ -1365,7 +1399,7 @@ async function runCratesAll(maxBots = Infinity) {
   try {
     await Promise.allSettled(
       ids.map((id, idx) => new Promise((resolve) => {
-        setTimeout(() => { runCratesAllSequenceForBot(id).finally(resolve) }, idx * CRATES_ALL_STAGGER_MS)
+        setTimeout(() => { runCratesAllSequenceForBot(id, blockNameOverride).finally(resolve) }, idx * CRATES_ALL_STAGGER_MS)
       }))
     )
     logSuccess(`/crates-all finished for all ${ids.length} bot(s).`)
@@ -1589,15 +1623,39 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /crates-loop [n] ───
-  if (trimmed === '/crates-loop' || trimmed.startsWith('/crates-loop ')) {
+  // ── /crates [color] ───
+  if (trimmed === '/crates' || trimmed.startsWith('/crates ')) {
     if (!activeId) { logWarn('No active bot.'); return }
-    const arg = trimmed.slice('/crates-loop'.length).trim()
-    const count = arg ? parseInt(arg, 10) : Infinity
-    if (arg && (isNaN(count) || count <= 0)) { logWarn('Usage: /crates-loop [n] — n must be a positive number'); return }
+    const arg = trimmed.slice('/crates'.length).trim()
     const entry = bots[activeId]
     if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); return }
-    runCrateLoop(activeId, count)
+    let blockName = CRATE_SHULKER_BLOCK
+    if (arg) {
+      const resolved = resolveCrateBlockName(arg)
+      if (!resolved) { logWarn(`Unknown crate color "${arg}". Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
+      blockName = resolved
+    }
+    runCrateRoutine(activeId, blockName)
+    return
+  }
+
+  // ── /crates-loop [n] [color] ───
+  if (trimmed === '/crates-loop' || trimmed.startsWith('/crates-loop ')) {
+    if (!activeId) { logWarn('No active bot.'); return }
+    const parts = trimmed.slice('/crates-loop'.length).trim().split(/\s+/).filter(Boolean)
+    let count = Infinity
+    if (parts.length && /^\d+$/.test(parts[0])) count = parseInt(parts.shift(), 10)
+    if (count <= 0) { logWarn('Usage: /crates-loop [n] [color] — n must be a positive number'); return }
+    let blockName = CRATE_SHULKER_BLOCK
+    if (parts.length) {
+      const resolved = resolveCrateBlockName(parts.shift())
+      if (!resolved) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
+      blockName = resolved
+    }
+    if (parts.length) { logWarn('Usage: /crates-loop [n] [color]'); return }
+    const entry = bots[activeId]
+    if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); return }
+    runCrateLoop(activeId, count, blockName)
     return
   }
 
@@ -1610,37 +1668,54 @@ function handleCommand(trimmed) {
     return
   }
 
-  // ── /crates-all [n] ───
+  // ── /crates-all [n] [color] ───
   if (trimmed === '/crates-all' || trimmed.startsWith('/crates-all ')) {
-    const arg = trimmed.slice('/crates-all'.length).trim()
-    const maxBots = arg ? parseInt(arg, 10) : Infinity
-    if (arg && (isNaN(maxBots) || maxBots <= 0)) { logWarn('Usage: /crates-all [n] — n must be a positive number'); return }
-    runCratesAll(maxBots)
+    const parts = trimmed.slice('/crates-all'.length).trim().split(/\s+/).filter(Boolean)
+    let maxBots = Infinity
+    if (parts.length && /^\d+$/.test(parts[0])) maxBots = parseInt(parts.shift(), 10)
+    if (maxBots <= 0) { logWarn('Usage: /crates-all [n] [color] — n must be a positive number'); return }
+    let blockName
+    if (parts.length) {
+      blockName = resolveCrateBlockName(parts.shift())
+      if (!blockName) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
+    }
+    if (parts.length) { logWarn('Usage: /crates-all [n] [color]'); return }
+    runCratesAll(maxBots, blockName)
     return
   }
 
-  // ── /crates-solo [bot] — same shardshop → crates → dump chain as /crates-all,
+  // ── /crates-solo [bot] [color] — same shardshop → crates → dump chain as /crates-all,
   // but for exactly ONE bot (default: the active one) instead of the whole roster ──
   if (trimmed === '/crates-solo' || trimmed.startsWith('/crates-solo ')) {
-    const arg = trimmed.slice('/crates-solo'.length).trim()
+    const parts = trimmed.slice('/crates-solo'.length).trim().split(/\s+/).filter(Boolean)
     let targetId = activeId
 
-    if (arg) {
-      if (/^\d+$/.test(arg)) {
+    // First token: a bot ref (number or exact existing bot name) if it matches one,
+    // otherwise it's treated as the color and targetId falls back to the active bot.
+    if (parts.length) {
+      if (/^\d+$/.test(parts[0])) {
         const names = Object.keys(bots)
-        const idx = parseInt(arg, 10) - 1
+        const idx = parseInt(parts[0], 10) - 1
         targetId = names[idx]
-        if (!targetId) { logWarn(`No bot at index [${arg}]. Valid: 1–${names.length}`); return }
-      } else {
-        targetId = arg
+        if (!targetId) { logWarn(`No bot at index [${parts[0]}]. Valid: 1–${names.length}`); return }
+        parts.shift()
+      } else if (bots[parts[0]]) {
+        targetId = parts.shift()
       }
     }
 
-    if (!targetId) { logWarn('No active bot. Usage: /crates-solo [bot name or number]'); return }
+    let blockName
+    if (parts.length) {
+      blockName = resolveCrateBlockName(parts.shift())
+      if (!blockName) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
+    }
+    if (parts.length) { logWarn('Usage: /crates-solo [bot name or number] [color]'); return }
+
+    if (!targetId) { logWarn('No active bot. Usage: /crates-solo [bot name or number] [color]'); return }
     if (!bots[targetId]) { logWarn(`No bot named "${sanitize(targetId)}".`); return }
 
-    logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}…`)
-    runCratesAllSequenceForBot(targetId)
+    logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${blockName ? ` targeting ${blockName.replace(/_/g, ' ')}` : ''}…`)
+    runCratesAllSequenceForBot(targetId, blockName)
     return
   }
 

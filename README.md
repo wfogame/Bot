@@ -362,3 +362,89 @@ This project is provided as-is. Use it at your own risk on your Minecraft server
 3. `BOT_NAMES` format (no spaces, comma-separated)
 4. Firewall or proxy blocking connections
 FOR THE RENDER BRANCH MAKE SURE TO SETUP UPTIME bot, to ping it otherwise it will go offline in 15 minutes DW IT IS FREE <https://uptimerobot.com/> NOT SPONSERED set it to 12 minutes not 5 minutes
+
+# bot.js changes
+
+Documents only the two features added on top of the existing bot.js. Everything else in the bot is unchanged.
+
+---
+
+## 1. GUI item search (toggleable slot selection)
+
+Previously, the compass GUI handler always clicked a hardcoded `GUI_SLOT`, with a separate hardcoded "Fatal Crate/Key" search baked into the code. That's now a single, optional, configurable feature — **off by default**.
+
+### New env vars
+
+```bash
+# Off by default. When false/unset, the bot always clicks GUI_SLOT — original behavior.
+GUI_ITEM_SEARCH_ENABLED=false
+
+# Only used when GUI_ITEM_SEARCH_ENABLED=true.
+# Syntax: ";" separates AND-groups, "|" separates OR-alternatives within a group.
+# An item matches only if it satisfies EVERY group (groups are AND'd together).
+GUI_ITEM_SEARCH_TERMS=fatal|red;crate|key|candle
+```
+
+### How matching works
+
+`GUI_ITEM_SEARCH_TERMS=fatal|red;crate|key|candle` means:
+
+- Group 1: `fatal` **OR** `red`
+- Group 2: `crate` **OR** `key` **OR** `candle`
+- Match requires **both groups** to be satisfied — e.g. an item named "Fatal Crate" matches (fatal ✓, crate ✓). An item named just "Key" does **not** match (group 1 never satisfied).
+
+The comparison is case-insensitive and checks the item's display name / name string.
+
+### Behavior when enabled
+
+1. Scans every slot in the opened window.
+2. First slot whose item satisfies all AND-groups is clicked.
+3. If no slot matches, **falls back to `GUI_SLOT`** (same as if the feature were off).
+
+### Example configs
+
+```bash
+# Reproduce the old hardcoded Fatal Crate/Key behavior exactly
+GUI_ITEM_SEARCH_ENABLED=true
+GUI_ITEM_SEARCH_TERMS=fatal|red;crate|key|candle
+
+# Look for anything called "diamond"
+GUI_ITEM_SEARCH_ENABLED=true
+GUI_ITEM_SEARCH_TERMS=diamond
+
+# "legendary" AND ("crate" OR "box")
+GUI_ITEM_SEARCH_ENABLED=true
+GUI_ITEM_SEARCH_TERMS=legendary;crate|box
+```
+
+> ⚠️ Must be **one line** in `.env` — a value can't wrap onto a second line without quoting/escaping. If it wraps, the second line has no `=` and dotenv silently ignores it.
+
+---
+
+## 2. Crate color argument (`[color]`)
+
+`/crates`, `/crates-loop`, `/crates-all`, and `/crates-solo` now accept an optional trailing `[color]` argument. Omit it and behavior is unchanged — it uses the existing `CRATE_SHULKER_BLOCK` env var as before.
+
+```bash
+# Existing var, unchanged — default crate color when no [color] arg is given
+CRATE_SHULKER_BLOCK=red_shulker_box
+```
+
+### Usage
+
+```
+/crates purple
+/crates-loop 5 purple
+/crates-all 3 purple
+/crates-solo Bot2 purple
+```
+
+- Accepts a bare color name (`purple`) or a full block id (`purple_shulker_box`).
+- Valid colors: `white, orange, magenta, light_blue, yellow, lime, pink, gray, light_gray, cyan, purple, blue, brown, green, red, black`.
+- An unrecognized color logs a warning listing valid options and aborts — it will not silently run against the wrong block.
+- `/help` and the command list (`/help`) reflect the new `[n] [color]` usage.
+
+### Note on `/crates-solo [bot] [color]`
+
+Since this command already takes an optional `[bot]`, the first word is checked against existing bot names/numbers first; if it doesn't match a bot, it's treated as the color instead (and the active bot is used).
+`CRATE_COMMAND` sets the chat command the bot sends when `/crates` (and `/crates-loop`, `/crates-all`, `/crates-solo`) warps to the crate area — for example, setting `CRATE_COMMAND=/warp afk` in `.env` makes it warp to afk instead of the default `/warp crates`.
