@@ -1,0 +1,55 @@
+diff --git a/node_modules/mineflayer/lib/plugins/resource_pack.js b/node_modules/mineflayer/lib/plugins/resource_pack.js
+index fc70ce3..1678010 100644
+--- a/node_modules/mineflayer/lib/plugins/resource_pack.js
++++ b/node_modules/mineflayer/lib/plugins/resource_pack.js
+@@ -60,11 +60,11 @@ function inject (bot) {
+       })
+     } else if (bot.supportFeature('resourcePackUsesUUID')) {
+       bot._client.write('resource_pack_receive', {
+-        uuid: latestUUID,
++        uuid: latestUUID.toString(),
+         result: TEXTURE_PACK_RESULTS.ACCEPTED
+       })
+       bot._client.write('resource_pack_receive', {
+-        uuid: latestUUID,
++        uuid: latestUUID.toString(),
+         result: TEXTURE_PACK_RESULTS.SUCCESSFULLY_LOADED
+       })
+     } else {
+@@ -80,7 +80,7 @@ function inject (bot) {
+   function denyResourcePack () {
+     if (bot.supportFeature('resourcePackUsesUUID')) {
+       bot._client.write('resource_pack_receive', {
+-        uuid: latestUUID,
++        uuid: latestUUID.toString(),
+         result: TEXTURE_PACK_RESULTS.DECLINED
+       })
+     }
+diff --git a/node_modules/mineflayer/lib/plugins/velocity.js b/node_modules/mineflayer/lib/plugins/velocity.js
+index 762d7d0..787ea91 100644
+--- a/node_modules/mineflayer/lib/plugins/velocity.js
++++ b/node_modules/mineflayer/lib/plugins/velocity.js
+@@ -100,10 +100,7 @@ function inject (bot) {
+       result: TEXTURE_PACK_RESULTS.ACCEPTED
+     })
+ 
+-    bot._client.write('resource_pack_receive', {
+-      uuid: data.uuid,
+-      result: TEXTURE_PACK_RESULTS.SUCCESSFULLY_LOADED
+-    })
++    setTimeout(() => { bot._client.write('resource_pack_receive', { uuid: data.uuid, result: TEXTURE_PACK_RESULTS.SUCCESSFULLY_LOADED }) }, 50)
+   })
+ 
+   // Handle resource_pack_send (older versions with UUID support)
+@@ -119,10 +116,7 @@ function inject (bot) {
+       result: TEXTURE_PACK_RESULTS.ACCEPTED
+     })
+ 
+-    bot._client.write('resource_pack_receive', {
+-      uuid: resourceUuid,
+-      result: TEXTURE_PACK_RESULTS.SUCCESSFULLY_LOADED
+-    })
++    setTimeout(() => { bot._client.write('resource_pack_receive', { uuid: resourceUuid, result: TEXTURE_PACK_RESULTS.SUCCESSFULLY_LOADED }) }, 50)
+   })
+ 
+   // === EXIT CONFIGURATION ===

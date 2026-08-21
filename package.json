@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "postinstall": "patch-package"
   },
   "keywords": [],
   "author": "",
@@ -21,5 +22,9 @@
     "neo-blessed": "^0.2.0",
     "prismarine-chunk": "^1.41.0",
     "socks": "^2.8.9"
+  },
+  "devDependencies": {
+    "patch-package": "^8.0.1",
+    "postinstall-postinstall": "^2.1.0"
   }
 }
