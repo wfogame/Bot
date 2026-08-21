@@ -448,3 +448,5 @@ CRATE_SHULKER_BLOCK=red_shulker_box
 
 Since this command already takes an optional `[bot]`, the first word is checked against existing bot names/numbers first; if it doesn't match a bot, it's treated as the color instead (and the active bot is used).
 `CRATE_COMMAND` sets the chat command the bot sends when `/crates` (and `/crates-loop`, `/crates-all`, `/crates-solo`) warps to the crate area — for example, setting `CRATE_COMMAND=/warp afk` in `.env` makes it warp to afk instead of the default `/warp crates`.
+RUN npx patch-package mineflayer FOR BANNNASMP
+OR npm run postinstall
