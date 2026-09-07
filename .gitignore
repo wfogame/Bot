@@ -6,4 +6,4 @@ node_modules
 .command_history
 bannana
 node_modules/
-WEB_PASSWORD=raidraid.moc
+.env*

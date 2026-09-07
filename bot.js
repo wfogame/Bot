@@ -1,4 +1,7 @@
 require('dotenv').config() // npm install dotenv ws — neo-blessed only if TUI_GUI, socks only for PROXY_HOST
+const { readDelayMs, shuffledCopy, createSlowBroadcast, parseProxyGroups, resolveBotProxy } = require('./bot-controls')
+const os = require('os')
+const { createMonitoring } = require('./monitoring')
 const net = require('net')
 const fs = require('fs')
 const path = require('path')
@@ -21,6 +24,8 @@ const LOGIN_PASSWORD = process.env.LOGIN_PASSWORD || '123456'
 const BOT_NAMES = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
 const CONNECT_DELAY_RANDOM_MS = parseInt(process.env.CONNECT_DELAY_RANDOM_MS || '0', 10)
+const ALL_SLOW_DELAY_MS = readDelayMs(process.env.ALL_SLOW_DELAY_MS, 15000)
+const RANDOMIZE_BOT_ORDER = !/^(0|false|no|off)$/i.test((process.env.RANDOMIZE_BOT_ORDER || '').trim())
 const MAX_RECONNECT = parseInt(process.env.MAX_RECONNECT || '17', 10)
 const GUI_SLOT = parseInt(process.env.GUI_SLOT || '11', 10)
 const WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
@@ -112,6 +117,11 @@ const PROXY_HOST = process.env.PROXY_HOST || ''
 const PROXY_ENABLED = Boolean(PROXY_HOST)
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '1080', 10)
 const PROXY_TYPE = (process.env.PROXY_TYPE || 'socks5').toLowerCase()
+const PROXY_DEFAULT = PROXY_ENABLED ? { host: PROXY_HOST, port: PROXY_PORT, type: PROXY_TYPE } : null
+// Dedicated per-bot proxy groups: PROXY_GROUP_<N>_BOTS/_HOST/_PORT/_TYPE (see .env.example).
+// Bots not listed in any group fall back to PROXY_DEFAULT (global proxy, or direct if unset).
+const PROXY_GROUPS = parseProxyGroups()
+const PROXY_GROUPS_ENABLED = PROXY_GROUPS.length > 0
 
 // ── Proxy stall watchdog ────────────────────────────────────────────────────
 const PROXY_STALL_ENABLED = PROXY_ENABLED && process.env.PROXY_STALL_WATCHDOG !== '0'
@@ -154,16 +164,16 @@ process.exit(1)
 }
 
 // ── Outbound proxy tunnelling (original, unchanged) ──────────────────────────
-function makeSocksConnect(targetHost, targetPort, onLog) {
+function makeSocksConnect(targetHost, targetPort, onLog, proxy) {
 return (client) => {
 if (!SocksClient) {
 client.emit('error', new Error('PROXY_TYPE=socks5 requires the "socks" package — run: npm install socks'))
 client.emit('end', 'Missing socks package')
 return
 }
-onLog?.(`Tunnelling through SOCKS5 proxy ${PROXY_HOST}:${PROXY_PORT}…`)
+onLog?.(`Tunnelling through SOCKS5 proxy ${proxy.host}:${proxy.port}…`)
 SocksClient.createConnection({
-proxy: { host: PROXY_HOST, port: PROXY_PORT, type: 5 },
+proxy: { host: proxy.host, port: proxy.port, type: 5 },
 command: 'connect',
 destination: { host: targetHost, port: targetPort }
 }).then(({ socket }) => {
@@ -177,10 +187,10 @@ client.emit('end', errMsg)
 }
 }
 
-function makeHttpConnect(targetHost, targetPort, onLog) {
+function makeHttpConnect(targetHost, targetPort, onLog, proxy) {
 return (client) => {
-onLog?.(`Tunnelling through HTTP proxy ${PROXY_HOST}:${PROXY_PORT}…`)
-const socket = net.connect(PROXY_PORT, PROXY_HOST, () => {
+onLog?.(`Tunnelling through HTTP proxy ${proxy.host}:${proxy.port}…`)
+const socket = net.connect(proxy.port, proxy.host, () => {
 socket.write(
 `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
 `Host: ${targetHost}:${targetPort}\r\n` +
@@ -223,11 +233,12 @@ client.emit('end', errMsg)
 }
 }
 
-function makeProxyConnect(targetHost, targetPort, onLog) {
-if (!PROXY_ENABLED) return undefined
-return PROXY_TYPE === 'http'
-? makeHttpConnect(targetHost, targetPort, onLog)
-: makeSocksConnect(targetHost, targetPort, onLog)
+function makeProxyConnect(targetHost, targetPort, onLog, username) {
+const proxy = resolveBotProxy(username, PROXY_GROUPS, PROXY_DEFAULT)
+if (!proxy) return undefined
+return proxy.type === 'http'
+? makeHttpConnect(targetHost, targetPort, onLog, proxy)
+: makeSocksConnect(targetHost, targetPort, onLog, proxy)
 }
 
 // ── Sanitizers ───────────────────────────────────────────────────────────────
@@ -277,6 +288,7 @@ let tui = null // set by startTUI()
 let webHandle = null // set by startWebGUI()
 let markBotsDirtyFn = null
 let webClearFn = null
+const slowBroadcast = createSlowBroadcast()
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -295,6 +307,9 @@ function log(msg) { logFor(activeId || SYSTEM_ID, msg) }
 function logSuccess(msg) { log(`{green-fg}✓ ${msg}{/green-fg}`) }
 function logError(msg) { log(`{red-fg}✗ ${msg}{/red-fg}`) }
 function logInfo(msg) { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
+
+// Centralized Discord alerts and host memory/swap monitoring.
+let monitoring
 function logWarn(msg) { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 
 // 20-minute log pruning (original behavior), timers unref'd so they never hold the process open
@@ -319,9 +334,17 @@ return {
 rssMB: Math.round(m.rss / 1048576), heapMB: Math.round(m.heapUsed / 1048576),
 uptimeSec: Math.floor(process.uptime()), clients: webHandle ? webHandle.clients.size : 0,
 evlLagMs, logPerSec: Math.round(logRateWindow / 2),
-bots: Object.keys(bots).length, online: Object.values(bots).filter(b => b.bot && b.bot.entity).length
+bots: Object.keys(bots).length, online: Object.values(bots).filter(b => b.bot && b.bot.entity).length,
+memory: monitoring ? monitoring.getMemorySnapshot() : null
 }
 }
+
+monitoring = createMonitoring({
+  logFor, systemId: SYSTEM_ID, sanitize,
+  getStats: () => globalStats(),
+  getBotCount: () => Object.keys(bots).length
+})
+
 function botSnapshot() {
 return Object.entries(bots).map(([id, e]) => {
 const b = e.bot
@@ -379,10 +402,10 @@ saveHistory()
 
 // ── Global crash guards ───────────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
-try { logFor(SYSTEM_ID, `{red-fg}[UNCAUGHT] ${sanitize(err.stack || err.message)}{/red-fg}`) } catch (_) {}
+try { logFor(SYSTEM_ID, `{red-fg}[UNCAUGHT] ${sanitize(err.stack || err.message)}{/red-fg}`); monitoring?.onFatal('uncaught exception', err.stack || err.message) } catch (_) {}
 })
 process.on('unhandledRejection', (reason) => {
-try { logFor(SYSTEM_ID, `{red-fg}[UNHANDLED REJECTION] ${sanitize(reason instanceof Error ? reason.message : String(reason))}{/red-fg}`) } catch (_) {}
+try { const detail = reason instanceof Error ? (reason.stack || reason.message) : String(reason); logFor(SYSTEM_ID, `{red-fg}[UNHANDLED REJECTION] ${sanitize(detail)}{/red-fg}`); monitoring?.onFatal('unhandled rejection', detail) } catch (_) {}
 })
 
 // ── TUI (optional — lazily loaded, only when TUI_GUI is on) ──────────────────
@@ -463,7 +486,9 @@ const activeIndex = names.indexOf(activeId) + 1
 const activeLabel = activeId ? `Active: [${activeIndex}] ${activeId}` : 'No active bot'
 const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` : null).filter(Boolean)
 const othersLabel = others.length ? ` | Others: ${others.join(', ')}` : ''
-const proxyLabel = PROXY_ENABLED ? ` — Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
+const proxyLabel = PROXY_GROUPS_ENABLED
+? ` — Proxy: ${PROXY_GROUPS.length} group(s)`
+: PROXY_ENABLED ? ` — Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
 const webLabel = webHandle ? ` — Web: :${webHandle.port}` : ''
 header.setContent(`{center}{bold}⛏ MINEFLAYER AFK CONSOLE{/bold} — ${activeLabel}${othersLabel}${proxyLabel}${webLabel}{/center}`)
 debouncedRender()
@@ -648,7 +673,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:8px;padding:9px 14px;max-width:340px;font-size:12px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
 .toast.bad{border-left-color:var(--red)}.toast.good{border-left-color:var(--grn)}
 .toast.out{opacity:0;transition:opacity .4s}
-@media(max-width:760px){#app{grid-template-columns:1fr;grid-template-areas:"top" "side" "main";grid-template-rows:46px 160px 1fr}#cmdbar{left:0}#search{width:110px}aside{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden}.bot{min-width:180px}.views{min-width:140px;flex-direction:column}}
+@media(max-width:760px){header{overflow-x:auto}header>*{flex-shrink:0}#chips{flex-wrap:nowrap}#loghead{overflow-x:auto}#loghead>*{flex-shrink:0}#botlist{display:flex;gap:6px}.bot{margin-bottom:0}#app{grid-template-columns:1fr;grid-template-areas:"top" "side" "main";grid-template-rows:46px 160px 1fr}#cmdbar{left:0}#search{width:110px}aside{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden}.bot{min-width:180px}.views{min-width:140px;flex-direction:column}}
 </style></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
@@ -659,6 +684,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <button class="tb" id="clearbtn">clear</button><button class="tb" id="helpbtn">? cmds</button></div>
 <div id="logwrap"><div id="log"></div></div>
 <form id="cmdbar" action="/command" method="post"><div id="sugg" hidden></div><span class="prompt">❯</span>
+<input type="hidden" id="selectedId" name="selectedId" value="all">
 <input id="cmd" name="text" placeholder="type / for commands — runs on selected bot" autocomplete="off" spellcheck="false">
 <button class="tb" id="sendbtn">send</button>
 </form>
@@ -670,7 +696,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <script>
 (function(){
 'use strict'
-var ws=null,view='all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,queuedCmds=[],terminalOpen=false,terminalEnabled=false
+var ws=null,view=new URLSearchParams(location.search).get('view')||'all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,terminalOpen=false,terminalEnabled=false
 function el(i){return document.getElementById(i)}
 function setWsState(kind,text){var state=el('wsstate');state.className='wsstate '+kind;state.textContent=text}
 // Strips ANSI/VT100 escape and control sequences (color codes, cursor moves,
@@ -715,11 +741,12 @@ setWsState('wait','http fallback')
 var poll=function(){
 if(pollBusy)return
 pollBusy=true
-fetch('/api/state?view='+encodeURIComponent(view),{credentials:'same-origin',cache:'no-store'}).then(function(r){
+var requestedView=view
+fetch('/api/state?view='+encodeURIComponent(requestedView),{credentials:'same-origin',cache:'no-store'}).then(function(r){
 if(!r.ok)throw Error('HTTP '+r.status)
 return r.json()
 }).then(function(m){
-cmds=m.commands||cmds;hist=m.cmdHistory||hist;terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();setLines(m.lines||[]);setWsState('up','http fallback')
+cmds=m.commands||cmds;hist=m.cmdHistory||hist;terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();if(view===requestedView)setLines(m.lines||[]);setWsState('up','http fallback')
 }).catch(function(){setWsState('down','offline')}).then(function(){pollBusy=false})
 }
 poll();pollTimer=setInterval(poll,2000)
@@ -731,24 +758,25 @@ if(ws&&(ws.readyState===WebSocket.CONNECTING||ws.readyState===WebSocket.OPEN))re
 setWsState('wait','connecting')
 var endpoint=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws'
 try{ws=new WebSocket(endpoint)}catch(e){startHttpFallback();scheduleConnect();return}
-ws.onopen=function(){rcDelay=600;stopHttpFallback();setWsState('up','connected');ws.send(JSON.stringify({t:'sub',id:view}));while(queuedCmds.length)ws.send(JSON.stringify({t:'cmd',text:queuedCmds.shift()}))}
+ws.onopen=function(){rcDelay=600;stopHttpFallback();setWsState('up','connected');ws.send(JSON.stringify({t:'sub',id:view}));}
 ws.onmessage=function(ev){var m;try{m=JSON.parse(ev.data)}catch(e){return}
 if(m.t==='hello'){cmds=m.commands||{};hist=m.cmdHistory||[];terminalEnabled=!!m.terminalEnabled;el('terminalbtn').hidden=!terminalEnabled;renderBots(m.bots||[]);renderStats(m.stats||{});buildHelp();toast('connected to console','good')}
 else if(m.t==='log'){addLines(m.entries||[])}
 else if(m.t==='bots'){renderBots(m.bots||[]);renderStats(m.stats||{})}
+else if(m.t==='select'){setView(m.id,false)}
 else if(m.t==='history'){if(m.id===view)setLines(m.lines||[])}
 else if(m.t==='clear'){if(m.id===view){lines=[];el('log').innerHTML=''}}
 else if(m.t==='terminal'){terminalWrite(m.data||'')}}
 ws.onclose=function(){startHttpFallback();scheduleConnect()}
 ws.onerror=function(){startHttpFallback()}
 }
-function setView(v){view=v;lines=[];pending=0;el('log').innerHTML='';el('newchip').style.display='none'
+function setView(v,subscribe){view=v;el('selectedId').value=v;lines=[];pending=0;el('log').innerHTML='';el('newchip').style.display='none'
 el('channame').textContent=v==='all'?'ALL CHANNELS':v==='system'?'SYSTEM':v
 var chips=document.querySelectorAll('.vchip'),i
 for(i=0;i<chips.length;i++)chips[i].classList.toggle('on',chips[i].getAttribute('data-view')===v)
 var cards=document.querySelectorAll('.bot')
 for(i=0;i<cards.length;i++)cards[i].classList.toggle('sel',cards[i].getAttribute('data-id')===v)
-if(ws&&ws.readyState===1)ws.send(JSON.stringify({t:'sub',id:v}))
+if(subscribe!==false&&ws&&ws.readyState===1)ws.send(JSON.stringify({t:'sub',id:v}))
 else if(pollTimer)startHttpFallback()
 setFollow(true)}
 function scrollBottom(){var w=el('logwrap');w.scrollTop=w.scrollHeight;pending=0;el('newchip').style.display='none'}
@@ -766,9 +794,9 @@ var pr=parseLine(e.text),pre=(view==='all'&&e.id!=='__system__')?'<span class="t
 lines.push({h:pr.h,p:pr.p,pre:pre})
 if(matchFilter(pr.p)){var d=document.createElement('div');d.className='ln';d.innerHTML=pre+pr.h;frag.appendChild(d);app=true
 if(!follow)pending++}}
+if(lines.length>3000)lines.splice(0,lines.length-3000)
 if(app){L.appendChild(frag)
 while(L.childNodes.length>1200)L.removeChild(L.firstChild)
-while(lines.length>3000)lines.shift()
 if(scrollOnNextLog){scrollOnNextLog=false;scrollBottom()}
 else if(follow)scrollBottom()
 else{var c=el('newchip');c.style.display='block';c.textContent=pending+' new ↓';c.onclick=scrollBottom}}}
@@ -819,8 +847,9 @@ el('toasts').appendChild(d)
 setTimeout(function(){d.classList.add('out');setTimeout(function(){d.remove()},500)},6000)}
 var cinput=el('cmd')
 function sendCmd(v){hist.push(v);hIdx=-1;setFollow(true);scrollOnNextLog=true;scrollBottom();setTimeout(scrollBottom,0);setTimeout(scrollBottom,180)
-if(ws&&ws.readyState===1){ws.send(JSON.stringify({t:'cmd',text:v}));return}
-fetch('/api/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:v})}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status)}).catch(function(){queuedCmds.push(v);setWsState('wait','queued');connect()})}
+var selectedId=view
+if(ws&&ws.readyState===1){ws.send(JSON.stringify({t:'cmd',text:v,selectedId:selectedId}));return}
+fetch('/api/command',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:v,selectedId:selectedId})}).then(function(r){if(!r.ok)throw Error('HTTP '+r.status);return r.json()}).then(function(m){if(m.selectedId)setView(m.selectedId)}).catch(function(){toast('Command delivery could not be confirmed. Check logs before retrying.','bad');connect()})}
 function hideSugg(){el('sugg').hidden=true}
 function showSugg(){var v=cinput.value
 if(!v||v.charAt(0)!=='/'){hideSugg();return}
@@ -869,6 +898,7 @@ if(e.key==='/'&&document.activeElement!==cinput&&document.activeElement!==el('se
 cinput.focus();if(!cinput.value)cinput.value='/';e.preventDefault()}})
 var chips=document.querySelectorAll('.vchip[data-view]')
 for(var ci=0;ci<chips.length;ci++)chips[ci].onclick=(function(v){return function(){setView(v)}})(chips[ci].getAttribute('data-view'))
+setView(view,false)
 connect()
 })()
 </script></body></html>`
@@ -981,7 +1011,7 @@ webTrace(`login success from ${ip}`)
 } else {
 const cnt = ((f && f.count) || 0) + 1
 fails.set(ip, { count: cnt, until: cnt >= WEB_LOGIN_MAX_FAILS ? Date.now() + 10 * 60_000 : 0 })
-if (cnt >= WEB_LOGIN_MAX_FAILS) logFor(SYSTEM_ID, `{red-fg}✗ Web login locked out for ${ip} (10 min){/red-fg}`)
+if (cnt >= WEB_LOGIN_MAX_FAILS) { logFor(SYSTEM_ID, `{red-fg}✗ Web login locked out for ${ip} (10 min){/red-fg}`); monitoring?.onSecurityLockout(ip) }
 webTrace(`login failed from ${ip} (attempt ${cnt})`)
 res.writeHead(303, { Location: '/login?e=1' }); res.end()
 }
@@ -1020,20 +1050,27 @@ if (!msg || typeof msg.text !== 'string' || !msg.text.trim()) { res.writeHead(40
 const trimmed = msg.text.trim()
 webTrace(`HTTP command: ${sanitize(trimmed).slice(0, 300)}`)
 recordHistory(trimmed)
-handleCommand(trimmed, { selectedId: typeof msg.selectedId === 'string' ? msg.selectedId : null })
-res.writeHead(202, { 'Cache-Control': 'no-store' }); res.end('accepted')
+let selectedId = null
+handleCommand(trimmed, {
+selectedId: botViewId(typeof msg.selectedId === 'string' ? msg.selectedId : null),
+selectBot: id => { selectedId = id }
+})
+res.writeHead(202, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(JSON.stringify({ accepted: true, selectedId }))
 return
 }
 if (p === '/command' && req.method === 'POST') {
 const body = await readBody(req)
-const text = new URLSearchParams(body || '').get('text') || ''
+const form = new URLSearchParams(body || '')
+const text = form.get('text') || ''
+let selectedId = normalizeView(form.get('selectedId'))
 if (text.trim()) {
 const trimmed = text.trim()
 webTrace(`form command: ${sanitize(trimmed).slice(0, 300)}`)
 recordHistory(trimmed)
-handleCommand(trimmed, { selectedId: null })
+handleCommand(trimmed, { selectedId: botViewId(selectedId), selectBot: id => { selectedId = id } })
 }
-res.writeHead(303, { Location: '/' }); res.end()
+res.writeHead(303, { Location: selectedId ? '/?view=' + encodeURIComponent(selectedId) : '/' }); res.end()
 return
 }
 if (p === '/' && req.method === 'GET') {
@@ -1075,15 +1112,15 @@ wss.handleUpgrade(req, socket, head, ws => { webTrace('upgrade accepted'); addCl
 
 function normalizeView(v) {
 if (v === 'all' || v === 'system') return v
-if (typeof v === 'string' && bots[v]) return v
+if (typeof v === 'string' && Object.hasOwn(bots, v)) return v
 return null
 }
 function botViewId(v) { return (v !== 'all' && v !== 'system') ? v : null }
 function historyForView(v) {
 if (v === 'system') return systemLogs.slice(-400).map(l => escHtml(l.text))
 if (v === 'all') {
-const all = systemLogs.slice()
-Object.values(bots).forEach(e => { all.push.apply(all, e.logs) })
+const all = systemLogs.slice(-400)
+Object.values(bots).forEach(e => { all.push(...e.logs.slice(-400)) })
 all.sort((a, b) => a.time - b.time)
 return all.slice(-400).map(l => escHtml(l.text))
 }
@@ -1157,7 +1194,14 @@ const trimmed = msg.text.trim()
 if (!trimmed) return
 recordHistory(trimmed)
 // Commands typed while viewing a bot act on THAT bot (see handleCommand's ctx routing)
-handleCommand(trimmed, { selectedId: botViewId(ctx.view) })
+handleCommand(trimmed, {
+selectedId: botViewId(typeof msg.selectedId === 'string' ? msg.selectedId : ctx.view),
+selectBot: id => {
+ctx.view = id
+ctx.send({ t: 'select', id })
+ctx.send({ t: 'history', id, lines: historyForView(id) })
+}
+})
 } else if (msg.t === 'sub' && typeof msg.id === 'string') {
 const v = normalizeView(msg.id)
 if (v) { ctx.view = v; ctx.send({ t: 'history', id: v, lines: historyForView(v) }) }
@@ -1186,6 +1230,7 @@ if (entries.length) ctx.send({ t: 'log', entries })
 }
 subscribeLog((id, text) => {
 logRateTick++
+if (!clients.size) return
 pendingLogs.push({ id, text })
 if (!flushTimer) {
 flushTimer = setTimeout(flushWebLogs, WS_BROADCAST_INTERVAL_MS)
@@ -1289,7 +1334,7 @@ let bot
 try {
 bot = mineflayer.createBot({
 host, port, username: id, version, hideErrors: true,
-connect: makeProxyConnect(host, port, i)
+connect: makeProxyConnect(host, port, i, id)
 })
 } catch (err) {
 const fallback = activeId || id
@@ -1346,6 +1391,7 @@ const attempt = bots[id]?.reconnectAttempts || 0
 if (!proxyCrash && attempt >= MAX_RECONNECT) {
 if (bots[id]) bots[id].reconnectTimer = null
 e(`${id} reached max reconnects (${MAX_RECONNECT}). Disconnected permanently. Use /reconnect to try again.`)
+monitoring?.onReconnectExhausted(id, MAX_RECONNECT)
 return
 }
 
@@ -1475,6 +1521,7 @@ i('Connected to server socket. Awaiting chat auth prompts…')
 // Listen to plain text messages to grep for auth requests
 bot.on('messagestr', (message) => {
 const text = message.toLowerCase()
+monitoring?.inspectServerMessage(id, message)
 
 // Grep for register prompts (e.g., "Please register using /register <password> <password>")
 if (text.includes('register') && text.includes('/register')) {
@@ -1509,7 +1556,9 @@ bot.acceptResourcePack(); // For older versions it still works fine
 
 bot.once('spawn', () => {
 connected = true
+const recoveredAfter = bots[id]?.reconnectAttempts || 0
 if (bots[id]) bots[id].spawnTime = Date.now()
+monitoring?.onRecovered(id, recoveredAfter)
 s(`Spawned on ${host}:${port} (v${version}).`)
 notifyBotsChanged()
 
@@ -1629,6 +1678,7 @@ bots[id].lastKickReason = text
 bots[id].lastDisconnectReason = text
 }
 e(`Kicked: ${sanitize(text)}`)
+monitoring?.onKick(id, text)
 notifyBotsChanged()
 })
 
@@ -1687,6 +1737,7 @@ if (!hasRealReason && PROXY_ENABLED && !bots[id]?.spawnTime && (reasonText === '
 classificationReason = 'pre-spawn socketClosed (proxy tunnel likely dropped)'
 }
 
+monitoring?.onDisconnect(id, classificationReason, manualDisconnect)
 scheduleReconnect('Connection lost', classificationReason)
 lastRawError = null
 })
@@ -1711,7 +1762,8 @@ return bot
 // ── Connect all bots with staggered delay ───────────────────────────────────
 let currentConnectDelay = 0
 const initialConnectTimers = []
-BOT_NAMES.forEach((name, index) => {
+const initialBotOrder = RANDOMIZE_BOT_ORDER ? shuffledCopy(BOT_NAMES) : BOT_NAMES.slice()
+initialBotOrder.forEach((name, index) => {
 const timer = setTimeout(() => {
 createBotInstance(name)
 if (index === 0) switchTo(name)
@@ -1751,7 +1803,9 @@ restartProxyService()
 }
 
 stalled.forEach(([id, entry]) => {
-console.warn(`[proxy-watchdog] "${id}" has received nothing for ${Math.round((now - entry.lastActivity) / 1000)}s — forcing reconnect.`)
+const stalledSeconds = Math.round((now - entry.lastActivity) / 1000)
+console.warn(`[proxy-watchdog] "${id}" has received nothing for ${stalledSeconds}s — forcing reconnect.`)
+monitoring?.onProxyStall(id, stalledSeconds)
 entry.forceKilled = true
 entry.lastActivity = now // avoid re-triggering every scan while the kill/reconnect is in flight
 try {
@@ -1768,6 +1822,7 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 // ── Command registry (original + /stats) ──────────────────────────────────────
 const COMMANDS = {
 '/all <cmd>': 'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
+'/all-slow <cmd>': `Like /all, but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS)`,
 '/overview': 'Dashboard of every bot\'s health, food, ping, shards, coins, and balance',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
@@ -2424,7 +2479,13 @@ if (!trimmed) return
 // TUI (or other browser tabs) see. The shadowed helpers below route all of
 // this command's output (including async continuations like /overview's)
 // into the commanding context's channel.
-const ctxId = (ctx && ctx.selectedId && bots[ctx.selectedId]) ? ctx.selectedId : null
+const requestedId = ctx && ctx.selectedId
+// Never silently send a stale tab's command to a different bot.
+if (requestedId && !Object.hasOwn(bots, requestedId) && !/^\/switch(?:\s|$)/.test(trimmed)) {
+logFor(SYSTEM_ID, `{yellow-fg}⚠ Bot "${sanitize(requestedId)}" no longer exists.{/yellow-fg}`)
+return
+}
+const ctxId = requestedId || null
 const activeId = ctxId || currentActiveId() // shadows the global for this invocation
 const log = (msg) => logFor(activeId || SYSTEM_ID, msg)
 const logInfo = (msg) => logFor(activeId || SYSTEM_ID, `{cyan-fg}› ${msg}{/cyan-fg}`)
@@ -2435,26 +2496,41 @@ const logError = (msg) => logFor(activeId || SYSTEM_ID, `{red-fg}✗ ${msg}{/red
 // Echo the run command so the log is self-documenting (the web console needs it)
 log(`{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
 
-// ── /all ────────────────────────────────────
-if (trimmed.startsWith('/all ')) {
-const msg = trimmed.slice(5).trim()
-if (!msg) { logWarn('Usage: /all <command or message>'); return }
-const baseCmd = msg.split(' ')[0]
-
-if (LOCAL_COMMANDS.includes(baseCmd)) {
-logInfo(`{yellow-fg}Running "${baseCmd}" locally on all bots:{/yellow-fg}`)
-let count = 0
-Object.keys(bots).forEach(id => { if (runLocalCommandForBot(id, baseCmd)) count++ })
-logSuccess(`Ran "${baseCmd}" on ${count} bots.`)
-return
+// ── /all and /all-slow ───────────────────────
+const broadcastMatch = trimmed.match(/^\/(all|all-slow)(?:\s+([\s\S]*))?$/)
+if (broadcastMatch) {
+const command = '/' + broadcastMatch[1]
+const msg = (broadcastMatch[2] || '').trim()
+if (!msg) { logWarn(`Usage: ${command} <command or message>`); return }
+const baseCmd = msg.split(/\s+/)[0]
+const isLocal = LOCAL_COMMANDS.includes(baseCmd)
+const ids = Object.keys(bots)
+const dispatch = id => {
+if (!bots[id]) return false
+if (isLocal) {
+// Reuse the single-bot router so arguments (e.g. /crates purple) survive.
+handleCommand(msg, { selectedId: id })
+return true
 }
-
-logInfo(`{yellow-fg}Broadcasting to all bots:{/yellow-fg} ${sanitize(msg)}`)
-let sent = 0
-Object.entries(bots).forEach(([, { bot }]) => {
-if (bot?.entity) { try { bot.chat(msg); sent++ } catch (_) {} }
+if (!bots[id].bot?.entity) return false
+bots[id].bot.chat(msg)
+return true
+}
+const onError = (err, id) => logWarn(`${id}: ${sanitize(err.message)}`)
+if (command === '/all-slow') {
+if (slowBroadcast.running) { logWarn('An /all-slow broadcast is already running. Wait for it to finish.'); return }
+logInfo(`Slow broadcast to ${ids.length} bot(s), ${ALL_SLOW_DELAY_MS / 1000}s apart: ${sanitize(msg)}`)
+slowBroadcast.start(ids, ALL_SLOW_DELAY_MS, dispatch, {
+onError,
+onDone: ({ sent, skipped }) => logSuccess(`Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
 })
-logSuccess(`Broadcasted to ${sent} bots.`)
+} else {
+let sent = 0
+for (const id of ids) {
+try { if (dispatch(id)) sent++ } catch (err) { onError(err, id) }
+}
+logSuccess(`${isLocal ? 'Ran locally on' : 'Broadcasted to'} ${sent} bots.`)
+}
 return
 }
 
@@ -2521,16 +2597,21 @@ return
 
 // ── /proxy ──────────────────────────────────
 if (trimmed === '/proxy') {
+if (PROXY_GROUPS_ENABLED) {
+logInfo(`{bold}Dedicated proxy groups:{/bold} ${PROXY_GROUPS.length} configured`)
+PROXY_GROUPS.forEach(g => logInfo(`  [${g.index}] ${g.bots.join(', ')} → ${g.type.toUpperCase()} ${g.host}:${g.port}`))
+logInfo(PROXY_DEFAULT ? `  (other bots) → ${PROXY_DEFAULT.type.toUpperCase()} ${PROXY_DEFAULT.host}:${PROXY_DEFAULT.port}` : '  (other bots) → direct connection')
+}
 if (PROXY_ENABLED) {
-logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots)`)
+logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots without a dedicated group)`)
 if (PROXY_STALL_ENABLED) {
 const restartInfo = PROXY_RESTART_CMD ? `restart cmd: "${PROXY_RESTART_CMD}"` : 'no restart cmd (proxy isn\'t local — set PROXY_RESTART_CMD in .env if you want auto-restart)'
 logInfo(`{bold}Stall watchdog:{/bold} on — stall timeout ${(PROXY_STALL_TIMEOUT_MS / 1000).toFixed(0)}s, checked every ${(PROXY_STALL_CHECK_MS / 1000).toFixed(0)}s, ${restartInfo}`)
 } else {
 logInfo('{bold}Stall watchdog:{/bold} off (set PROXY_STALL_WATCHDOG=1, or unset PROXY_STALL_WATCHDOG=0, in .env)')
 }
-} else {
-logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST in .env to enable one.')
+} else if (!PROXY_GROUPS_ENABLED) {
+logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST or PROXY_GROUP_1_* in .env to enable one.')
 }
 return
 }
@@ -2538,7 +2619,9 @@ return
 // ── /stats (added) ──────────────────────────
 if (trimmed === '/stats') {
 const s = globalStats()
-logInfo(`Runtime: RSS ${s.rssMB}MB · heap ${s.heapMB}MB · event-loop lag ${s.evlLagMs}ms · logs ${s.logPerSec}/s · web viewers ${s.clients} · bots ${s.online}/${s.bots} online · uptime ${formatUptime(s.uptimeSec * 1000)}`)
+const mem = s.memory
+const hostMem = mem && mem.availablePct != null ? ` · host RAM free ${mem.availablePct.toFixed(1)}% · swap ${mem.swapPct.toFixed(1)}% · pressure ${mem.level}` : ''
+logInfo(`Runtime: RSS ${s.rssMB}MB · heap ${s.heapMB}MB · event-loop lag ${s.evlLagMs}ms · logs ${s.logPerSec}/s · web viewers ${s.clients} · bots ${s.online}/${s.bots} online · uptime ${formatUptime(s.uptimeSec * 1000)}${hostMem}`)
 return
 }
 
@@ -2600,17 +2683,19 @@ return
 }
 
 // ── /switch ─────────────────────────────────
-if (trimmed.startsWith('/switch ')) {
-const arg = trimmed.slice(8).trim()
-if (/^\d+$/.test(arg)) {
-const index = parseInt(arg, 10) - 1
+if (trimmed === '/switch' || trimmed.startsWith('/switch ')) {
+const arg = trimmed.slice(7).trim()
+if (!arg) { logWarn('Usage: /switch <bot name or number>'); return }
 const names = Object.keys(bots)
-if (names[index]) switchTo(names[index])
-else logWarn(`No bot at index [${arg}]. Valid: 1–${names.length}`)
-} else {
-switchTo(arg)
-}
+const targetId = /^\d+$/.test(arg) ? names[Number(arg) - 1] : arg
+if (!targetId || !Object.hasOwn(bots, targetId)) {
+logWarn(/^\d+$/.test(arg) ? `No bot at index [${arg}]. Valid: 1–${names.length}` : `No bot named "${sanitize(arg)}".`)
 return
+}
+// A browser owns its selection; do not change the TUI or another tab.
+if (ctx && typeof ctx.selectBot === 'function') ctx.selectBot(targetId)
+else switchTo(targetId)
+return { selectedId: targetId }
 }
 
 // ── /crates [color] ───
@@ -2723,6 +2808,7 @@ break
 
 case '/exit':
 logWarn('Exiting all bots…')
+slowBroadcast.cancel()
 initialConnectTimers.forEach(clearTimeout)
 initialConnectTimers.length = 0
 Object.values(bots).forEach(entry => { try { entry.disconnectManually() } catch (_) {} })

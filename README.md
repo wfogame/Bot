@@ -228,6 +228,12 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_STALL_CHECK_MS` | `20000` | Watchdog polling interval |
 | `PROXY_STALL_RATIO` | `0.5` | Fraction of stalled bots that triggers proxy restart |
 | `PROXY_RESTART_CMD` | local Tor restart when applicable | Optional proxy restart command |
+| `PROXY_GROUP_<N>_BOTS` | unset | Comma-separated bot usernames dedicated to group `N` (starts at 1, no gaps) |
+| `PROXY_GROUP_<N>_HOST` | unset | Proxy host for group `N` |
+| `PROXY_GROUP_<N>_PORT` | `1080` | Proxy port for group `N` |
+| `PROXY_GROUP_<N>_TYPE` | `socks5` | `socks5` or `http` for group `N` |
+
+Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOST` above (or connect directly if it's unset). `/proxy` reports both the configured groups and the fallback.
 
 ### Web dashboard
 
@@ -378,3 +384,11 @@ RTP log for webhook errors. Node.js 18+ is required for the built-in `fetch`.
 
 This project is provided as-is. Use it only on servers and accounts you are
 authorized to automate.
+
+## Discord Alerts and Memory Watchdog
+
+The main bot runner can send Discord webhook alerts for 30-second server restart warnings, kicks, unexpected disconnects, successful recovery, exhausted reconnect limits, proxy stalls, dashboard login lockouts, fatal process errors, and host memory pressure. Set `DISCORD_WEBHOOK_URL` and `DISCORD_USER_ID` in `.env`.
+
+The restart detector requires both the case-insensitive phrase `SERVER WILL RESTART IN` and the standalone number `30` in the same server message. Duplicate alerts are suppressed for the configured cooldown.
+
+The memory watchdog uses Linux `/proc/meminfo` where available so container/host memory availability and swap usage can be monitored. It falls back to Node's OS memory counters on other platforms. Alerts are stateful, rate-limited, and followed by a recovery notice once available memory returns above `MEMORY_RECOVERY_PERCENT`.
