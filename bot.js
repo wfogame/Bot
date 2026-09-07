@@ -1,5 +1,5 @@
 require('dotenv').config() // npm install dotenv ws — neo-blessed only if TUI_GUI, socks only for PROXY_HOST
-const { readDelayMs, shuffledCopy, createSlowBroadcast } = require('./bot-controls')
+const { readDelayMs, shuffledCopy, createSlowBroadcast, parseProxyGroups, resolveBotProxy } = require('./bot-controls')
 const os = require('os')
 const { createMonitoring } = require('./monitoring')
 const net = require('net')
@@ -117,6 +117,11 @@ const PROXY_HOST = process.env.PROXY_HOST || ''
 const PROXY_ENABLED = Boolean(PROXY_HOST)
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '1080', 10)
 const PROXY_TYPE = (process.env.PROXY_TYPE || 'socks5').toLowerCase()
+const PROXY_DEFAULT = PROXY_ENABLED ? { host: PROXY_HOST, port: PROXY_PORT, type: PROXY_TYPE } : null
+// Dedicated per-bot proxy groups: PROXY_GROUP_<N>_BOTS/_HOST/_PORT/_TYPE (see .env.example).
+// Bots not listed in any group fall back to PROXY_DEFAULT (global proxy, or direct if unset).
+const PROXY_GROUPS = parseProxyGroups()
+const PROXY_GROUPS_ENABLED = PROXY_GROUPS.length > 0
 
 // ── Proxy stall watchdog ────────────────────────────────────────────────────
 const PROXY_STALL_ENABLED = PROXY_ENABLED && process.env.PROXY_STALL_WATCHDOG !== '0'
@@ -159,16 +164,16 @@ process.exit(1)
 }
 
 // ── Outbound proxy tunnelling (original, unchanged) ──────────────────────────
-function makeSocksConnect(targetHost, targetPort, onLog) {
+function makeSocksConnect(targetHost, targetPort, onLog, proxy) {
 return (client) => {
 if (!SocksClient) {
 client.emit('error', new Error('PROXY_TYPE=socks5 requires the "socks" package — run: npm install socks'))
 client.emit('end', 'Missing socks package')
 return
 }
-onLog?.(`Tunnelling through SOCKS5 proxy ${PROXY_HOST}:${PROXY_PORT}…`)
+onLog?.(`Tunnelling through SOCKS5 proxy ${proxy.host}:${proxy.port}…`)
 SocksClient.createConnection({
-proxy: { host: PROXY_HOST, port: PROXY_PORT, type: 5 },
+proxy: { host: proxy.host, port: proxy.port, type: 5 },
 command: 'connect',
 destination: { host: targetHost, port: targetPort }
 }).then(({ socket }) => {
@@ -182,10 +187,10 @@ client.emit('end', errMsg)
 }
 }
 
-function makeHttpConnect(targetHost, targetPort, onLog) {
+function makeHttpConnect(targetHost, targetPort, onLog, proxy) {
 return (client) => {
-onLog?.(`Tunnelling through HTTP proxy ${PROXY_HOST}:${PROXY_PORT}…`)
-const socket = net.connect(PROXY_PORT, PROXY_HOST, () => {
+onLog?.(`Tunnelling through HTTP proxy ${proxy.host}:${proxy.port}…`)
+const socket = net.connect(proxy.port, proxy.host, () => {
 socket.write(
 `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
 `Host: ${targetHost}:${targetPort}\r\n` +
@@ -228,11 +233,12 @@ client.emit('end', errMsg)
 }
 }
 
-function makeProxyConnect(targetHost, targetPort, onLog) {
-if (!PROXY_ENABLED) return undefined
-return PROXY_TYPE === 'http'
-? makeHttpConnect(targetHost, targetPort, onLog)
-: makeSocksConnect(targetHost, targetPort, onLog)
+function makeProxyConnect(targetHost, targetPort, onLog, username) {
+const proxy = resolveBotProxy(username, PROXY_GROUPS, PROXY_DEFAULT)
+if (!proxy) return undefined
+return proxy.type === 'http'
+? makeHttpConnect(targetHost, targetPort, onLog, proxy)
+: makeSocksConnect(targetHost, targetPort, onLog, proxy)
 }
 
 // ── Sanitizers ───────────────────────────────────────────────────────────────
@@ -480,7 +486,9 @@ const activeIndex = names.indexOf(activeId) + 1
 const activeLabel = activeId ? `Active: [${activeIndex}] ${activeId}` : 'No active bot'
 const others = names.map((n, i) => i !== (activeIndex - 1) ? `[${i + 1}] ${n}` : null).filter(Boolean)
 const othersLabel = others.length ? ` | Others: ${others.join(', ')}` : ''
-const proxyLabel = PROXY_ENABLED ? ` — Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
+const proxyLabel = PROXY_GROUPS_ENABLED
+? ` — Proxy: ${PROXY_GROUPS.length} group(s)`
+: PROXY_ENABLED ? ` — Proxy: ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT}` : ''
 const webLabel = webHandle ? ` — Web: :${webHandle.port}` : ''
 header.setContent(`{center}{bold}⛏ MINEFLAYER AFK CONSOLE{/bold} — ${activeLabel}${othersLabel}${proxyLabel}${webLabel}{/center}`)
 debouncedRender()
@@ -1326,7 +1334,7 @@ let bot
 try {
 bot = mineflayer.createBot({
 host, port, username: id, version, hideErrors: true,
-connect: makeProxyConnect(host, port, i)
+connect: makeProxyConnect(host, port, i, id)
 })
 } catch (err) {
 const fallback = activeId || id
@@ -2589,16 +2597,21 @@ return
 
 // ── /proxy ──────────────────────────────────
 if (trimmed === '/proxy') {
+if (PROXY_GROUPS_ENABLED) {
+logInfo(`{bold}Dedicated proxy groups:{/bold} ${PROXY_GROUPS.length} configured`)
+PROXY_GROUPS.forEach(g => logInfo(`  [${g.index}] ${g.bots.join(', ')} → ${g.type.toUpperCase()} ${g.host}:${g.port}`))
+logInfo(PROXY_DEFAULT ? `  (other bots) → ${PROXY_DEFAULT.type.toUpperCase()} ${PROXY_DEFAULT.host}:${PROXY_DEFAULT.port}` : '  (other bots) → direct connection')
+}
 if (PROXY_ENABLED) {
-logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots)`)
+logInfo(`{bold}Outbound proxy:{/bold} ${PROXY_TYPE.toUpperCase()} ${PROXY_HOST}:${PROXY_PORT} (applies to all bots without a dedicated group)`)
 if (PROXY_STALL_ENABLED) {
 const restartInfo = PROXY_RESTART_CMD ? `restart cmd: "${PROXY_RESTART_CMD}"` : 'no restart cmd (proxy isn\'t local — set PROXY_RESTART_CMD in .env if you want auto-restart)'
 logInfo(`{bold}Stall watchdog:{/bold} on — stall timeout ${(PROXY_STALL_TIMEOUT_MS / 1000).toFixed(0)}s, checked every ${(PROXY_STALL_CHECK_MS / 1000).toFixed(0)}s, ${restartInfo}`)
 } else {
 logInfo('{bold}Stall watchdog:{/bold} off (set PROXY_STALL_WATCHDOG=1, or unset PROXY_STALL_WATCHDOG=0, in .env)')
 }
-} else {
-logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST in .env to enable one.')
+} else if (!PROXY_GROUPS_ENABLED) {
+logInfo('No outbound proxy configured — bots connect directly. Set PROXY_HOST or PROXY_GROUP_1_* in .env to enable one.')
 }
 return
 }

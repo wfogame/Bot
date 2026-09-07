@@ -228,6 +228,12 @@ item matches, the bot falls back to `GUI_SLOT`.
 | `PROXY_STALL_CHECK_MS` | `20000` | Watchdog polling interval |
 | `PROXY_STALL_RATIO` | `0.5` | Fraction of stalled bots that triggers proxy restart |
 | `PROXY_RESTART_CMD` | local Tor restart when applicable | Optional proxy restart command |
+| `PROXY_GROUP_<N>_BOTS` | unset | Comma-separated bot usernames dedicated to group `N` (starts at 1, no gaps) |
+| `PROXY_GROUP_<N>_HOST` | unset | Proxy host for group `N` |
+| `PROXY_GROUP_<N>_PORT` | `1080` | Proxy port for group `N` |
+| `PROXY_GROUP_<N>_TYPE` | `socks5` | `socks5` or `http` for group `N` |
+
+Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOST` above (or connect directly if it's unset). `/proxy` reports both the configured groups and the fallback.
 
 ### Web dashboard
 

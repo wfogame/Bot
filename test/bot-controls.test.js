@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, shuffledCopy, createSlowBroadcast } = require('../bot-controls')
+const { readDelayMs, shuffledCopy, createSlowBroadcast, parseProxyGroups, resolveBotProxy } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -83,4 +83,47 @@ test('empty broadcast finishes without a timer', () => {
   assert.deepEqual(result, { sent: 0, skipped: 0 })
   assert.equal(job.running, false)
   assert.equal(c.timers.size, 0)
+})
+
+test('parseProxyGroups reads indexed PROXY_GROUP_N_* vars and stops at the first gap', () => {
+  const env = {
+    PROXY_GROUP_1_BOTS: 'Alice, Bob',
+    PROXY_GROUP_1_HOST: '1.2.3.4',
+    PROXY_GROUP_1_PORT: '1081',
+    PROXY_GROUP_1_TYPE: 'http',
+    PROXY_GROUP_2_BOTS: 'Carol',
+    PROXY_GROUP_2_HOST: '5.6.7.8',
+    // no PORT/TYPE -> defaults
+    PROXY_GROUP_4_BOTS: 'Dave', // gap at 3 -> never reached
+    PROXY_GROUP_4_HOST: '9.9.9.9'
+  }
+  const groups = parseProxyGroups(env)
+  assert.deepEqual(groups, [
+    { index: 1, bots: ['Alice', 'Bob'], host: '1.2.3.4', port: 1081, type: 'http' },
+    { index: 2, bots: ['Carol'], host: '5.6.7.8', port: 1080, type: 'socks5' }
+  ])
+})
+
+test('parseProxyGroups skips a group missing bots or host', () => {
+  const env = { PROXY_GROUP_1_BOTS: '', PROXY_GROUP_1_HOST: '1.2.3.4' }
+  assert.deepEqual(parseProxyGroups(env), [])
+  assert.deepEqual(parseProxyGroups({}), [])
+})
+
+test('resolveBotProxy matches the group containing the bot', () => {
+  const groups = parseProxyGroups({
+    PROXY_GROUP_1_BOTS: 'Alice,Bob', PROXY_GROUP_1_HOST: '1.2.3.4', PROXY_GROUP_1_PORT: '1081', PROXY_GROUP_1_TYPE: 'http',
+    PROXY_GROUP_2_BOTS: 'Carol', PROXY_GROUP_2_HOST: '5.6.7.8'
+  })
+  assert.deepEqual(resolveBotProxy('Bob', groups), { host: '1.2.3.4', port: 1081, type: 'http', group: 1 })
+  assert.deepEqual(resolveBotProxy('Carol', groups), { host: '5.6.7.8', port: 1080, type: 'socks5', group: 2 })
+})
+
+test('resolveBotProxy falls back when unmatched, disabled, or empty', () => {
+  const groups = parseProxyGroups({ PROXY_GROUP_1_BOTS: 'Alice', PROXY_GROUP_1_HOST: '1.2.3.4' })
+  const fallback = { host: 'global-host', port: 1080, type: 'socks5' }
+  assert.deepEqual(resolveBotProxy('Zed', groups, fallback), fallback)
+  assert.equal(resolveBotProxy('Zed', groups, null), null)
+  assert.equal(resolveBotProxy('Alice', [], fallback), fallback)
+  assert.equal(resolveBotProxy('Alice', undefined, fallback), fallback)
 })
