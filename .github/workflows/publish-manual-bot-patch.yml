@@ -18,8 +18,8 @@ jobs:
           node-version: '22'
       - name: Apply exact patch and verify
         run: |
-          git apply --check .automation/bot-controls.patch
-          git apply .automation/bot-controls.patch
+          git apply --check --unidiff-zero .automation/bot-controls.patch
+          git apply --unidiff-zero .automation/bot-controls.patch
           node --check bot.js
           node --check bot-controls.js
           npm test
