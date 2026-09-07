@@ -1,5 +1,7 @@
 require('dotenv').config() // npm install dotenv ws — neo-blessed only if TUI_GUI, socks only for PROXY_HOST
 const { readDelayMs, shuffledCopy, createSlowBroadcast } = require('./bot-controls')
+const os = require('os')
+const { createMonitoring } = require('./monitoring')
 const net = require('net')
 const fs = require('fs')
 const path = require('path')
@@ -299,6 +301,9 @@ function log(msg) { logFor(activeId || SYSTEM_ID, msg) }
 function logSuccess(msg) { log(`{green-fg}✓ ${msg}{/green-fg}`) }
 function logError(msg) { log(`{red-fg}✗ ${msg}{/red-fg}`) }
 function logInfo(msg) { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
+
+// Centralized Discord alerts and host memory/swap monitoring.
+let monitoring
 function logWarn(msg) { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 
 // 20-minute log pruning (original behavior), timers unref'd so they never hold the process open
@@ -323,9 +328,17 @@ return {
 rssMB: Math.round(m.rss / 1048576), heapMB: Math.round(m.heapUsed / 1048576),
 uptimeSec: Math.floor(process.uptime()), clients: webHandle ? webHandle.clients.size : 0,
 evlLagMs, logPerSec: Math.round(logRateWindow / 2),
-bots: Object.keys(bots).length, online: Object.values(bots).filter(b => b.bot && b.bot.entity).length
+bots: Object.keys(bots).length, online: Object.values(bots).filter(b => b.bot && b.bot.entity).length,
+memory: monitoring ? monitoring.getMemorySnapshot() : null
 }
 }
+
+monitoring = createMonitoring({
+  logFor, systemId: SYSTEM_ID, sanitize,
+  getStats: () => globalStats(),
+  getBotCount: () => Object.keys(bots).length
+})
+
 function botSnapshot() {
 return Object.entries(bots).map(([id, e]) => {
 const b = e.bot
@@ -383,10 +396,10 @@ saveHistory()
 
 // ── Global crash guards ───────────────────────────────────────────────────────
 process.on('uncaughtException', (err) => {
-try { logFor(SYSTEM_ID, `{red-fg}[UNCAUGHT] ${sanitize(err.stack || err.message)}{/red-fg}`) } catch (_) {}
+try { logFor(SYSTEM_ID, `{red-fg}[UNCAUGHT] ${sanitize(err.stack || err.message)}{/red-fg}`); monitoring?.onFatal('uncaught exception', err.stack || err.message) } catch (_) {}
 })
 process.on('unhandledRejection', (reason) => {
-try { logFor(SYSTEM_ID, `{red-fg}[UNHANDLED REJECTION] ${sanitize(reason instanceof Error ? reason.message : String(reason))}{/red-fg}`) } catch (_) {}
+try { const detail = reason instanceof Error ? (reason.stack || reason.message) : String(reason); logFor(SYSTEM_ID, `{red-fg}[UNHANDLED REJECTION] ${sanitize(detail)}{/red-fg}`); monitoring?.onFatal('unhandled rejection', detail) } catch (_) {}
 })
 
 // ── TUI (optional — lazily loaded, only when TUI_GUI is on) ──────────────────
@@ -990,7 +1003,7 @@ webTrace(`login success from ${ip}`)
 } else {
 const cnt = ((f && f.count) || 0) + 1
 fails.set(ip, { count: cnt, until: cnt >= WEB_LOGIN_MAX_FAILS ? Date.now() + 10 * 60_000 : 0 })
-if (cnt >= WEB_LOGIN_MAX_FAILS) logFor(SYSTEM_ID, `{red-fg}✗ Web login locked out for ${ip} (10 min){/red-fg}`)
+if (cnt >= WEB_LOGIN_MAX_FAILS) { logFor(SYSTEM_ID, `{red-fg}✗ Web login locked out for ${ip} (10 min){/red-fg}`); monitoring?.onSecurityLockout(ip) }
 webTrace(`login failed from ${ip} (attempt ${cnt})`)
 res.writeHead(303, { Location: '/login?e=1' }); res.end()
 }
@@ -1370,6 +1383,7 @@ const attempt = bots[id]?.reconnectAttempts || 0
 if (!proxyCrash && attempt >= MAX_RECONNECT) {
 if (bots[id]) bots[id].reconnectTimer = null
 e(`${id} reached max reconnects (${MAX_RECONNECT}). Disconnected permanently. Use /reconnect to try again.`)
+monitoring?.onReconnectExhausted(id, MAX_RECONNECT)
 return
 }
 
@@ -1499,6 +1513,7 @@ i('Connected to server socket. Awaiting chat auth prompts…')
 // Listen to plain text messages to grep for auth requests
 bot.on('messagestr', (message) => {
 const text = message.toLowerCase()
+monitoring?.inspectServerMessage(id, message)
 
 // Grep for register prompts (e.g., "Please register using /register <password> <password>")
 if (text.includes('register') && text.includes('/register')) {
@@ -1533,7 +1548,9 @@ bot.acceptResourcePack(); // For older versions it still works fine
 
 bot.once('spawn', () => {
 connected = true
+const recoveredAfter = bots[id]?.reconnectAttempts || 0
 if (bots[id]) bots[id].spawnTime = Date.now()
+monitoring?.onRecovered(id, recoveredAfter)
 s(`Spawned on ${host}:${port} (v${version}).`)
 notifyBotsChanged()
 
@@ -1653,6 +1670,7 @@ bots[id].lastKickReason = text
 bots[id].lastDisconnectReason = text
 }
 e(`Kicked: ${sanitize(text)}`)
+monitoring?.onKick(id, text)
 notifyBotsChanged()
 })
 
@@ -1711,6 +1729,7 @@ if (!hasRealReason && PROXY_ENABLED && !bots[id]?.spawnTime && (reasonText === '
 classificationReason = 'pre-spawn socketClosed (proxy tunnel likely dropped)'
 }
 
+monitoring?.onDisconnect(id, classificationReason, manualDisconnect)
 scheduleReconnect('Connection lost', classificationReason)
 lastRawError = null
 })
@@ -1776,7 +1795,9 @@ restartProxyService()
 }
 
 stalled.forEach(([id, entry]) => {
-console.warn(`[proxy-watchdog] "${id}" has received nothing for ${Math.round((now - entry.lastActivity) / 1000)}s — forcing reconnect.`)
+const stalledSeconds = Math.round((now - entry.lastActivity) / 1000)
+console.warn(`[proxy-watchdog] "${id}" has received nothing for ${stalledSeconds}s — forcing reconnect.`)
+monitoring?.onProxyStall(id, stalledSeconds)
 entry.forceKilled = true
 entry.lastActivity = now // avoid re-triggering every scan while the kill/reconnect is in flight
 try {
@@ -2585,7 +2606,9 @@ return
 // ── /stats (added) ──────────────────────────
 if (trimmed === '/stats') {
 const s = globalStats()
-logInfo(`Runtime: RSS ${s.rssMB}MB · heap ${s.heapMB}MB · event-loop lag ${s.evlLagMs}ms · logs ${s.logPerSec}/s · web viewers ${s.clients} · bots ${s.online}/${s.bots} online · uptime ${formatUptime(s.uptimeSec * 1000)}`)
+const mem = s.memory
+const hostMem = mem && mem.availablePct != null ? ` · host RAM free ${mem.availablePct.toFixed(1)}% · swap ${mem.swapPct.toFixed(1)}% · pressure ${mem.level}` : ''
+logInfo(`Runtime: RSS ${s.rssMB}MB · heap ${s.heapMB}MB · event-loop lag ${s.evlLagMs}ms · logs ${s.logPerSec}/s · web viewers ${s.clients} · bots ${s.online}/${s.bots} online · uptime ${formatUptime(s.uptimeSec * 1000)}${hostMem}`)
 return
 }
 

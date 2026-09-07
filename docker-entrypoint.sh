@@ -26,7 +26,7 @@ if [ -n "$PROXY_HOST" ] && is_local_proxy; then
   # bot connection doesn't race the proxy bootstrap.
   i=0
   until node -e "const net=require('net'),s=net.connect(process.env.PROXY_PORT,'127.0.0.1',()=>{s.destroy();process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null; do
-    i=$((i+1))
+    i=$((i + 1))
     if [ "$i" -ge 90 ]; then
       echo "[entrypoint] WARNING: Tor not accepting connections after 90s — starting the app anyway; its reconnect logic will retry."
       break
@@ -39,3 +39,4 @@ else
 fi
 
 exec node index.js
+exec monitoring.js
