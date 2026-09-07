@@ -62,4 +62,36 @@ function createSlowBroadcast({ setTimer = setTimeout, clearTimer = clearTimeout 
   }
 }
 
-module.exports = { readDelayMs, shuffledCopy, createSlowBroadcast }
+// ── Dedicated proxy groups (SOCKS5/HTTP per bot subset) ─────────────────────
+// PROXY_GROUP_<N>_BOTS = comma-separated usernames
+// PROXY_GROUP_<N>_HOST / _PORT / _TYPE = proxy target for that group
+// Unassigned bots fall back to the caller-provided default (global PROXY_* or direct).
+function parseProxyGroups(env = process.env) {
+  const groups = []
+  let n = 1
+  while (env[`PROXY_GROUP_${n}_BOTS`] !== undefined) {
+    const botsRaw = env[`PROXY_GROUP_${n}_BOTS`] || ''
+    const bots = botsRaw.split(',').map(s => s.trim()).filter(Boolean)
+    const host = (env[`PROXY_GROUP_${n}_HOST`] || '').trim()
+    const port = parseInt(env[`PROXY_GROUP_${n}_PORT`] || '1080', 10)
+    const type = (env[`PROXY_GROUP_${n}_TYPE`] || 'socks5').toLowerCase()
+    if (bots.length && host) groups.push({ index: n, bots, host, port, type })
+    n++
+  }
+  return groups
+}
+
+// Resolves a bot username to its dedicated proxy config, or `fallback` (default
+// global proxy config / null for direct) when unmatched or when disabled.
+function resolveBotProxy(username, groups, fallback = null) {
+  if (Array.isArray(groups)) {
+    for (const group of groups) {
+      if (group.bots.includes(username)) {
+        return { host: group.host, port: group.port, type: group.type, group: group.index }
+      }
+    }
+  }
+  return fallback
+}
+
+module.exports = { readDelayMs, shuffledCopy, createSlowBroadcast, parseProxyGroups, resolveBotProxy }
