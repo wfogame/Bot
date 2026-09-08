@@ -31,6 +31,16 @@ const GUI_SLOT = parseInt(process.env.GUI_SLOT || '11', 10)
 const WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
 const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
 const SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
+
+// ── Chat activity watchdog ───────────────────────────────────────────────────
+// If no player chat has been seen for CHAT_WATCHDOG_TIMEOUT_MS, the bot runs
+// CHAT_WATCHDOG_COMMAND (default: /server lifesteal) to nudge itself back onto
+// the right server. Chat lines can be prefixed with odd unicode just before the
+// "<name>: message" part — detectPlayerChat strips non-ASCII before matching.
+const CHAT_WATCHDOG_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CHAT_WATCHDOG_ENABLED ?? 'true')
+const CHAT_WATCHDOG_TIMEOUT_MS = parseInt(process.env.CHAT_WATCHDOG_TIMEOUT_MS || '600000', 10)
+const CHAT_WATCHDOG_CHECK_MS = parseInt(process.env.CHAT_WATCHDOG_CHECK_MS || '60000', 10)
+const CHAT_WATCHDOG_COMMAND = (process.env.CHAT_WATCHDOG_COMMAND ?? '').trim()
 const CLICK_COMPASS_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CLICK_COMPASS || '')
 
 // ── Interface config: TUI_GUI + WEB_GUI ──────────────────────────────────────
@@ -1514,6 +1524,18 @@ return realStderr(chunk, encoding, cb)
 }
 
 // ── Bot creation (original, with consolidated packet listener + log throttling) ──
+// Recognize "<name>: message" player chat lines. The server may inject odd
+// unicode just before the username, so strip § codes + non-ASCII first.
+function detectPlayerChat (text) {
+  const clean = String(text || '')
+    .replace(/\u00a7./g, '')
+    .replace(/[^\x20-\x7e]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  const m = clean.match(/^([A-Za-z0-9_]{1,16}):\s*(.+)$/)
+  return m ? { name: m[1], message: m[2] } : null
+}
+
 function createBotInstance(username, host = HOST, port = PORT, version = VERSION) {
 const id = username
 let connected = false
@@ -1567,13 +1589,15 @@ forceKilled: false, // set by the watchdog so scheduleReconnect logs it distinct
 manualDisconnect: false, // mirrors the closure-local flag so the watchdog (outside this closure) can see it too
 pingHist: [], // web GUI sparkline
 manualMode: false, // manual interact mode (bot-manual.js)
-manualViewer: null, // { port } when the 3D viewer is live
+manualViewer: null, // { port, firstPerson } when the 3D viewer is live
+manualViewerFirstPerson: false, // 3D viewer camera: false = orbit, true = first-person (/view)
 manualWindow: null, // window tracked for manual /window-* commands
 guiTui: false, // dashboard ASCII GUI TUI toggle (/gui-tui)
 suppressNextWindowClick: false, // suppress auto slot-click for the next windowOpen
 suppressWindowTimer: null, // clears the above when no window opens within 5s
 manualSession: false, // sticky manual GUI session (set when a /gui window opens)
 guiSessionTimer: null, // 20-min auto-close timer for the manual GUI session
+lastPlayerChatAt: Date.now(), // chat activity watchdog — last time a player message was seen
 }
 const entry = bots[id]
 
@@ -1749,6 +1773,16 @@ else if (text.includes('login') && text.includes('/login')) {
 i('Auth prompt detected: sending /login')
 pushT(() => bot.chat(`/login ${LOGIN_PASSWORD}`), 220 + Math.random() * 400)
 }
+})
+
+// Chat activity watchdog: timestamp real player chat so the idle check below
+// can run /server lifesteal when the chat has been silent too long. Our own
+// bots' echoes (name matches a bot key) do not count as player chat.
+bot.on('messagestr', (text) => {
+  try {
+    const who = detectPlayerChat(text)
+    if (who && !(who.name in bots)) bots[id].lastPlayerChatAt = Date.now()
+  } catch (_) {}
 })
 
 bot.on('resourcePack', (url, hashOrUuid) => {
@@ -2102,6 +2136,11 @@ const COMMANDS = {
 '/window-click <slot> [l|r]': 'Left/right-click a raw window slot',
 '/move <src> <dst>': 'Move an item between raw window slots',
 '/window-close': 'Close the open container window',
+'/pos': 'Show the active bot location (coordinates, facing, dimension)',
+'/view first|third': 'Switch the 3D viewer camera: first-person (what the bot sees) or third-person orbit',
+'/take <slot|name|all>': 'Shift-click a specific item out of the open GUI into the inventory',
+'/take-gui': 'Shift-click every item out of the open GUI into the inventory',
+'/dump-gui': 'Shift-click the whole inventory into the open GUI window',
 'anything else': 'Sent directly as a chat message/command from the active bot',
 '/dump': 'dump gear to chest'
 }
@@ -3183,6 +3222,27 @@ if (!activeId) { logWarn('No active bot.'); break }
 try { bots[activeId].bot.chat(trimmed) } catch (err) { logError(`Chat failed: ${sanitize(err.message)}`); break }
 log(`{green-fg}❯{/green-fg} Sent: ${sanitize(trimmed)}`)
 }
+}
+
+// ── Chat activity watchdog loop ──────────────────────────────────────────────
+if (CHAT_WATCHDOG_ENABLED) {
+  const chatWatchdogTimer = setInterval(() => {
+    const now = Date.now()
+    for (const id of Object.keys(bots)) {
+      const e = bots[id]
+      if (!e?.bot?.entity) continue // not spawned — nothing to keep alive
+      const idle = now - (e.lastPlayerChatAt || now)
+      if (idle >= CHAT_WATCHDOG_TIMEOUT_MS) {
+        e.lastPlayerChatAt = now // reset so it does not re-fire every check tick
+        const cmd = CHAT_WATCHDOG_COMMAND || SERVER_COMMAND || '/server lifesteal'
+        logFor(id, `{yellow-fg}⚠ No player chat for ${Math.round(idle / 60000)} min — running ${cmd}…{/yellow-fg}`)
+        try { e.bot.chat(cmd) } catch (err) {
+          logFor(id, `{red-fg}✗ Chat watchdog: ${sanitize(err.message)}{/red-fg}`)
+        }
+      }
+    }
+  }, CHAT_WATCHDOG_CHECK_MS)
+  if (chatWatchdogTimer.unref) chatWatchdogTimer.unref()
 }
 
 // ── Interface startup ─────────────────────────────────────────────────────────

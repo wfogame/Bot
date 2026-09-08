@@ -87,6 +87,23 @@ check logs before retrying to avoid accidentally executing a command twice.
   messages are unaffected, and the suppression expires after 5 seconds if no
   window opens. Crate/shardshop routines clear it defensively at startup so a
   stale arm can never swallow a routine's window.
+- `/take <slot|name|all>` — take a specific item out of the open GUI into the
+  bot's inventory: by raw slot (`/take 12`), by name match (`/take netherite`
+  matches the display, custom, or registry name), or `all`. Uses shift-clicks.
+- `/take-gui` — shift-click every item out of the open GUI into the inventory.
+- `/dump-gui` — shift-click the whole bot's inventory into the open GUI window
+  (the reverse of `/take-gui`). All three refuse to run while a crate/shardshop
+  routine is active, and abort safely if the window closes mid-way.
+- `/view first|third` — switch the 3D viewer camera. `first` shows the bot's
+  own view (what the bot sees, with the camera following its head); `third`
+  returns to the free orbit camera. The switch restarts the viewer server on
+  the same port — re-open the 🌍 viewer tab if it was already open.
+- `/pos` — show the active bot's location: X/Y/Z, facing yaw/pitch in degrees,
+  and dimension.
+- **GUI TUI names** — when an item has a server/anvil-set custom name (e.g. a
+  netherite chestplate renamed "Fatal Chestplate"), the dashboard GUI TUI and
+  `/window` listing show the custom name as the primary name with the registry
+  name (`netherite_chestplate`) underneath, so renamed items are identifiable.
 - **Auto-close** — if a manual GUI session is still open after
   `MANUAL_GUI_TIMEOUT_MS` (default 20 minutes), the window is closed
   automatically and automatic GUI handling (slot-scan/click, fatal-crate
@@ -118,6 +135,27 @@ several commands back-to-back and would otherwise trip the server cooldown
 (the old code only spaced `/fix` → `/rank`, so `/fix` still got rate-limited
 and showed N/A). Override the command and spacing with `RANK_FIX_COMMAND` and
 `RANK_COOLDOWN_MS`.
+
+## Chat activity watchdog
+
+If no player chat has been seen for a while, the bot runs a server command
+(default `/server lifesteal`) to nudge itself back onto the right server.
+
+- Every `CHAT_WATCHDOG_CHECK_MS` (default 60s) each spawned bot checks how long
+  it has been since the last player chat message; if that exceeds
+  `CHAT_WATCHDOG_TIMEOUT_MS` (default 10 minutes) it sends
+  `CHAT_WATCHDOG_COMMAND` (default: `/server lifesteal`, falling back to
+  `SERVER_COMMAND`) and resets its timer.
+- Player chat is detected as `<name>: message` after stripping § color codes
+  and non-ASCII characters — the server can prefix usernames with odd unicode,
+  so the detector normalizes the line first. Messages from the fleet's own
+  bots (names that match a bot key) do not count.
+- Turn it off with `CHAT_WATCHDOG_ENABLED=0`; tune the cadence with
+  `CHAT_WATCHDOG_TIMEOUT_MS` and `CHAT_WATCHDOG_CHECK_MS`.
+
+Note: short server replies that look like `<word>: value` (e.g. `Shards: 123`)
+can also reset the timer; the watchdog is meant for servers where the chat is
+otherwise completely silent.
 
 ## Tests
 

@@ -41,6 +41,43 @@ module.exports = function createManualControls (deps) {
 
   const windowTitle = win => sanitize((win && win.title && win.title.toString ? win.title.toString() : win && win.title) || win && win.type || 'window')
 
+  // Best human-readable name for an item: a server/anvil-set custom name
+  // (1.20.5+ custom_name component or NBT display.Name — e.g. a netherite
+  // chestplate the server renamed "Fatal Chestplate") wins over the registry
+  // displayName. Custom names can arrive as JSON text components or plain
+  // strings; strip § codes from whatever we extract.
+  function textParts (node, out) {
+    if (node == null) return out
+    if (typeof node === 'string') { out.push(node); return out }
+    if (typeof node === 'object') {
+      if (typeof node.text === 'string') out.push(node.text)
+      if (Array.isArray(node.extra)) node.extra.forEach(n => textParts(n, out))
+    }
+    return out
+  }
+  function itemCustomName (item) {
+    if (!item) return null
+    let raw = null
+    try { raw = item.customName } catch (_) {}
+    if (raw == null) return null
+    let text = null
+    if (typeof raw === 'string') {
+      try {
+        const parts = textParts(JSON.parse(raw), [])
+        if (parts.length) text = parts.join('')
+      } catch (_) { /* plain string name */ }
+      if (!text) text = raw
+    } else if (typeof raw === 'object') {
+      const parts = textParts(raw, [])
+      if (parts.length) text = parts.join('')
+    }
+    if (!text) return null
+    const out = String(text).replace(/\u00a7./g, '').trim()
+    return out || null
+  }
+  const itemDisplayName = item => itemCustomName(item) || (item && (item.displayName || item.name)) || null
+  const itemLabel = item => item ? `${item.count}x ${itemDisplayName(item) || 'item'}` : 'item'
+
   // ── 3D viewer (prismarine-viewer web client) ────────────────────────────────
   let viewerFactory = null
   let viewerProbed = false
@@ -99,15 +136,18 @@ module.exports = function createManualControls (deps) {
       fail(id, `3D viewer: no free port in ${VIEWER_PORT}–${VIEWER_PORT + VIEWER_PORT_ATTEMPTS}`)
       return null
     }
+    const firstPerson = !!entry.manualViewerFirstPerson
     try {
-      factory(bot, { port, firstPerson: false, viewDistance: VIEW_DISTANCE, prefix: '' })
+      factory(bot, { port, firstPerson, viewDistance: VIEW_DISTANCE, prefix: '' })
     } catch (err) {
       fail(id, `3D viewer failed to start: ${sanitize(err.message)}`)
       return null
     }
-    entry.manualViewer = { port }
+    entry.manualViewer = { port, firstPerson }
     // First start: the viewer is only created after startManualMode checked for
-    // it, so bind the click handler now that it exists (retry once if needed).
+    // it — and a /view switch replaces bot.viewer with a fresh emitter — so
+    // bind the click handler to the live viewer now (retry once if needed).
+    entry.manualViewerClicksBound = false
     if (!bindViewerClicks(id)) {
       setTimeout(() => { if (bots[id]?.manualMode) bindViewerClicks(id) }, 250)
     }
@@ -124,6 +164,35 @@ module.exports = function createManualControls (deps) {
     try { if (entry.bot && entry.bot.viewer) delete entry.bot.viewer } catch (_) {}
     entry.manualViewer = null
     i(id, '3D viewer stopped.')
+  }
+
+  // /view first|third — prismarine-viewer picks the camera mode when the viewer
+  // server starts (firstPerson sends yaw+pitch so the web client renders the
+  // bot's actual view; orbit keeps the free camera), so switching modes means a
+  // quick viewer restart on the same port. The click handler is re-bound to the
+  // fresh viewer by startManualViewer.
+  function setViewerMode (id, firstPerson) {
+    const entry = bots[id]
+    if (!entry?.bot?.entity) { warn(chan(id), `${id} is not currently spawned.`); return }
+    if (!entry.manualMode) { warn(id, 'The 3D viewer is part of manual interact mode — run /manual-interact first.'); return }
+    const want = !!firstPerson
+    entry.manualViewerFirstPerson = want
+    const viewer = entry.manualViewer
+    if (!viewer?.port) {
+      startManualViewer(id)
+      okMsg(id, `3D viewer starting in ${want ? 'first-person (the bot view)' : 'third-person orbit'} — open it from the dashboard (🌍 viewer button).`)
+      return
+    }
+    if (viewer.firstPerson === want) {
+      i(id, `3D viewer is already in ${want ? 'first-person' : 'third-person'} mode.`)
+      return
+    }
+    i(id, `Switching 3D viewer to ${want ? 'first-person' : 'third-person'}…`)
+    stopManualViewer(id)
+    setTimeout(() => {
+      startManualViewer(id)
+      if (bots[id]?.manualViewer?.port) okMsg(id, `3D viewer restarted on port ${bots[id].manualViewer.port} — re-open the 🌍 viewer tab if it was already open.`)
+    }, 400)
   }
 
   // ── Mode lifecycle ──────────────────────────────────────────────────────────
@@ -143,7 +212,8 @@ module.exports = function createManualControls (deps) {
       bindViewerClicks(id)
       hint(id, 'Movement: /walk <x> <y> <z> [range] · /walk stop · /look <yaw> <pitch> · /lookat <x> <y> <z> · /hotbar <1-9>')
       hint(id, 'Actions: /dig · /place · /use · /attack — Windows: /window-open · /window · /window-click <slot> [l|r] · /move <src> <dst> · /window-close')
-      hint(id, 'Items: /drop [count] · /pickup [all] — GUIs: /gui /shardshop (or /chat /shardshop) opens without auto scan/click')
+      hint(id, 'Items: /drop [count] · /pickup [all] · /take <slot|name> · /take-gui · /dump-gui — GUIs: /gui /shardshop (or /chat /shardshop) opens without auto scan/click')
+      hint(id, 'View: /view first|third switches the 3D camera to first-person (what the bot sees) or orbit — /pos shows the bot location')
       hint(id, 'Dashboard GUI TUI: /gui-tui — shows the open window as a clickable ASCII panel that shrinks the log view')
     }
     startManualViewer(id)
@@ -355,7 +425,7 @@ module.exports = function createManualControls (deps) {
     let printed = 0
     win.slots.forEach((item, idx) => {
       if (!item) return
-      logFor(id, ` ${label(idx)} (slot ${idx}): ${item.count}x ${sanitize(item.displayName || item.name)}`)
+      logFor(id, ` ${label(idx)} (slot ${idx}): ${sanitize(itemLabel(item))}`)
       printed++
     })
     if (!printed) i(id, '(empty)')
@@ -428,6 +498,36 @@ module.exports = function createManualControls (deps) {
     if (collected) okMsg(id, `Pickup done: ${collected} item${collected === 1 ? '' : 's'} collected.`)
     if (remaining) hint(id, `${remaining} item${remaining === 1 ? '' : 's'} still within ${PICKUP_RANGE} blocks — /walk closer and /pickup again if needed.`)
     if (!collected && !remaining) i(id, 'No dropped items within reach to pick up.')
+  }
+
+  // ── GUI bulk moves (/take, /take-gui, /dump-gui) ───────────────────────────
+  // A shift-click (clickWindow mode 1) moves an item between the open window
+  // and the player inventory: from a container slot into the inventory, or from
+  // an inventory slot into the container. Clicks are spaced out so the server
+  // can keep up with fast bulk operations.
+  function routineBusy (entry) {
+    return !!(entry && (entry.inCrateRoutine || entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning))
+  }
+
+  function shiftMoveSlots (id, entry, slots, label) {
+    const bot = entry.bot
+    const win = bot.currentWindow
+    if (!win) { warn(id, 'No GUI window is open.'); return }
+    const queue = slots.slice()
+    if (!queue.length) { i(id, `${label}: nothing to move.`); return }
+    i(id, `${label}: shift-clicking ${queue.length} slot${queue.length === 1 ? '' : 's'} (150ms apart)…`)
+    let moved = 0
+    const step = () => {
+      if (!bot.entity || !bot.currentWindow) { fail(id, `${label}: window closed mid-way (${moved} moved).`); return }
+      if (!queue.length) { okMsg(id, `${label} done — ${moved} slot${moved === 1 ? '' : 's'} moved.`); notifyBotsChanged(); return }
+      const slot = queue.shift()
+      if (!win.slots[slot]) { step(); return } // already empty (stack merged by an earlier click)
+      bot.clickWindow(slot, 0, 1).then(() => {
+        moved++
+        setTimeout(step, 150)
+      }).catch(err => fail(id, `${label}: slot ${slot} failed — ${sanitize(err.message)} (${moved} moved so far).`))
+    }
+    step()
   }
 
   // ── Command router (returns true when the command was handled here) ─────────
@@ -515,6 +615,35 @@ module.exports = function createManualControls (deps) {
         bot.lookAt(pos.offset(target[0] - pos.x, target[1] - pos.y, target[2] - pos.z), false)
           .then(() => okMsg(activeId, `Looking at ${target[0]}, ${target[1]}, ${target[2]}.`))
           .catch(err => fail(activeId, `LookAt failed: ${sanitize(err.message)}`))
+        return true
+      }
+      case '/view': {
+        const entry = needsBot()
+        if (!entry) return true
+        const mode = rest.toLowerCase()
+        if (!mode) {
+          const current = entry.manualViewerFirstPerson ? 'first-person (what the bot sees)' : 'third-person orbit'
+          i(activeId, `3D viewer is set to ${current}${entry.manualViewer?.port ? ` (port ${entry.manualViewer.port})` : ' — not running yet'}. Usage: /view first|third`)
+          return true
+        }
+        if (mode === 'first' || mode === 'firstperson' || mode === 'fp') {
+          setViewerMode(activeId, true)
+        } else if (mode === 'third' || mode === 'thirdperson' || mode === 'orbit' || mode === 'tp') {
+          setViewerMode(activeId, false)
+        } else {
+          warn(activeId, 'Usage: /view first|third — switches the 3D viewer camera between first-person and third-person orbit')
+        }
+        return true
+      }
+      case '/pos': {
+        const entry = needsBot()
+        if (!entry) return true
+        const bot = entry.bot
+        const pos = bot.entity.position
+        const yawDeg = Math.round(bot.entity.yaw * 180 / Math.PI)
+        const pitchDeg = Math.round(bot.entity.pitch * 180 / Math.PI)
+        const dim = (bot.game && bot.game.dimension) || 'unknown'
+        okMsg(activeId, `Position: X ${pos.x.toFixed(1)} Y ${pos.y.toFixed(1)} Z ${pos.z.toFixed(1)} — facing ${yawDeg}°/${pitchDeg}° — ${dim}`)
         return true
       }
       case '/hotbar': {
@@ -654,6 +783,68 @@ module.exports = function createManualControls (deps) {
         return true
       }
 
+      case '/take': {
+        const entry = needsBot()
+        if (!entry) return true
+        if (routineBusy(entry)) { warn(activeId, 'A crates/shardshop routine is running on this bot — stop it before taking from a GUI.'); return true }
+        const bot = entry.bot
+        const win = bot.currentWindow
+        if (!win) { warn(activeId, 'No GUI window is open — /window-open or /gui first.'); return true }
+        const containerCount = Math.max(0, win.slots.length - 36)
+        if (containerCount === 0) { warn(activeId, 'The open window has no container region to take from.'); return true }
+        if (!rest) { warn(activeId, 'Usage: /take <slot|item name|all> — shift-clicks the item out of the GUI into your inventory. /take-gui takes everything.'); return true }
+        if (rest.toLowerCase() === 'all') {
+          const targets = []
+          for (let i = 0; i < containerCount; i++) if (win.slots[i]) targets.push(i)
+          shiftMoveSlots(activeId, entry, targets, 'Take all')
+          return true
+        }
+        const slotNum = Number(rest)
+        if (Number.isInteger(slotNum) && slotNum >= 0 && slotNum < win.slots.length) {
+          if (slotNum >= containerCount) { warn(activeId, `Slot ${slotNum} is player inventory, not GUI — container slots are 0–${containerCount - 1}.`); return true }
+          if (!win.slots[slotNum]) { warn(activeId, `Slot ${slotNum} is empty.`); return true }
+          shiftMoveSlots(activeId, entry, [slotNum], `Take ${itemLabel(win.slots[slotNum])}`)
+          return true
+        }
+        const q = rest.toLowerCase()
+        let found = -1
+        for (let i = 0; i < containerCount; i++) {
+          const it = win.slots[i]
+          if (!it) continue
+          const names = [itemCustomName(it), it.displayName, it.name].filter(Boolean).map(n => String(n).toLowerCase())
+          if (names.some(n => n.includes(q))) { found = i; break }
+        }
+        if (found === -1) { warn(activeId, `No item matching "${sanitize(rest)}" in the GUI (slots 0–${containerCount - 1}).`); return true }
+        shiftMoveSlots(activeId, entry, [found], `Take ${itemLabel(win.slots[found])} (slot ${found})`)
+        return true
+      }
+      case '/take-gui': {
+        const entry = needsBot()
+        if (!entry) return true
+        if (routineBusy(entry)) { warn(activeId, 'A crates/shardshop routine is running on this bot — stop it before taking from a GUI.'); return true }
+        const win = entry.bot.currentWindow
+        if (!win) { warn(activeId, 'No GUI window is open — /window-open or /gui first.'); return true }
+        const containerCount = Math.max(0, win.slots.length - 36)
+        if (containerCount === 0) { warn(activeId, 'The open window has no container region to take from.'); return true }
+        const targets = []
+        for (let i = 0; i < containerCount; i++) if (win.slots[i]) targets.push(i)
+        shiftMoveSlots(activeId, entry, targets, 'Take GUI')
+        return true
+      }
+      case '/dump-gui': {
+        const entry = needsBot()
+        if (!entry) return true
+        if (routineBusy(entry)) { warn(activeId, 'A crates/shardshop routine is running on this bot — stop it before dumping into a GUI.'); return true }
+        const win = entry.bot.currentWindow
+        if (!win) { warn(activeId, 'No GUI window is open — /window-open or /gui first.'); return true }
+        const containerCount = Math.max(0, win.slots.length - 36)
+        if (containerCount === 0) { warn(activeId, 'The open window has no container region to dump into.'); return true }
+        const targets = []
+        for (let i = containerCount; i < win.slots.length; i++) if (win.slots[i]) targets.push(i)
+        shiftMoveSlots(activeId, entry, targets, 'Dump inventory')
+        return true
+      }
+
       // ── windows / inventory ──
       case '/window-open': {
         const entry = needsBot()
@@ -749,10 +940,14 @@ module.exports = function createManualControls (deps) {
     }
     const slots = []
     win.slots.forEach((item, idx) => {
-      const primary = item ? `${item.count}x ${sanitize(item.displayName || item.name)}` : null
-      // Alternative/internal name (displayName "Diamond Sword" vs name
-      // "diamond_sword") — shown on its own line in the dashboard GUI TUI.
-      const alt = item && item.name && String(item.name).toLowerCase() !== String(item.displayName || item.name).toLowerCase()
+      // Prefer a server/anvil-set custom name (e.g. "Fatal Chestplate" for a
+      // netherite chestplate the server renamed) over the registry displayName.
+      const shown = item ? itemDisplayName(item) : null
+      const primary = shown ? `${item.count}x ${sanitize(shown)}` : null
+      // Alternative/internal registry name (displayName "Diamond Sword" vs name
+      // "diamond_sword", or a custom name vs its base item) — shown on its own
+      // line in the dashboard GUI TUI when it differs from what is displayed.
+      const alt = item && item.name && String(item.name).toLowerCase() !== String(shown || '').toLowerCase()
         ? String(item.name) : null
       slots.push({
         slot: idx,
