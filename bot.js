@@ -96,6 +96,20 @@ return null
 
 // ── /crates-all: shardshop → crates → dump chain across multiple bots ───────
 const SHARDSHOP_COMMAND = process.env.SHARDSHOP_COMMAND || '/shardshop' // ⚠ verify this matches your server's actual shardshop command
+
+// ── /overview rank detection ─────────────────────────────────────────────
+// /fix is rank-gated on this server: an ERROR / "no access" reply means the
+// bot is a Member; otherwise /rank names the real rank (e.g. Regent). The two
+// commands are spaced RANK_COOLDOWN_MS apart so the server cooldown is safe.
+const RANK_FIX_COMMAND = process.env.RANK_FIX_COMMAND || '/fix'
+const RANK_COMMAND = process.env.RANK_COMMAND || '/rank'
+const RANK_COOLDOWN_MS = (() => { const n = parseInt(process.env.RANK_COOLDOWN_MS, 10); return Number.isFinite(n) && n >= 0 ? n : 1500 })()
+const RANK_REPLY_TIMEOUT_MS = 2500
+const RANK_ERROR_PATTERNS = [
+  /\berror\b/i,
+  /you do not have access(?: to the command)?/i,
+  /\bno permission\b/i
+]
 const CRATES_ALL_STAGGER_MS = parseInt(process.env.CRATES_ALL_STAGGER_MS || '30000', 10)
 const CRATES_ALL_SHARDSHOP_WAIT_MS = parseInt(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS || '4000', 10)
 const CRATES_ALL_STEP_WAIT_MS = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS || '3000', 10)
@@ -1511,7 +1525,8 @@ pingHist: [], // web GUI sparkline
 manualMode: false, // manual interact mode (bot-manual.js)
 manualViewer: null, // { port } when the 3D viewer is live
 manualWindow: null, // window tracked for manual /window-* commands
-suppressNextWindowClick: false // suppress auto slot-click for the next windowOpen
+suppressNextWindowClick: false, // suppress auto slot-click for the next windowOpen
+suppressWindowTimer: null, // clears the above when no window opens within 5s
 }
 const entry = bots[id]
 
@@ -1996,7 +2011,7 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 const COMMANDS = {
 '/all <cmd>': 'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
 '/all-slow <cmd>': `Like /all, but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS)`,
-'/overview': 'Dashboard of every bot\'s health, food, ping, shards, coins, and balance',
+'/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, and balance',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
@@ -2004,7 +2019,7 @@ const COMMANDS = {
 '/crates-all [n] [color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
 '/crates-solo [bot] [color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots',
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
-'/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands)',
+'/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands); /-prefixed server commands open their GUI without auto-clicking',
 '/disconnect': 'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
 '/closeBot': 'Disconnect the active bot and completely remove it from the UI',
 '/clear': 'Clear the active bot\'s log view',
@@ -2022,6 +2037,9 @@ const COMMANDS = {
 '/proxy': 'Show the currently configured outbound proxy',
 '/manual-interact': 'Toggle manual interact mode for the active bot (3D view, movement pad, direct world actions); disabled while crate/shardshop routines run',
 '/manual-stop': 'Stop manual interact mode, release held controls, stop pathfinding, close viewer',
+'/drop [count]': 'Drop the held stack (all of it, or [count] items from it)',
+'/pickup [all]': 'Walk to the nearest dropped item and collect it; /pickup all sweeps everything within reach',
+'/gui <cmd>': 'Send a server command (e.g. /gui /shardshop) and treat the GUI it opens as manual — no auto scan/click or warp',
 '/walk <x> <y> <z> [range]': 'Pathfind near coordinates (range defaults to 1, capped at 16); /walk stop cancels',
 '/look <yaw> <pitch>': 'Turn the bot using yaw/pitch in degrees',
 '/lookat <x> <y> <z>': 'Turn the bot toward world coordinates',
@@ -2359,6 +2377,9 @@ clickOnce()
 async function runCrateRoutine(id, blockNameOverride) {
 const entry = bots[id]
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /crates.{/yellow-fg}`); return false }
+// A GUI session armed by /chat or /gui must not swallow this routine's window
+if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
+if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
 const blockName = blockNameOverride || CRATE_SHULKER_BLOCK
 logFor(id, `Change the version in .env to 1.21.1 to use this mechanic otherwise SKIP it.`)
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
@@ -2477,6 +2498,8 @@ function runShardshopLoop(id) {
 return new Promise((resolve) => {
 const entry = bots[id]
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /shardshop-loop.{/yellow-fg}`); resolve(null); return }
+if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
+if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-ffg}`); resolve(null); return }
 if (entry.shardshopLoopRunning) { logFor(id, `{yellow-fg}⚠ /shardshop-loop is already running for ${id}.{/yellow-fg}`); resolve(null); return }
 entry.shardshopLoopRunning = true
@@ -2548,6 +2571,8 @@ let cratesAllRunning = false
 async function runCratesAllSequenceForBot(id, blockNameOverride) {
 const entry = bots[id]
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before running /crates-all on ${id}.{/yellow-fg}`); return }
+if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
+if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned — skipping /crates-all.{/yellow-fg}`); return }
 if (entry.crateRoutineRunning || entry.crateLoopRunning) {
 logFor(id, `{yellow-fg}⚠ ${id} is already busy with a crate routine — skipping /crates-all.{/yellow-fg}`)
@@ -2659,6 +2684,74 @@ try { bot.chat(command) } catch (_) { finish(null) }
 })
 }
 
+// ── /overview rank detection ──────────────────────────────────────────────
+// /fix is rank-gated: if its reply errors or says there's no access, the bot
+// is a Member. Otherwise /rank names the real rank (e.g. Regent). Commands are
+// spaced RANK_COOLDOWN_MS (default 1.5s) apart to stay under the cooldown.
+function listenForRankReply (bot, command, ms, isErrorLine) {
+  return new Promise((resolve) => {
+    const lines = []
+    let done = false
+    const finish = (value) => {
+      if (done) return
+      done = true
+      bot.removeListener('message', onMessage)
+      bot.removeListener('end', onEnd)
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const onMessage = (jsonMsg) => {
+      try {
+        const text = jsonMsg.toString()
+        if (isErrorLine && isErrorLine(text)) { finish({ lines, member: true }); return }
+        lines.push(text)
+      } catch (_) {}
+    }
+    const onEnd = () => finish({ lines, member: false })
+    const timer = setTimeout(() => finish({ lines, member: false }), ms)
+    bot.on('message', onMessage)
+    bot.on('end', onEnd)
+    try { bot.chat(command) } catch (_) { finish({ lines, member: false }) }
+  })
+}
+
+function parseRankReply (lines) {
+  const cleaned = (lines || []).map(l => String(l).replace(/§[0-9a-fk-or]/gi, '').trim())
+  const joined = cleaned.join(' ').replace(/\s+/g, ' ').trim()
+  if (!joined) return 'Unknown'
+  // "Your rank is Regent" / "Rank: Regent" — ranks are capitalized, so filler
+  // like "not" / "currently" can't be captured as the rank name.
+  const labeled = joined.match(/(?:rank|rango)\s*(?:is|:)?\s*:?\s*([A-Za-zÀ-ž]+)/i)
+  if (labeled && /^[A-ZÀ-Ž]/.test(labeled[1])) return labeled[1]
+  // "You are Regent" / "You're Regent"
+  const youAre = joined.match(/(?:you are|you're|ur)\s+([A-Za-zÀ-ž]+)/i)
+  if (youAre && /^[A-ZÀ-Ž]/.test(youAre[1])) return youAre[1]
+  // Bare reply ("Regent") — last short, single-word-looking line wins
+  for (let i = cleaned.length - 1; i >= 0; i--) {
+    const line = cleaned[i]
+    if (line && line.length <= 24 && /^[A-ZÀ-Ž][A-Za-zÀ-ž' -]*$/.test(line)) return line
+  }
+  return 'Unknown'
+}
+
+async function queryRank (id) {
+  const entry = bots[id]
+  if (!entry?.bot?.entity) return null
+  const bot = entry.bot
+  const isErrorLine = (text) => RANK_ERROR_PATTERNS.some(re => re.test(text))
+
+  // 1. /fix — the Member gate; short-circuits the moment an error shows up.
+  const fix = await listenForRankReply(bot, RANK_FIX_COMMAND, RANK_REPLY_TIMEOUT_MS, isErrorLine)
+  if (fix.member) return 'Member'
+  if (!bot.entity) return null
+
+  // 2. Not a Member — wait out the cooldown, then /rank for the real name.
+  await new Promise(resolve => setTimeout(resolve, RANK_COOLDOWN_MS))
+  if (!bot.entity) return null
+  const rank = await listenForRankReply(bot, RANK_COMMAND, RANK_REPLY_TIMEOUT_MS, isErrorLine)
+  return parseRankReply(rank.lines)
+}
+
 // ── Command router (real tail + context routing prologue for the web GUI) ────
 function handleCommand(raw, ctx) {
 const trimmed = String(raw ?? '').trim()
@@ -2735,17 +2828,21 @@ return
 if (trimmed === '/overview') {
 const names = Object.keys(bots)
 logInfo('{bold}── Bot Overview Dashboard ──{/bold}')
-logInfo('Querying shard, coin, and money balances…')
+logInfo('Querying shards, coins, balance, and rank…')
 
 Promise.all(names.map(name => {
-if (!bots[name]?.bot?.entity) return Promise.resolve({ name, shards: null, coins: null, money: null })
+if (!bots[name]?.bot?.entity) return Promise.resolve({ name, shards: null, coins: null, money: null, rank: null })
 return Promise.all([
 queryBalance(name, 'Shards', '/shards'),
 queryBalance(name, 'Coins', '/coins'),
 queryBalance(name, 'Balance', '/bal')
-]).then(([shards, coins, money]) => ({ name, shards, coins, money }))
+]).then(([shards, coins, money]) =>
+// Rank detection runs after the balances settle so its /fix + /rank land
+// RANK_COOLDOWN_MS (1.5s) apart — safe from the server's command cooldown.
+queryRank(name).then(rank => ({ name, shards, coins, money, rank }))
+)
 })).then(results => {
-results.forEach(({ name, shards, coins, money }, idx) => {
+results.forEach(({ name, shards, coins, money, rank }, idx) => {
 const b = bots[name]
 if (b?.bot?.entity) {
 const hp = Math.round(b.bot.health || 0)
@@ -2754,7 +2851,8 @@ const ping = b.bot.player?.ping ?? '?'
 const sh = shards !== null ? shards.toLocaleString() : 'N/A'
 const co = coins !== null ? coins.toLocaleString() : 'N/A'
 const mo = money !== null ? `$${money.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : 'N/A'
-log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Shards: ${sh} | Coins: ${co} | Balance: ${mo}`)
+const rk = rank || 'N/A'
+log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Rank: ${rk} | Shards: ${sh} | Coins: ${co} | Balance: ${mo}`)
 } else {
 log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{/gray-fg}`)
 }
@@ -2860,6 +2958,12 @@ if (trimmed.startsWith('/chat ')) {
 const msg = trimmed.slice(6).trim()
 if (!activeId) { logWarn('No active bot.'); return }
 if (!msg) { logWarn('Usage: /chat <message>'); return }
+// /-prefixed server commands (e.g. /chat /shardshop) often open a GUI — arm
+// the manual-window suppression so the automatic slot-scan/click and the
+// delayed AFK warp don't fire on the window they open.
+if (msg.startsWith('/') && bots[activeId] && typeof manual.armWindowSuppression === 'function') {
+manual.armWindowSuppression(bots[activeId])
+}
 try { bots[activeId].bot.chat(msg) } catch (err) { logError(`Chat failed: ${sanitize(err.message)}`); return }
 log(`{green-fg}❯{/green-fg} Chat: ${sanitize(msg)}`)
 return

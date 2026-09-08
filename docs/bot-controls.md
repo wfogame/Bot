@@ -67,6 +67,23 @@ check logs before retrying to avoid accidentally executing a command twice.
 - WebSocket log batches are not allocated or scheduled without connected viewers.
 - Stale HTTP poll responses do not overwrite the newly selected channel's logs.
 
+## Manual interact: items and server-command GUIs
+
+- `/drop [count]` — drop the whole held stack, or `count` items from it.
+- `/pickup [all]` — pathfind to the nearest dropped item entity and wait until
+  it is collected (`all` sweeps everything within `MANUAL_PICKUP_RANGE`, default
+  16 blocks, capped at `MANUAL_PICKUP_MAX_ITEMS`). Item collection is passive in
+  Minecraft, so the bot walks onto the item and waits for it to vanish.
+- `/gui <server command>` — send a server command (e.g. `/gui /shardshop`) and
+  treat the window it opens as a manual window: the automatic slot-scan/click
+  and the delayed AFK warp are suppressed, and `/window` / `/window-click` /
+  `/move` / `/window-close` take over.
+- `/chat /<command>` — the same suppression is armed for `/`-prefixed server
+  commands sent through `/chat` (e.g. `/chat /shardshop`). Plain `/chat`
+  messages are unaffected, and the suppression expires after 5 seconds if no
+  window opens. Crate/shardshop routines clear it defensively at startup so a
+  stale arm can never swallow a routine's window.
+
 ## Tests
 
 ```sh
