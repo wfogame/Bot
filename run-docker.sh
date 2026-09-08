@@ -100,6 +100,9 @@ if [ ${#files[@]} -eq 0 ]; then
 # AFK Console instance 1 — plain KEY=VALUE lines, NO quotes, no spaces around =
 BOT_NAMES=
 LOGIN_PASSWORD=123456
+# Optional cron jobs: CRON_JOB_<N>=<schedule>|<command> (5-field cron or "@every <secs>")
+# CRON_JOB_1=0 4 * * *|/crates-all
+# CRON_JOB_2=@every 60|/status
 # Tor is the default outbound proxy inside Docker (127.0.0.1:9050).
 # Set PROXY_HOST= (empty) to connect directly instead.
 # WEB_PASSWORD=change-me    # unset = random password printed in `docker logs`

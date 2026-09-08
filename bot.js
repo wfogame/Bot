@@ -404,6 +404,44 @@ return typeof pv.mineflayer === 'function' ? pv.mineflayer : (typeof pv === 'fun
 }
 const manual = createManualControls({ bots, logFor, sanitize, notifyBotsChanged, SYSTEM_ID, WEB_BIND, loadViewerFactory })
 
+// ── Scheduled jobs (cron) ────────────────────────────────────────────────────
+// /cron manages jobs at runtime; CRON_JOB_<N>="<schedule>|<command>" in .env
+// loads them at startup. Schedules are 5-field cron ("0 4 * * *") or
+// "@every <seconds>" (min 5). Jobs dispatch with /all semantics: known local
+// commands run per bot, everything else is broadcast as chat to spawned bots.
+const { CronManager } = require('./cron')
+// Per-bot dispatch with /all semantics: manual commands route through their own
+// router, known local commands run through handleCommand (arguments preserved),
+// everything else is sent as chat to that bot. Returns true when dispatched.
+function dispatchCommandToBot (msg, id) {
+  const command = String(msg || '').trim()
+  if (!command) return false
+  if (!bots[id]) return false
+  if (manual.routeCommand(command, id)) return true
+  if (LOCAL_COMMANDS.includes(command.split(/\s+/)[0])) {
+    // Reuse the single-bot router so arguments (e.g. /crates purple) survive.
+    handleCommand(command, { selectedId: id })
+    return true
+  }
+  if (!bots[id].bot?.entity) return false
+  bots[id].bot.chat(command)
+  return true
+}
+// Batch variant used by cron jobs: dispatch to every bot, return how many took it.
+function dispatchCommandToAllBots (msg) {
+  let sent = 0
+  for (const id of Object.keys(bots)) {
+    try { if (dispatchCommandToBot(msg, id)) sent++ } catch (_) {}
+  }
+  return sent
+}
+const cronManager = new CronManager({
+  dispatch: (command) => dispatchCommandToAllBots(command),
+  log: (msg) => logFor(SYSTEM_ID, msg)
+})
+const CRON_ENV_LOADED = cronManager.loadFromEnv(process.env)
+cronManager.start()
+
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
 
@@ -2181,6 +2219,9 @@ const COMMANDS = {
 '/help': 'List all available commands',
 '/status': 'Show active bot\'s connection, position, health, ping, uptime',
 '/inv': 'List active bot\'s inventory',
+'/find <name>': 'Search EVERY bot\'s inventory and open window for an item by display, custom, or registry name',
+'/cron': 'List scheduled jobs; /cron add <schedule> <cmd> | rm <id> | on|off <id> | run <id> — schedules are 5-field cron or "@every <secs>"; env CRON_JOB_<N>="<schedule>|<command>"',
+
 '/players': 'List players online from the active bot\'s perspective',
 '/exit': 'Disconnect all bots and close the program',
 '/reconnect': 'Reconnect the active bot',
@@ -2948,30 +2989,145 @@ const logError = (msg) => logFor(activeId || SYSTEM_ID, `{red-fg}✗ ${msg}{/red
 // Echo the run command so the log is self-documenting (the web console needs it)
 log(`{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
 
+// ── /find ───────────────────────────────────
+const findMatch = trimmed.match(/^\/find(?:\s+([\s\S]*))?$/)
+if (findMatch) {
+  const term = (findMatch[1] || '').trim()
+  if (!term) { logWarn('Usage: /find <name> — search every bot\'s inventory and open window by display, custom, or registry name'); return }
+  const needle = term.toLowerCase()
+  let foundTotal = 0
+  let scanned = 0
+  const botNames = Object.keys(bots)
+  for (const name of botNames) {
+    const entry = bots[name]
+    if (!entry?.bot?.entity) { log(`{gray-fg}[${name}] offline — skipped{/gray-fg}`); continue }
+    scanned++
+    const bot = entry.bot
+    const hits = []
+    const seen = new Set()
+    const consider = (item, where) => {
+      if (!item) return
+      const display = itemDisplayName(item)
+      const alt = itemAltName(item, display)
+      const custom = itemCustomName(item)
+      const candidates = [display, alt, custom, item.name].filter(Boolean)
+      if (!candidates.some(n => n.toLowerCase().includes(needle))) return
+      const sig = `${item.type || item.name}:${item.slot}`
+      if (seen.has(sig)) return
+      seen.add(sig)
+      hits.push({ count: item.count || 1, slot: item.slot, display, alt, where })
+    }
+    try {
+      if (bot.inventory && typeof bot.inventory.items === 'function') {
+        bot.inventory.items().forEach(it => consider(it, 'inv'))
+      }
+      if (bot.currentWindow && bot.currentWindow.slots) {
+        for (const it of Object.values(bot.currentWindow.slots)) consider(it, 'window')
+      }
+    } catch (err) {
+      logWarn(`${name}: inventory scan failed: ${sanitize(err.message)}`)
+    }
+    if (hits.length === 0) continue
+    foundTotal += hits.reduce((sum, h) => sum + h.count, 0)
+    log(`{cyan-fg}[${name}]{/cyan-fg} — ${hits.length} matching stack(s)`)
+    hits.forEach(h => {
+      const shown = h.display || h.alt || 'item'
+      const altLine = h.alt && h.alt !== shown ? ` (${sanitize(h.alt)})` : ''
+      log(`  ${h.count}x ${sanitize(shown)}${altLine} — ${h.where} slot ${h.slot}`)
+    })
+  }
+  if (foundTotal === 0) logInfo(`No bot has an item matching "${sanitize(term)}" (${scanned} scanned, ${botNames.length - scanned} offline).`)
+  else logSuccess(`Found ${foundTotal} matching item(s) across ${botNames.length} bot(s).`)
+  return
+}
+
+// ── /cron ───────────────────────────────────
+if (trimmed === '/cron' || trimmed.startsWith('/cron ')) {
+  const parts = trimmed.slice('/cron'.length).trim().split(/\s+/)
+  const sub = (parts[0] || '').toLowerCase()
+  if (!sub) {
+    const jobs = cronManager.list()
+    if (jobs.length === 0) { logInfo('No cron jobs configured. Add them in .env as CRON_JOB_1="<schedule>|<command>" or use /cron add.'); return }
+    logInfo('{bold}── Cron jobs ──{/bold}')
+    jobs.forEach(job => {
+      const state = job.enabled ? (job.running ? '{yellow-fg}● running{/yellow-fg}' : '{green-fg}● on{/green-fg}') : '{red-fg}○ off{/red-fg}'
+      const next = job.nextRun ? job.nextRun.toLocaleString() : '—'
+      const last = job.lastRun ? job.lastRun.toLocaleString() : 'never'
+      log(` [{bold}${job.id}{/bold}] ${state} — ${job.schedule} — ${job.command} (runs: ${job.runs}, last: ${last}, next: ${next})`)
+    })
+    logInfo('Usage: /cron add <schedule> <command> · /cron rm <id> · /cron on|off <id> · /cron run <id>')
+    return
+  }
+  if (sub === 'add') {
+    const rest = trimmed.slice(trimmed.indexOf('add') + 3).trim()
+    let schedule
+    let command
+    const restTrim = rest
+    if (restTrim.startsWith('"')) {
+      const close = restTrim.indexOf('"', 1)
+      if (close > 0) {
+        schedule = restTrim.slice(1, close).trim()
+        command = restTrim.slice(close + 1).trim()
+      }
+    }
+    if (!schedule) {
+      const tokens = restTrim.split(/\s+/)
+      if (tokens[0] && /^@every$/i.test(tokens[0])) {
+        schedule = tokens.slice(0, 2).join(' ')
+        command = tokens.slice(2).join(' ')
+      } else {
+        schedule = tokens.slice(0, 5).join(' ')
+        command = tokens.slice(5).join(' ')
+      }
+    }
+    if (!schedule || !command) { logWarn('Usage: /cron add <schedule> <command> — schedule = 5-field cron ("0 4 * * *") or "@every <seconds>"; command = anything /all would run'); return }
+    try {
+      const job = cronManager.add(schedule, command)
+      logSuccess(`Cron job ${job.id} added: "${job.schedule}" → ${job.command} (next run ${job.nextRun ? job.nextRun.toLocaleString() : '—'})`)
+    } catch (err) {
+      logError(`Could not add cron job: ${err.message}`)
+    }
+    return
+  }
+  if (sub === 'rm' || sub === 'remove') {
+    const id = parts[1]
+    if (!id) { logWarn('Usage: /cron rm <id>'); return }
+    if (cronManager.remove(id)) logSuccess(`Removed cron job ${id}.`)
+    else logWarn(`No cron job with id ${id}.`)
+    return
+  }
+  if (sub === 'on' || sub === 'off') {
+    const id = parts[1]
+    if (!id) { logWarn(`Usage: /cron ${sub} <id>`); return }
+    if (cronManager.setEnabled(id, sub === 'on')) logSuccess(`Cron job ${id} ${sub === 'on' ? 'enabled' : 'disabled'}.`)
+    else logWarn(`No cron job with id ${id}.`)
+    return
+  }
+  if (sub === 'run') {
+    const id = parts[1]
+    if (!id) { logWarn('Usage: /cron run <id>'); return }
+    const result = cronManager.runNow(id)
+    if (result.ok) {
+      const job = cronManager.list().find(j => j.id === id)
+      logSuccess(`Triggered cron job ${id}${job ? ': ' + job.command : ''}.`)
+    } else {
+      logWarn(`Could not run cron job ${id}: ${result.error}`)
+    }
+    return
+  }
+  logWarn(`Unknown /cron subcommand "${sub}". Try: add, rm, on, off, run — or /cron alone to list.`)
+  return
+}
+
 // ── /all and /all-slow ───────────────────────
 const broadcastMatch = trimmed.match(/^\/(all|all-slow)(?:\s+([\s\S]*))?$/)
 if (broadcastMatch) {
 const command = '/' + broadcastMatch[1]
 const msg = (broadcastMatch[2] || '').trim()
 if (!msg) { logWarn(`Usage: ${command} <command or message>`); return }
-const baseCmd = msg.split(/\s+/)[0]
-const isLocal = LOCAL_COMMANDS.includes(baseCmd)
+const isLocal = LOCAL_COMMANDS.includes(msg.split(/\s+/)[0])
 const ids = Object.keys(bots)
-const dispatch = id => {
-if (!bots[id]) return false
-
-// Manual commands route per bot through their own router (e.g. /all /manual-stop).
-if (manual.routeCommand(msg, id)) return true
-
-if (isLocal) {
-// Reuse the single-bot router so arguments (e.g. /crates purple) survive.
-handleCommand(msg, { selectedId: id })
-return true
-}
-if (!bots[id].bot?.entity) return false
-bots[id].bot.chat(msg)
-return true
-}
+const dispatch = id => dispatchCommandToBot(msg, id)
 const onError = (err, id) => logWarn(`${id}: ${sanitize(err.message)}`)
 if (command === '/all-slow') {
 if (slowBroadcast.running) { logWarn('An /all-slow broadcast is already running. Wait for it to finish.'); return }

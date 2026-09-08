@@ -83,7 +83,9 @@ exits instead of starting with no managed bots.
 The Docker helper uses numbered environment files. Create `.env.docker1`,
 `.env.docker2`, and so on; each file starts one container. Copy only valid
 `KEY=VALUE` lines into these files; the repository `.env` may contain notes or
-section headings that Docker rejects:
+section headings that Docker rejects. All app settings work here, including
+cron jobs (`CRON_JOB_1=0 4 * * *|/crates-all` — the `|` separator and spaces
+are fine in a Docker env file):
 
 ```bash
 # Create .env.docker1 manually, or copy it and remove all non-KEY=VALUE lines.
@@ -253,6 +255,28 @@ Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOS
 | `WINDOW_DEBUG` | `false` | Include complete inventory slot dumps |
 | `CONFIG_PACKET_LOG_LIMIT` | `120` | Configuration packet log limit; `0` means unlimited |
 
+### Cron jobs
+
+Scheduled jobs run any command with `/all` semantics: known local commands run
+per bot, manual commands route through their own router, and everything else
+broadcasts as chat to every spawned bot. Define them in `.env` as
+`CRON_JOB_<N>=<schedule>|<command>`:
+
+```dotenv
+CRON_JOB_1=0 4 * * *|/crates-all
+CRON_JOB_2=@every 60|/status
+```
+
+The schedule is either a standard 5-field cron expression
+(`minute hour day-of-month month day-of-week`; day-of-week 0-6, 7 accepted as
+Sunday) or `@every <seconds>` (minimum 5). Fields support `*`, `*/n`, `a-b`,
+`a-b/n`, and comma-separated lists.
+
+Jobs are also managed from the terminal with `/cron` (list), `/cron add
+<schedule> <command>`, `/cron rm <id>`, `/cron on|off <id>`, and `/cron run
+<id>` (run fires immediately, even for a disabled job). Terminal-added jobs
+last until the process exits; `.env` jobs reload on restart.
+
 ## Commands
 
 Commands typed in the browser or TUI apply to the selected bot unless noted.
@@ -266,6 +290,8 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/stats` | Show process memory, event-loop lag, log rate, viewers, and uptime |
 | `/overview` | Query shards, coins, and balance for every bot |
 | `/inv` | List the active bot's inventory |
+| `/find <name>` | Search every bot's inventory and open window for an item by display, custom, or registry name |
+| `/cron` | List scheduled jobs; `/cron add <schedule> <cmd>`, `/cron rm <id>`, `/cron on|off <id>`, `/cron run <id>` |
 | `/players` | List players visible to the active bot |
 | `/uptime` | Show uptime for every bot |
 | `/proxy` | Show proxy and stall-watchdog configuration |
@@ -373,6 +399,7 @@ RTP log for webhook errors. Node.js 18+ is required for the built-in `fetch`.
 | --- | --- |
 | `bot.js` | Main multi-bot manager and web/TUI dashboard |
 | `bot-rtp.js` | RTP, scanning, survival helpers, and Discord alerts |
+| `cron.js` | Dependency-free cron scheduler (`/cron`, `CRON_JOB_<N>` env jobs) |
 | `package.json` | Dependencies and startup/postinstall scripts |
 | `Dockerfile` | Container image definition |
 | `docker-entrypoint.sh` | Container startup entrypoint |

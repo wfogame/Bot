@@ -43,6 +43,7 @@ function runtime(env = {}) {
       if (name === 'mineflayer-armor-manager') return () => {}
       if (name === 'mineflayer-pathfinder') return { goals: {} }
       if (name === 'socks') return {}
+      if (name === './cron') return require('../cron')
       return require(name)
     }
   })
@@ -190,4 +191,111 @@ test('item name helpers prefer anvil custom names and expose the alternative nam
     'Blade', 'diamond_sword',
     'Legacy', 'netherite_sword'
   ])
+})
+
+test('/find matches custom, display, and registry names across all bots', () => {
+  const r = runtime()
+  r.run(`
+    bots.A.bot.inventory = { items: () => [
+      { type: 1, slot: 12, count: 3, name: 'netherite_sword', displayName: 'Netherite Sword', customName: { type: 'string', value: 'Sword' } },
+      { type: 2, slot: 8, count: 1, name: 'diamond', displayName: 'Diamond', customName: null }
+    ] }
+    bots.B.bot.inventory = { items: () => [
+      { type: 3, slot: 0, count: 5, name: 'red_shulker_box', displayName: 'Red Shulker Box', customName: null }
+    ] }
+    bots.C.bot.inventory = { items: () => [] }
+  `)
+  r.run(`handleCommand('/find sword')`)
+  let logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /\[A\]/)
+  assert.match(logText, /3x Sword \(netherite_sword\) — inv slot 12/)
+  assert.equal(r.run('chats.length'), 0)
+  r.run(`handleCommand('/find shulker')`)
+  logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /5x Red Shulker Box \(red_shulker_box\) — inv slot 0/)
+  // No match anywhere
+  r.run(`handleCommand('/find nonexistent-item-xyz')`)
+  logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /No bot has an item matching/)
+  // Usage
+  r.run(`handleCommand('/find')`)
+  logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /Usage: \/find/)
+})
+
+test('/find also scans the open window and skips offline bots', () => {
+  const r = runtime()
+  r.run(`
+    bots.A.bot.inventory = { items: () => [] }
+    bots.A.bot.currentWindow = { slots: { 5: { type: 4, slot: 5, count: 2, name: 'diamond_sword', displayName: 'Diamond Sword', customName: null } } }
+    bots.B.bot.entity = null
+  `)
+  r.run(`handleCommand('/find diamond')`)
+  const logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /2x Diamond Sword \(diamond_sword\) — window slot 5/)
+  assert.match(logText, /\[B\] offline — skipped/)
+})
+
+test('/cron add lists runs and manages jobs', () => {
+  const r = runtime()
+  r.run(`handleCommand('/cron add "*/5 * * * *" /status')`)
+  assert.equal(r.run('cronManager.list().length'), 1)
+  assert.equal(r.run('cronManager.list()[0].schedule'), '*/5 * * * *')
+  assert.equal(r.run('cronManager.list()[0].command'), '/status')
+  // Bare /cron lists it
+  r.run(`handleCommand('/cron')`)
+  let logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /Cron jobs/)
+  assert.match(logText, /\[[^\]]*1[^\]]*\]/)
+  // /cron run fires it through the /all-style dispatcher (local command → per-bot, no chat)
+  r.run(`handleCommand('/cron run 1')`)
+  assert.equal(r.run('chats.length'), 0)
+  logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /Status for A/)
+  assert.equal(r.run('cronManager.list()[0].runs'), 1)
+  // Disable, list state, remove
+  r.run(`handleCommand('/cron off 1')`)
+  assert.equal(r.run('cronManager.list()[0].enabled'), false)
+  r.run(`handleCommand('/cron on 1')`)
+  assert.equal(r.run('cronManager.list()[0].enabled'), true)
+  r.run(`handleCommand('/cron rm 1')`)
+  assert.equal(r.run('cronManager.list().length'), 0)
+  r.run(`handleCommand('/cron rm 1')`)
+  logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /No cron job with id 1/)
+})
+
+test('/cron supports @every and raw-chat broadcast commands', () => {
+  const r = runtime()
+  r.run(`handleCommand('/cron add @every 60 hello everyone')`)
+  assert.equal(r.run('cronManager.list()[0].schedule'), '@every 60')
+  assert.equal(r.run('cronManager.list()[0].command'), 'hello everyone')
+  r.run(`handleCommand('/cron run 1')`)
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello everyone'], ['B', 'hello everyone'], ['C', 'hello everyone']])
+  // Bad schedule / bad subcommand produce warnings, not crashes
+  r.run(`handleCommand('/cron add bogus /status')`)
+  r.run(`handleCommand('/cron wat')`)
+})
+
+test('CRON_JOB_<N> env entries load at startup', () => {
+  const r = runtime({ CRON_JOB_1: '@every 60|/status', CRON_JOB_2: '0 */2 * * *|/crates-all' })
+  assert.equal(r.run('cronManager.list().length'), 2)
+  assert.equal(r.run('cronManager.list()[0].command'), '/status')
+  assert.equal(r.run('cronManager.list()[1].schedule'), '0 */2 * * *')
+})
+
+test('/all reuses the shared dispatcher (local args preserved, chat broadcast)', () => {
+  const r = runtime()
+  r.run(`
+    for (const id of ['A', 'B', 'C']) {
+      bots[id].bot.entity = { position: { x: 0, y: 0, z: 0 } }
+      bots[id].host = 'test-host'; bots[id].port = 1; bots[id].version = '1'; bots[id].spawnTime = Date.now()
+    }
+  `)
+  r.run(`handleCommand('/all /status')`)
+  let logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
+  assert.match(logText, /Ran locally on 3 bots/)
+  assert.equal(r.run('chats.length'), 0)
+  r.run(`handleCommand('/all hello')`)
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['B', 'hello'], ['C', 'hello']])
 })
