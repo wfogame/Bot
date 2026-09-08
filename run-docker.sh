@@ -19,6 +19,10 @@
 #   PERSIST_TOR=1          keep Tor identity across container recreation (named volume)
 #   DOCKER_RUN_FLAGS="..." extra flags for docker run (e.g. --memory 2g)
 #   DOCKER_BUILD_FLAGS="..." extra flags for docker build (e.g. --no-cache)
+#   MANUAL_VIEWER_HOST_PORT=3000  first candidate host port for the manual 3D
+#      viewer. Each instance gets the next free block of 10 (container ports
+#      MANUAL_VIEWER_PORT..+9), so the dashboard's viewer button works from the
+#      host even with several containers running.
 set -euo pipefail
 
 IMAGE="${IMAGE:-afk-console}"
@@ -26,6 +30,8 @@ PREFIX="${CONTAINER_PREFIX:-afk-console}"
 APP_FILE="${APP_FILE:-bot.js}"
 PORT_BASE="${WEB_PORT_HOST:-80}"
 PORT_SPAN="${WEB_PORT_HOST_MAX:-40}"
+VIEWER_HOST_BASE="${MANUAL_VIEWER_HOST_PORT:-3000}"
+vnext="$VIEWER_HOST_BASE"
 DOCKER_RUN_FLAGS="${DOCKER_RUN_FLAGS:-}"
 DOCKER_BUILD_FLAGS="${DOCKER_BUILD_FLAGS:-}"
 PERSIST_TOR="${PERSIST_TOR:-0}"
@@ -36,6 +42,15 @@ err() { printf '\033[31m✗ %s\033[0m\n' "$*" >&2; }
 
 # Anything listening on this host port? (bash /dev/tcp probe)
 port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# Are all 10 ports of a viewer block free? (one 10-port block per instance)
+block_free() {
+  local k
+  for k in $(seq 0 9); do
+    port_free "$(($1 + k))" || return 1
+  done
+  return 0
+}
 
 cmd="${1:-up}"
 case "$cmd" in
@@ -109,6 +124,24 @@ for f in $ordered; do
   cport=$(grep -E '^ *WEB_PORT *=' "$f" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -dc '0-9' || true)
   cport="${cport:-80}"
 
+  # container viewer start = MANUAL_VIEWER_PORT from the env file (default 3000)
+  vport=$(grep -E '^ *MANUAL_VIEWER_PORT *=' "$f" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -dc '0-9' || true)
+  vport="${vport:-3000}"
+
+  # Manual 3D viewer: map this instance's container viewer range (vport..+9)
+  # onto the next free 10-port host block starting no earlier than vnext, and
+  # inject MANUAL_VIEWER_HOST_PORT so the dashboard can build the host URL.
+  viewer_pflags=""
+  vcand="$vnext"
+  while [ "$vcand" -lt "$((VIEWER_HOST_BASE + PORT_SPAN * 10))" ]; do
+    if block_free "$vcand"; then
+      viewer_pflags="-p ${vcand}-$((vcand + 9)):${vport}-$((vport + 9)) -e MANUAL_VIEWER_HOST_PORT=${vcand}"
+      vnext=$((vcand + 10))
+      break
+    fi
+    vcand=$((vcand + 10))
+  done
+
   bn=$(grep -E '^ *BOT_NAMES *=' "$f" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d ' ,' || true)
   [ -n "$bn" ] || say "  ⚠ ${f}: BOT_NAMES is empty — ${PREFIX}-${n} will exit until you fill it in"
 
@@ -140,6 +173,7 @@ for f in $ordered; do
       --init --restart unless-stopped \
       --env-file "$f" \
       -p "${next}:${cport}" \
+      $viewer_pflags \
       $vol_flags $extra_host_flags $DOCKER_RUN_FLAGS \
       "${IMAGE}:latest" 2>&1) && { hport="$next"; break; }
     # start failed — only retry if the port was snatched in the race window
@@ -151,7 +185,12 @@ for f in $ordered; do
   done
   [ -n "$hport" ] || { err "could not allocate a host port for ${f}"; exit 1; }
 
-  say "  ✓ ${PREFIX}-${n}  ←  ${f}  →  http://localhost:${hport}  (container port ${cport})"
+  if [ -n "$viewer_pflags" ]; then
+    say "  ✓ ${PREFIX}-${n}  ←  ${f}  →  http://localhost:${hport}  (container port ${cport}) · 3D viewer http://localhost:${vcand} (container ${vport})"
+  else
+    say "  ✓ ${PREFIX}-${n}  ←  ${f}  →  http://localhost:${hport}  (container port ${cport})"
+    say "  ⚠ ${f}: no free 10-port block for the manual 3D viewer from host port ${VIEWER_HOST_BASE} — set MANUAL_VIEWER_HOST_PORT to start elsewhere, or use the viewer without host mapping"
+  fi
   next=$((hport + 1))
 done
 say "──────────────────────────────────────────────────────────────────"

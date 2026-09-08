@@ -959,7 +959,7 @@ d.querySelector('.bname').textContent=b.id
 if(b.kick)d.title=b.kick
 d.onclick=(function(id){return function(){setView(id)}})(b.id)
 var viewerButton=d.querySelector('.manual-viewer')
-if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerPort)
+if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerHostPort||b.manual.viewerPort)
 box.appendChild(d)
 drawSpark(d.querySelector('canvas'),b.pingHist||[])}
 updateManualBar()}
