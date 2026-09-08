@@ -4,7 +4,7 @@
 //   • a browser 3D view (prismarine-viewer) streams the bot's world and turns
 //     clicks in the view into dig / place / open-container actions,
 //   • the dashboard gets a hold-to-move pad + hotbar over a tiny 'key' channel,
-//   • commands (/walk, /dig, /place, /window-*, /move, /key…) give the same
+//   • commands (/walk, /drop, /pickup, /dig, /place, /window-*, /gui…) give the same
 //     manual control from the TUI.
 // While manual mode is ON for a bot, bot.js suppresses its automatic
 // windowOpen click-slot + AFK-warp handler for that bot.
@@ -19,6 +19,9 @@ const VIEWER_PORT = envInt(process.env.MANUAL_VIEWER_PORT, 3000)
 const VIEWER_PORT_ATTEMPTS = envInt(process.env.MANUAL_VIEWER_PORT_MAX_ATTEMPTS, 10)
 const REACH = envFloat(process.env.MANUAL_REACH, 4.5) // blocks for /dig, /place, /window-open
 const VIEW_DISTANCE = envInt(process.env.MANUAL_VIEW_DISTANCE, 6) // viewer chunk radius
+const PICKUP_RANGE = envFloat(process.env.MANUAL_PICKUP_RANGE, 16) // blocks scanned by /pickup
+const PICKUP_TIMEOUT_MS = envInt(process.env.MANUAL_PICKUP_TIMEOUT_MS, 10000) // max wait for item collection
+const PICKUP_MAX_ITEMS = envInt(process.env.MANUAL_PICKUP_MAX_ITEMS, 32) // /pickup all safety cap
 
 function envInt (value, fallback) { const n = parseInt(value, 10); return Number.isFinite(n) ? n : fallback }
 function envFloat (value, fallback) { const n = parseFloat(value, 10); return Number.isFinite(n) ? n : fallback }
@@ -139,6 +142,7 @@ module.exports = function createManualControls (deps) {
       bindViewerClicks(id)
       hint(id, 'Movement: /walk <x> <y> <z> [range] · /walk stop · /look <yaw> <pitch> · /lookat <x> <y> <z> · /hotbar <1-9>')
       hint(id, 'Actions: /dig · /place · /use · /attack — Windows: /window-open · /window · /window-click <slot> [l|r] · /move <src> <dst> · /window-close')
+      hint(id, 'Items: /drop [count] · /pickup [all] — GUIs: /gui /shardshop (or /chat /shardshop) opens without auto scan/click')
     }
     startManualViewer(id)
     notifyBotsChanged()
@@ -149,6 +153,10 @@ module.exports = function createManualControls (deps) {
     if (!entry) return
     const wasManual = entry.manualMode
     entry.suppressNextWindowClick = false
+    if (entry.suppressWindowTimer) {
+      clearTimeout(entry.suppressWindowTimer)
+      entry.suppressWindowTimer = null
+    }
     if (entry.manualWindow) {
       try { if (entry.bot?.currentWindow === entry.manualWindow) entry.bot.closeWindow(entry.manualWindow) } catch (_) {}
       entry.manualWindow = null
@@ -166,6 +174,20 @@ module.exports = function createManualControls (deps) {
     notifyBotsChanged()
   }
 
+  // Arm "treat the next windowOpen as a manual window" for one window. Used by
+  // /window-open, the 3D-viewer middle click, /gui, and /chat server commands.
+  // Expires after 5s so a command that does NOT open a GUI can't suppress a
+  // later automatic window.
+  function armWindowSuppression (entry) {
+    entry.suppressNextWindowClick = true
+    if (entry.suppressWindowTimer) clearTimeout(entry.suppressWindowTimer)
+    entry.suppressWindowTimer = setTimeout(() => {
+      entry.suppressNextWindowClick = false
+      entry.suppressWindowTimer = null
+    }, 5000)
+    if (entry.suppressWindowTimer.unref) entry.suppressWindowTimer.unref()
+  }
+
   // ── Window tracking (auto-click suppression hooks for bot.js) ───────────────
   // Returns true when bot.js must NOT run its automatic windowOpen logic.
   function onWindowOpen (id, window) {
@@ -173,6 +195,10 @@ module.exports = function createManualControls (deps) {
     if (!entry) return false
     if (entry.suppressNextWindowClick) {
       entry.suppressNextWindowClick = false
+      if (entry.suppressWindowTimer) {
+        clearTimeout(entry.suppressWindowTimer)
+        entry.suppressWindowTimer = null
+      }
       entry.manualWindow = window
       i(id, `Window "${windowTitle(window)}" opened manually (${window.slots.length} slots) — auto-click suppressed. /window to inspect · /window-close when done.`)
       notifyBotsChanged()
@@ -216,12 +242,11 @@ module.exports = function createManualControls (deps) {
         .catch(err => fail(id, `Mine failed: ${sanitize(err.message)}`))
     } else if (button === 1) {
       i(id, `Viewer: opening ${name} at ${pos} (manual — no auto-clicks)`)
-      entry.suppressNextWindowClick = true
+      armWindowSuppression(entry)
       bot.openBlock(block).catch(err => {
         entry.suppressNextWindowClick = false
         fail(id, `Open failed: ${sanitize(err.message || String(err))}`)
       })
-      setTimeout(() => { if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false }, 5000)
     } else {
       if (!bot.heldItem) { warn(id, 'Right-click with an empty hand — select a slot holding a block first (/hotbar <1-9>).'); return }
       i(id, `Viewer: placing ${sanitize(bot.heldItem.displayName || bot.heldItem.name)} against ${name} at ${pos}…`)
@@ -266,6 +291,74 @@ module.exports = function createManualControls (deps) {
     })
     if (!printed) i(id, '(empty)')
     hint(id, 'Rearrange with /move <src> <dst> · raw click: /window-click <slot> [l|r]')
+  }
+
+  // ── dropped-item pickup (/pickup) ──────────────────────────────────────────
+  // Mineflayer has no "collect this entity" API — the server picks up dropped
+  // items when the bot stands close enough. So /pickup pathfinds onto the item
+  // and waits for its entity to vanish (collected), with a timeout.
+  function nearbyItems (bot, maxDist) {
+    const items = []
+    const selfPos = bot?.entity?.position
+    if (!selfPos) return items
+    for (const entity of Object.values(bot.entities)) {
+      if (entity === bot.entity) continue
+      if (entity.type !== 'object') continue
+      if (entity.name !== 'item' && entity.objectType !== 'Item') continue
+      const dist = selfPos.distanceTo(entity.position)
+      if (dist <= maxDist) items.push({ entity, dist })
+    }
+    return items.sort((a, b) => a.dist - b.dist)
+  }
+
+  function collectItem (id, entry, label) {
+    const bot = entry.bot
+    if (!bot?.entity) return Promise.resolve(false)
+    const items = nearbyItems(bot, PICKUP_RANGE)
+    if (!items.length) return Promise.resolve(false)
+    const target = items[0]
+    const eid = target.entity.id
+    const name = sanitize(target.entity.displayName || target.entity.name || 'item')
+    i(id, `[${label}] Walking to collect ${name} (${target.dist.toFixed(1)} blocks away)…`)
+    try {
+      const { goals: { GoalNear } } = require('mineflayer-pathfinder')
+      bot.pathfinder.setGoal(new GoalNear(target.entity.position.x, target.entity.position.y, target.entity.position.z, 1))
+    } catch (err) {
+      fail(id, `Pickup pathfinding failed: ${sanitize(err.message)}`)
+      return Promise.resolve(false)
+    }
+    return new Promise(resolve => {
+      const start = Date.now()
+      const poll = () => {
+        if (!bot.entities[eid]) { okMsg(id, `Collected ${name}.`); resolve(true); return }
+        if (!bot.entity || Date.now() - start > PICKUP_TIMEOUT_MS) { resolve(false); return }
+        setTimeout(poll, 250)
+      }
+      poll()
+    })
+  }
+
+  async function pickupItems (id, entry, limit) {
+    const bot = entry.bot
+    const max = Math.min(limit, PICKUP_MAX_ITEMS)
+    let collected = 0
+    let attempted = 0
+    while (attempted < max) {
+      if (!bot?.entity) { fail(id, 'Bot despawned during pickup.'); return }
+      if (!nearbyItems(bot, PICKUP_RANGE).length) break
+      attempted++
+      const label = limit === Infinity ? `${attempted}/${max}` : `${attempted}/${limit}`
+      const okItem = await collectItem(id, entry, label)
+      if (okItem) collected++
+      else {
+        warn(id, 'Item not collected (timed out) — it may be out of reach. Use /walk to get closer, then /pickup again.')
+        break
+      }
+    }
+    const remaining = bot?.entity ? nearbyItems(bot, PICKUP_RANGE).length : 0
+    if (collected) okMsg(id, `Pickup done: ${collected} item${collected === 1 ? '' : 's'} collected.`)
+    if (remaining) hint(id, `${remaining} item${remaining === 1 ? '' : 's'} still within ${PICKUP_RANGE} blocks — /walk closer and /pickup again if needed.`)
+    if (!collected && !remaining) i(id, 'No dropped items within reach to pick up.')
   }
 
   // ── Command router (returns true when the command was handled here) ─────────
@@ -425,6 +518,54 @@ module.exports = function createManualControls (deps) {
         return true
       }
 
+      // ── items / server-command GUIs ──
+      case '/gui': {
+        const entry = needsBot()
+        if (!entry) return true
+        if (!rest) { warn(activeId, 'Usage: /gui <server command> — e.g. /gui /shardshop or /gui /shop'); return true }
+        const bot = entry.bot
+        if (bot.currentWindow) { i(activeId, 'A window is already open — /window-close it first.'); return true }
+        armWindowSuppression(entry)
+        try {
+          bot.chat(rest)
+          i(activeId, `Sent server command: ${sanitize(rest)} — its GUI opens in manual mode (no auto scan/click or warp). /window to inspect.`)
+        } catch (err) {
+          entry.suppressNextWindowClick = false
+          fail(activeId, `Send failed: ${sanitize(err.message)}`)
+        }
+        return true
+      }
+      case '/drop': {
+        const entry = needsBot()
+        if (!entry) return true
+        const bot = entry.bot
+        const item = bot.heldItem
+        if (!item) { warn(activeId, 'Nothing in hand to drop.'); return true }
+        const name = sanitize(item.displayName || item.name || 'item')
+        if (rest === '') {
+          bot.tossStack(item).then(() => okMsg(activeId, `Dropped ${item.count}x ${name}.`))
+            .catch(err => fail(activeId, `Drop failed: ${sanitize(err.message)}`))
+        } else {
+          const count = Number(rest)
+          if (!Number.isInteger(count) || count <= 0) {
+            warn(activeId, 'Usage: /drop [count] — drops the whole held stack, or [count] items from it')
+          } else {
+            bot.toss(item.type, item.metadata ?? null, Math.min(count, item.count))
+              .then(() => okMsg(activeId, `Dropped ${Math.min(count, item.count)}x ${name}.`))
+              .catch(err => fail(activeId, `Drop failed: ${sanitize(err.message)}`))
+          }
+        }
+        return true
+      }
+      case '/pickup': {
+        const entry = needsBot()
+        if (!entry) return true
+        const all = rest.toLowerCase() === 'all'
+        if (rest && !all) { warn(activeId, 'Usage: /pickup [all]'); return true }
+        pickupItems(id, entry, all ? Infinity : 1)
+        return true
+      }
+
       // ── windows / inventory ──
       case '/window-open': {
         const entry = needsBot()
@@ -437,12 +578,11 @@ module.exports = function createManualControls (deps) {
         const block = bot.blockAtCursor(REACH)
         if (!block) { warn(activeId, `No block in reach (${REACH} blocks) — look at a chest/furnace/etc. first.`); return true }
         i(activeId, `Opening ${sanitize(block.name)} at ${block.position} (manual — no auto-clicks)…`)
-        entry.suppressNextWindowClick = true
+        armWindowSuppression(entry)
         bot.openBlock(block).catch(err => {
           entry.suppressNextWindowClick = false
           fail(activeId, `Open failed: ${sanitize(err.message || String(err))}`)
         })
-        setTimeout(() => { if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false }, 5000)
         return true
       }
       case '/window': {
@@ -522,6 +662,7 @@ module.exports = function createManualControls (deps) {
     key: manualKey,
     onWindowOpen,
     onWindowClose,
+    armWindowSuppression,
     snapshotFor
   }
 }
