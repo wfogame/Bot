@@ -143,6 +143,7 @@ module.exports = function createManualControls (deps) {
       hint(id, 'Movement: /walk <x> <y> <z> [range] · /walk stop · /look <yaw> <pitch> · /lookat <x> <y> <z> · /hotbar <1-9>')
       hint(id, 'Actions: /dig · /place · /use · /attack — Windows: /window-open · /window · /window-click <slot> [l|r] · /move <src> <dst> · /window-close')
       hint(id, 'Items: /drop [count] · /pickup [all] — GUIs: /gui /shardshop (or /chat /shardshop) opens without auto scan/click')
+      hint(id, 'Dashboard GUI TUI: /gui-tui — shows the open window as a clickable ASCII panel that shrinks the log view')
     }
     startManualViewer(id)
     notifyBotsChanged()
@@ -189,6 +190,19 @@ module.exports = function createManualControls (deps) {
   }
 
   // ── Window tracking (auto-click suppression hooks for bot.js) ───────────────
+  // Track a manually-opened window and keep the dashboard GUI TUI fresh as the
+  // server updates slots (shop stock, moved items, etc.).
+  function trackManualWindow (entry, window) {
+    entry.manualWindow = window
+    try {
+      if (window && typeof window.on === 'function') {
+        window.on('updateSlot', notifyBotsChanged)
+        window.on('windowUpdate', notifyBotsChanged)
+      }
+    } catch (_) {}
+    notifyBotsChanged()
+  }
+
   // Returns true when bot.js must NOT run its automatic windowOpen logic.
   function onWindowOpen (id, window) {
     const entry = bots[id]
@@ -199,15 +213,13 @@ module.exports = function createManualControls (deps) {
         clearTimeout(entry.suppressWindowTimer)
         entry.suppressWindowTimer = null
       }
-      entry.manualWindow = window
+      trackManualWindow(entry, window)
       i(id, `Window "${windowTitle(window)}" opened manually (${window.slots.length} slots) — auto-click suppressed. /window to inspect · /window-close when done.`)
-      notifyBotsChanged()
       return true
     }
     if (entry.manualMode) {
-      entry.manualWindow = window
+      trackManualWindow(entry, window)
       i(id, `Manual mode: "${windowTitle(window)}" open (${window.slots.length} slots) — auto-click suppressed. /window to inspect · /window-click <slot> [l|r] · /move <src> <dst> · /window-close`)
-      notifyBotsChanged()
       return true
     }
     return false
@@ -519,6 +531,25 @@ module.exports = function createManualControls (deps) {
       }
 
       // ── items / server-command GUIs ──
+      case '/gui-tui': {
+        const entry = needsBot()
+        if (!entry) return true
+        const bot = entry.bot
+        const win = entry.manualWindow || bot.currentWindow
+        if (!win || !win.slots) {
+          warn(activeId, 'No GUI is open — open one first (/window-open, /gui /shardshop, or /chat /shardshop).')
+          return true
+        }
+        entry.guiTui = !entry.guiTui
+        if (entry.guiTui) {
+          okMsg(activeId, `GUI TUI shown for "${windowTitle(win)}" (${win.slots.length} slots) — the dashboard renders it as a clickable ASCII panel.`)
+          printWindowSlots(activeId, bot, win)
+        } else {
+          i(activeId, 'GUI TUI hidden.')
+        }
+        notifyBotsChanged()
+        return true
+      }
       case '/gui': {
         const entry = needsBot()
         if (!entry) return true
@@ -614,7 +645,7 @@ module.exports = function createManualControls (deps) {
           return true
         }
         const button = parts[1] === 'r' ? 1 : 0
-        bot.clickWindow(slot, button, 0).then(() => okMsg(activeId, `Clicked slot ${slot} (${button ? 'right' : 'left'}).`))
+        bot.clickWindow(slot, button, 0).then(() => { okMsg(activeId, `Clicked slot ${slot} (${button ? 'right' : 'left'}).`); notifyBotsChanged() })
           .catch(err => fail(activeId, `Click failed: ${sanitize(err.message)}`))
         return true
       }
@@ -628,7 +659,7 @@ module.exports = function createManualControls (deps) {
           warn(activeId, `Usage: /move <src> <dst> — valid slots: 0–${win.slots.length - 1} (${bot.currentWindow ? 'open window' : 'inventory'})`)
           return true
         }
-        bot.moveSlotItem(pair[0], pair[1]).then(() => okMsg(activeId, `Moved slot ${pair[0]} → ${pair[1]}.`))
+        bot.moveSlotItem(pair[0], pair[1]).then(() => { okMsg(activeId, `Moved slot ${pair[0]} → ${pair[1]}.`); notifyBotsChanged() })
           .catch(err => fail(activeId, `Move failed: ${sanitize(err.message)}`))
         return true
       }
@@ -637,21 +668,59 @@ module.exports = function createManualControls (deps) {
     }
   }
 
-  function snapshotFor (entry) {
-    if (!entry?.manualMode) return null
-    const viewerPort = entry.manualViewer ? entry.manualViewer.port : null
-    // Docker/run-docker.sh maps the container viewer range to a per-instance
-    // host block and injects MANUAL_VIEWER_HOST_PORT — translate so the
-    // dashboard's viewer button opens the right host URL (falls back to the
-    // container port when unset, i.e. plain local runs).
-    let viewerHostPort = null
-    const hostBase = parseInt(process.env.MANUAL_VIEWER_HOST_PORT, 10)
-    if (viewerPort && Number.isFinite(hostBase)) {
-      const containerBase = parseInt(process.env.MANUAL_VIEWER_PORT, 10)
-      const base = Number.isFinite(containerBase) ? containerBase : VIEWER_PORT
-      viewerHostPort = hostBase + (viewerPort - base)
+  // Compact, dashboard-safe description of an open window for the GUI TUI.
+  function describeWindow (win, bot) {
+    const isInventory = win === bot?.inventory
+    const containerCount = isInventory ? 0 : Math.max(0, win.slots.length - 36)
+    const label = idx => {
+      if (containerCount && idx < containerCount) return `container[${idx}]`
+      if (idx >= 36 && idx < 45) return `hotbar[${idx - 36}]`
+      if (idx === 45) return 'offhand'
+      if (idx >= 9 && idx < 36) return `main[${idx - 9}]`
+      if (idx >= 5 && idx < 9) return `armor[${idx - 5}]`
+      return `slot ${idx}`
     }
-    return { viewerPort, viewerHostPort }
+    const slots = []
+    win.slots.forEach((item, idx) => {
+      slots.push({
+        slot: idx,
+        label: label(idx),
+        item: item ? `${item.count}x ${sanitize(item.displayName || item.name)}` : null
+      })
+    })
+    return { title: windowTitle(win), isInventory, slots }
+  }
+
+  // Dashboard snapshot. Returns null when there is nothing manual to show. The
+  // shape changed to carry `mode` separately from the GUI TUI, because /gui and
+  // /chat /shardshop track windows even when manual mode is OFF.
+  function snapshotFor (entry) {
+    const win = entry?.manualWindow && entry.manualWindow.slots ? entry.manualWindow : null
+    const hasMode = !!entry?.manualMode
+    const hasTui = !!entry?.guiTui && !!win
+    if (!hasMode && !hasTui) return null
+    const out = { mode: hasMode }
+    if (hasMode) {
+      const viewerPort = entry.manualViewer ? entry.manualViewer.port : null
+      // Docker/run-docker.sh maps the container viewer range to a per-instance
+      // host block and injects MANUAL_VIEWER_HOST_PORT — translate so the
+      // dashboard's viewer button opens the right host URL (falls back to the
+      // container port when unset, i.e. plain local runs).
+      let viewerHostPort = null
+      const hostBase = parseInt(process.env.MANUAL_VIEWER_HOST_PORT, 10)
+      if (viewerPort && Number.isFinite(hostBase)) {
+        const containerBase = parseInt(process.env.MANUAL_VIEWER_PORT, 10)
+        const base = Number.isFinite(containerBase) ? containerBase : VIEWER_PORT
+        viewerHostPort = hostBase + (viewerPort - base)
+      }
+      out.viewerPort = viewerPort
+      out.viewerHostPort = viewerHostPort
+    }
+    if (hasTui) {
+      out.guiTui = true
+      out.window = describeWindow(win, entry.bot)
+    }
+    return out
   }
 
   return {
