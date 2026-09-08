@@ -25,6 +25,7 @@ COPY expose-terminal.js ./expose-terminal.js
 COPY bot-controls.js ./bot-controls.js
 COPY monitoring.js ./monitoring.js
 COPY bot-manual.js ./bot-manual.js
+COPY cron.js ./cron.js
 COPY ${APP_FILE} ./index.js
 
 # Tor config: local SOCKS5 on 127.0.0.1:9050, drops privileges to debian-tor.

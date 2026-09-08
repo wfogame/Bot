@@ -160,6 +160,57 @@ Note: short server replies that look like `<word>: value` (e.g. `Shards: 123`)
 can also reset the timer; the watchdog is meant for servers where the chat is
 otherwise completely silent.
 
+## `/find <name>` — search the whole fleet
+
+`/find` scans every bot's inventory **and** any open window and lists matching
+items, matching against the display name, the anvil custom name, and the
+registry/alternative name (`netherite_sword`), case-insensitively. Offline bots
+are reported as skipped. Example output:
+
+```text
+❯ /find sword
+[A] — 1 matching stack(s)
+  3x Sword (netherite_sword) — inv slot 12
+✓ Found 3 matching item(s) across 3 bot(s).
+```
+
+## Cron jobs (`/cron` + `CRON_JOB_<N>`)
+
+Cron jobs run any command on a schedule with `/all` semantics: known local
+commands run per bot, manual commands route through their own router, and
+anything else broadcasts as chat to every spawned bot.
+
+Configure durable jobs in `.env`:
+
+```dotenv
+CRON_JOB_1=0 4 * * *|/crates-all
+CRON_JOB_2=@every 60|/status
+```
+
+Each entry is `<schedule>|<command>`. The schedule is a standard 5-field cron
+(`minute hour day-of-month month day-of-week`; day-of-week 0-6, 7 accepted as
+Sunday) or `@every <seconds>` (minimum 5). Fields support `*`, `*/n`, `a-b`,
+`a-b/n`, and comma lists; when both day-of-month and day-of-week are
+restricted, cron fires when either matches (standard OR semantics). Invalid
+entries are logged and skipped at startup.
+
+Manage jobs at runtime from the TUI/browser terminal:
+
+- `/cron` — list jobs with id, schedule, command, state, run count, last/next run.
+- `/cron add <schedule> <command>` — add a job; the schedule may be quoted
+  (`/cron add "0 4 * * *" /crates-all`) or bare (`/cron add 0 4 * * *
+  /crates-all`, `/cron add @every 60 /status`). The rest of the line is the
+  command, so chat messages with spaces work too.
+- `/cron rm <id>` — remove a job.
+- `/cron on|off <id>` — enable/disable a job.
+- `/cron run <id>` — fire a job immediately (works even when disabled, handy
+  for testing).
+
+Jobs added from the terminal last until the process exits; `.env` jobs reload
+on every restart. A job that is still running when its next trigger arrives is
+skipped (no overlapping runs), and dispatcher errors are logged to the system
+channel.
+
 ## Tests
 
 ```sh

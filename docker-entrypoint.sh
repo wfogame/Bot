@@ -44,4 +44,3 @@ fi
 
 echo "[entrypoint] starting app — manual 3D viewer will bind ${WEB_BIND:-0.0.0.0}:${MANUAL_VIEWER_PORT}+ when /manual-interact is used (map host ports to reach it)"
 exec node index.js
-exec monitoring.js
