@@ -371,7 +371,8 @@ health: b ? (b.health ?? null) : null, food: b ? (b.food ?? null) : null,
 uptimeSec: e.spawnTime ? Math.floor((Date.now() - e.spawnTime) / 1000) : null,
 attempts: e.reconnectAttempts || 0,
 kick: e.lastKickReason ? escHtml(sanitize(e.lastKickReason).slice(0, 140)) : null,
-pingHist: histArr
+pingHist: histArr,
+manual: manual.snapshotFor(e)
 }
 })
 }
@@ -655,7 +656,7 @@ main{grid-area:main;position:relative;display:flex;flex-direction:column;min-wid
 button.tb{background:none;border:1px solid var(--line);color:var(--dim);border-radius:6px;padding:3px 9px;cursor:pointer;font:inherit;font-size:11px}
 button.tb:hover{color:var(--txt);border-color:var(--acc)}
 #newchip{position:absolute;top:-9px;right:150px;background:var(--acc);color:#04211d;border-radius:9px;padding:1px 8px;font-size:10px;font-weight:700;cursor:pointer;display:none}
-#logwrap{flex:1;min-height:0;overflow-y:auto;padding:6px 0 70px;background:var(--bg)}
+#logwrap{flex:1;min-height:0;overflow-y:auto;padding:6px 0 140px;background:var(--bg)}
 .ln{padding:0 14px;white-space:pre-wrap;word-break:break-word}
 .ln .tag{color:var(--dim);font-size:11px}
 .c-red{color:var(--red)}.c-green{color:var(--grn)}.c-blue{color:var(--blu)}.c-cyan{color:var(--cyan)}
@@ -663,6 +664,23 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .c-gray,.c-grey{color:var(--dim)}.c-black{color:#0a0e13}.b{font-weight:700}
 #cmdbar{position:fixed;left:250px;right:0;bottom:0;z-index:30;display:flex;min-height:56px;gap:8px;align-items:center;padding:9px 12px;background:var(--panel);border-top:1px solid var(--line);box-shadow:0 -6px 18px rgba(0,0,0,.25)}
 #cmdbar.cmdbar-hidden{display:none}
+.manual-viewer{background:none;border:1px solid rgba(103,232,249,.4);color:var(--cyan);border-radius:5px;padding:2px 6px;font:inherit;font-size:10px;cursor:pointer;margin-left:auto}
+.manual-viewer:hover{border-color:var(--cyan);background:rgba(103,232,249,.08)}
+.manual-badge{color:var(--yel);border:1px solid rgba(251,191,36,.4);border-radius:5px;padding:1px 5px;font-size:9px}
+#manualbar{position:fixed;left:250px;right:0;bottom:56px;z-index:29;display:none;align-items:center;justify-content:center;gap:18px;padding:8px 12px;background:var(--panel2);border-top:1px solid var(--line);box-shadow:0 -5px 14px rgba(0,0,0,.18)}
+#manualbar.on{display:flex}
+.manual-group{display:flex;align-items:center;gap:6px}
+.manual-label{color:var(--dim);font-size:10px;text-transform:uppercase}
+.move-pad{display:grid;grid-template-columns:34px 34px 34px;grid-template-rows:28px 28px;gap:4px}
+.mkey,.hkey{background:var(--bg);border:1px solid var(--line);color:var(--txt);border-radius:6px;cursor:pointer;font:inherit;user-select:none;touch-action:none}
+.mkey{min-width:34px;min-height:28px}
+.mkey[data-control="forward"]{grid-column:2;grid-row:1}
+.mkey[data-control="left"]{grid-column:1;grid-row:2}
+.mkey[data-control="back"]{grid-column:2;grid-row:2}
+.mkey[data-control="right"]{grid-column:3;grid-row:2}
+.mkey.held,.hkey.on{color:#04211d;background:var(--acc);border-color:var(--acc)}
+.action-keys,.hotbar-keys{display:flex;gap:4px;flex-wrap:wrap}
+.hkey{min-width:29px;height:29px;padding:0 6px}
 .prompt{color:var(--grn);font-weight:700}
 #cmd{display:block;flex:1 1 auto;min-width:0;height:32px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 10px;color:var(--txt);font:inherit}
 #cmd:focus{outline:none;border-color:var(--acc)}
@@ -686,7 +704,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:8px;padding:9px 14px;max-width:340px;font-size:12px;box-shadow:0 6px 24px rgba(0,0,0,.5)}
 .toast.bad{border-left-color:var(--red)}.toast.good{border-left-color:var(--grn)}
 .toast.out{opacity:0;transition:opacity .4s}
-@media(max-width:760px){header{overflow-x:auto}header>*{flex-shrink:0}#chips{flex-wrap:nowrap}#loghead{overflow-x:auto}#loghead>*{flex-shrink:0}#botlist{display:flex;gap:6px}.bot{margin-bottom:0}#app{grid-template-columns:1fr;grid-template-areas:"top" "side" "main";grid-template-rows:46px 160px 1fr}#cmdbar{left:0}#search{width:110px}aside{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden}.bot{min-width:180px}.views{min-width:140px;flex-direction:column}}
+@media(max-width:760px){header{overflow-x:auto}header>*{flex-shrink:0}#chips{flex-wrap:nowrap}#loghead{overflow-x:auto}#loghead>*{flex-shrink:0}#botlist{display:flex;gap:6px}.bot{margin-bottom:0}#app{grid-template-columns:1fr;grid-template-areas:"top" "side" "main";grid-template-rows:46px 160px 1fr}#cmdbar{left:0}#manualbar{left:0;overflow-x:auto;justify-content:flex-start}#search{width:110px}aside{display:flex;gap:6px;overflow-x:auto;overflow-y:hidden}.bot{min-width:180px}.views{min-width:140px;flex-direction:column}}
 </style></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
@@ -696,6 +714,30 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
 <button class="tb" id="clearbtn">clear</button><button class="tb" id="helpbtn">? cmds</button></div>
 <div id="logwrap"><div id="log"></div></div>
+<div id="manualbar" aria-label="Manual bot controls">
+<div class="manual-group"><span class="manual-label">move</span><div class="move-pad">
+<button class="mkey" type="button" data-control="forward" title="Forward">W</button>
+<button class="mkey" type="button" data-control="left" title="Left">A</button>
+<button class="mkey" type="button" data-control="back" title="Back">S</button>
+<button class="mkey" type="button" data-control="right" title="Right">D</button>
+</div></div>
+<div class="manual-group"><span class="manual-label">actions</span><div class="action-keys">
+<button class="mkey" type="button" data-control="jump">jump</button>
+<button class="mkey" type="button" data-control="sneak">sneak</button>
+<button class="mkey" type="button" data-control="sprint">sprint</button>
+</div></div>
+<div class="manual-group"><span class="manual-label">hotbar</span><div class="hotbar-keys">
+<button class="hkey" type="button" data-slot="1">1</button>
+<button class="hkey" type="button" data-slot="2">2</button>
+<button class="hkey" type="button" data-slot="3">3</button>
+<button class="hkey" type="button" data-slot="4">4</button>
+<button class="hkey" type="button" data-slot="5">5</button>
+<button class="hkey" type="button" data-slot="6">6</button>
+<button class="hkey" type="button" data-slot="7">7</button>
+<button class="hkey" type="button" data-slot="8">8</button>
+<button class="hkey" type="button" data-slot="9">9</button>
+</div></div>
+</div>
 <form id="cmdbar" action="/command" method="post"><div id="sugg" hidden></div><span class="prompt">❯</span>
 <input type="hidden" id="selectedId" name="selectedId" value="all">
 <input id="cmd" name="text" placeholder="type / for commands — runs on selected bot" autocomplete="off" spellcheck="false">
@@ -709,7 +751,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <script>
 (function(){
 'use strict'
-var ws=null,view=new URLSearchParams(location.search).get('view')||'all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,terminalOpen=false,terminalEnabled=false
+var ws=null,view=new URLSearchParams(location.search).get('view')||'all',follow=true,scrollOnNextLog=false,lines=[],hist=[],hIdx=-1,pending=0,cmds={},prevOnline={},botStates={},heldControls={},rcDelay=600,rcTimer=null,rt=null,pollTimer=null,pollBusy=false,terminalOpen=false,terminalEnabled=false
 function el(i){return document.getElementById(i)}
 function setWsState(kind,text){var state=el('wsstate');state.className='wsstate '+kind;state.textContent=text}
 // Strips ANSI/VT100 escape and control sequences (color codes, cursor moves,
@@ -780,10 +822,10 @@ else if(m.t==='select'){setView(m.id,false)}
 else if(m.t==='history'){if(m.id===view)setLines(m.lines||[])}
 else if(m.t==='clear'){if(m.id===view){lines=[];el('log').innerHTML=''}}
 else if(m.t==='terminal'){terminalWrite(m.data||'')}}
-ws.onclose=function(){startHttpFallback();scheduleConnect()}
-ws.onerror=function(){startHttpFallback()}
+ws.onclose=function(){releaseAllManualKeys();startHttpFallback();scheduleConnect()}
+ws.onerror=function(){releaseAllManualKeys();startHttpFallback()}
 }
-function setView(v,subscribe){view=v;el('selectedId').value=v;lines=[];pending=0;el('log').innerHTML='';el('newchip').style.display='none'
+function setView(v,subscribe){releaseAllManualKeys();view=v;el('selectedId').value=v;lines=[];pending=0;el('log').innerHTML='';el('newchip').style.display='none'
 el('channame').textContent=v==='all'?'ALL CHANNELS':v==='system'?'SYSTEM':v
 var chips=document.querySelectorAll('.vchip'),i
 for(i=0;i<chips.length;i++)chips[i].classList.toggle('on',chips[i].getAttribute('data-view')===v)
@@ -791,6 +833,7 @@ var cards=document.querySelectorAll('.bot')
 for(i=0;i<cards.length;i++)cards[i].classList.toggle('sel',cards[i].getAttribute('data-id')===v)
 if(subscribe!==false&&ws&&ws.readyState===1)ws.send(JSON.stringify({t:'sub',id:v}))
 else if(pollTimer)startHttpFallback()
+updateManualBar()
 setFollow(true)}
 function scrollBottom(){var w=el('logwrap');w.scrollTop=w.scrollHeight;pending=0;el('newchip').style.display='none'}
 function setFollow(f){follow=f;el('followbtn').textContent=f?'⏸ pause':'▶ follow';if(f)scrollBottom()}
@@ -823,8 +866,83 @@ for(var i=0;i<lines.length&&n<1200;i++){var l=lines[i];if(q&&l.p.toLowerCase().i
 var d=document.createElement('div');d.className='ln';d.innerHTML=l.pre+l.h;frag.appendChild(d);n++}
 L.appendChild(frag);if(follow)scrollBottom()}
 el('search').addEventListener('input',function(){if(rt)clearTimeout(rt);rt=setTimeout(rebuild,160)})
-function renderBots(bs){var box=el('botlist');box.innerHTML=''
-for(var i=0;i<bs.length;i++){var b=bs[i],old=prevOnline[b.id]
+function selectedBotState(){return botStates[view]||null}
+function manualSelected(){var b=selectedBotState();return !!(b&&b.manual)}
+function updateManualBar(){var bar=el('manualbar');if(!bar)return;bar.classList.toggle('on',manualSelected())}
+function sendManualKey(control,state){
+if(!manualSelected())return
+if(!ws||ws.readyState!==1){toast('Manual movement requires the WebSocket connection.','bad');return}
+ws.send(JSON.stringify({t:'key',id:view,control:control,state:state}))
+}
+function releaseManualKey(control,button){
+if(!heldControls[control])return
+delete heldControls[control]
+if(button)button.classList.remove('held')
+sendManualKey(control,false)
+}
+function releaseAllManualKeys(){
+var controls=Object.keys(heldControls)
+for(var i=0;i<controls.length;i++){
+var control=controls[i]
+releaseManualKey(control,document.querySelector('.mkey[data-control="'+control+'"]'))
+}
+}
+function bindManualControls(){
+var keys=document.querySelectorAll('.mkey[data-control]')
+for(var i=0;i<keys.length;i++){
+(function(button){
+var control=button.getAttribute('data-control')
+function down(e){
+e.preventDefault()
+if(heldControls[control])return
+heldControls[control]=true
+button.classList.add('held')
+sendManualKey(control,true)
+if(e.pointerId!==undefined&&button.setPointerCapture){try{button.setPointerCapture(e.pointerId)}catch(_){}}
+}
+function up(e){if(e)e.preventDefault();releaseManualKey(control,button)}
+button.addEventListener('pointerdown',down)
+button.addEventListener('pointerup',up)
+button.addEventListener('pointercancel',up)
+button.addEventListener('lostpointercapture',up)
+button.addEventListener('contextmenu',function(e){e.preventDefault()})
+})(keys[i])
+}
+var slots=document.querySelectorAll('.hkey[data-slot]')
+for(var j=0;j<slots.length;j++){
+(function(button){
+button.addEventListener('click',function(){
+if(!manualSelected())return
+sendCmd('/hotbar '+button.getAttribute('data-slot'))
+})
+})(slots[j])
+}
+window.addEventListener('blur',releaseAllManualKeys)
+document.addEventListener('visibilitychange',function(){if(document.hidden)releaseAllManualKeys()})
+}
+function bindManualKeyboard(){
+var map={KeyW:'forward',KeyS:'back',KeyA:'left',KeyD:'right',Space:'jump',ShiftLeft:'sneak',ShiftRight:'sneak',ControlLeft:'sprint',ControlRight:'sprint'}
+document.addEventListener('keydown',function(e){
+var control=map[e.code]
+if(!control||!manualSelected())return
+var tag=(document.activeElement&&document.activeElement.tagName)||''
+if(tag==='INPUT'||tag==='TEXTAREA')return
+e.preventDefault()
+if(e.repeat||heldControls[control])return
+heldControls[control]=true
+var button=document.querySelector('.mkey[data-control="'+control+'"]')
+if(button)button.classList.add('held')
+sendManualKey(control,true)
+})
+document.addEventListener('keyup',function(e){
+var control=map[e.code]
+if(!control)return
+releaseManualKey(control,document.querySelector('.mkey[data-control="'+control+'"]'))
+})
+}
+function renderBots(bs){var box=el('botlist');box.innerHTML='';botStates={}
+for(var i=0;i<bs.length;i++){var b=bs[i];botStates[b.id]=b
+var old=prevOnline[b.id]
 if(old===true&&!b.online)toast(b.id+' went offline'+(b.kick?' — '+b.kick:''),'bad')
 if(old===false&&b.online)toast(b.id+' is online','good')
 prevOnline[b.id]=b.online
@@ -832,14 +950,19 @@ var d=document.createElement('div')
 d.className='bot'+(b.online?' on':'')+(b.id===view?' sel':'')
 d.setAttribute('data-id',b.id)
 var up=b.uptimeSec==null?'':fmtUp(b.uptimeSec)
-d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
+var manualHtml=b.manual?'<span class="manual-badge">manual</span>':''
+var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
+d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+manualHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<canvas width="220" height="16"></canvas>'
 d.querySelector('.bname').textContent=b.id
 if(b.kick)d.title=b.kick
 d.onclick=(function(id){return function(){setView(id)}})(b.id)
+var viewerButton=d.querySelector('.manual-viewer')
+if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerPort)
 box.appendChild(d)
-drawSpark(d.querySelector('canvas'),b.pingHist||[])}}
+drawSpark(d.querySelector('canvas'),b.pingHist||[])}
+updateManualBar()}
 function drawSpark(cv,h){var ctx=cv.getContext('2d');ctx.clearRect(0,0,cv.width,cv.height)
 if(!h||h.length<2)return
 var mx=0;for(var i=0;i<h.length;i++)mx=Math.max(mx,h[i]);if(mx<=0)mx=1
@@ -911,6 +1034,8 @@ if(e.key==='/'&&document.activeElement!==cinput&&document.activeElement!==el('se
 cinput.focus();if(!cinput.value)cinput.value='/';e.preventDefault()}})
 var chips=document.querySelectorAll('.vchip[data-view]')
 for(var ci=0;ci<chips.length;ci++)chips[ci].onclick=(function(v){return function(){setView(v)}})(chips[ci].getAttribute('data-view'))
+bindManualControls()
+bindManualKeyboard()
 setView(view,false)
 connect()
 })()
@@ -1184,6 +1309,17 @@ ws.on('message', raw => {
 let msg
 try { msg = JSON.parse(raw) } catch (_) { webTrace('websocket received invalid JSON'); return }
 webTrace(`websocket message type=${msg.t || 'unknown'}`)
+
+// Hold-to-move / hotbar controls from the dashboard manual pad (bot-manual.js).
+if (msg.t === 'key') {
+const id = typeof msg.id === 'string' ? msg.id : null
+const state = msg.state === true || msg.state === 'down' || msg.state === 'on'
+if (id && Object.hasOwn(bots, id) && typeof msg.control === 'string') {
+manual.key(id, msg.control, state)
+}
+return
+}
+
 if (msg.t === 'terminal') {
 if (msg.action === 'open') openTerminalProcess()
 else if (msg.action === 'close') closeTerminalProcess()
@@ -1371,7 +1507,11 @@ shardshopLoopRunning: false, // prevents concurrent /shardshop-loop runs
 lastActivity: Date.now(), // updated on every inbound packet — used by the proxy stall watchdog
 forceKilled: false, // set by the watchdog so scheduleReconnect logs it distinctly
 manualDisconnect: false, // mirrors the closure-local flag so the watchdog (outside this closure) can see it too
-pingHist: [] // web GUI sparkline
+pingHist: [], // web GUI sparkline
+manualMode: false, // manual interact mode (bot-manual.js)
+manualViewer: null, // { port } when the 3D viewer is live
+manualWindow: null, // window tracked for manual /window-* commands
+suppressNextWindowClick: false // suppress auto slot-click for the next windowOpen
 }
 const entry = bots[id]
 
@@ -1600,6 +1740,10 @@ try { bot.chat(spawnCommand) } catch (err) { e(`Server command failed: ${sanitiz
 
 bot.on('windowOpen', (window) => {
 try {
+// Manual interaction gets first refusal — suppresses automatic slot selection
+// and the delayed AFK warp when manual mode is on or /window-open opened it.
+if (manual.onWindowOpen(id, window)) return
+
 // Skip the GUI/Fatal Crate handler when a /crates routine opened this window
 if (bots[id]?.inCrateRoutine) return
 
@@ -1681,6 +1825,13 @@ i(`Warped — waiting for server transfer…`)
 } catch (err) { e(`windowOpen handler error: ${sanitize(err.message)}`) }
 })
 
+bot.on('windowClose', (window) => {
+try {
+manual.onWindowClose(id, window)
+notifyBotsChanged()
+} catch (err) { e(`windowClose handler error: ${sanitize(err.message || String(err))}`) }
+})
+
 bot.on('message', (jsonMsg) => { try { c(jsonMsg.toString()) } catch (_) {} })
 
 bot.on('kicked', (reason) => {
@@ -1726,6 +1877,12 @@ e(`Client error: ${sanitize(err.message || String(err))}`)
 
 bot.on('end', (reason) => {
 connected = false
+
+try {
+// Release held controls, close the viewer, restore automatic behavior.
+if (bots[id]?.bot === bot) manual.stopManualMode(id)
+} catch (err) { w(`Manual mode cleanup failed: ${sanitize(err.message || String(err))}`) }
+
 const reasonText = reason ? String(reason) : ''
 w(`Disconnected${reasonText ? ': ' + sanitize(reasonText) : ''}.`)
 notifyBotsChanged()
@@ -1757,6 +1914,9 @@ lastRawError = null
 
 bots[id].disconnectManually = () => {
 manualDisconnect = true
+
+try { manual.stopManualMode(id) } catch (_) {}
+
 if (bots[id]) {
 bots[id].manualDisconnect = true // let the watchdog (outside this closure) know this was intentional
 bots[id].spawnTime = null // stop looking "spawned" to the watchdog now that we're intentionally offline
@@ -1860,6 +2020,22 @@ const COMMANDS = {
 '/switch <id>': 'Switch view to a different bot by name or number',
 '/uptime': 'Show uptime for all bots',
 '/proxy': 'Show the currently configured outbound proxy',
+'/manual-interact': 'Toggle manual interact mode for the active bot (3D view, movement pad, direct world actions); disabled while crate/shardshop routines run',
+'/manual-stop': 'Stop manual interact mode, release held controls, stop pathfinding, close viewer',
+'/walk <x> <y> <z> [range]': 'Pathfind near coordinates (range defaults to 1, capped at 16); /walk stop cancels',
+'/look <yaw> <pitch>': 'Turn the bot using yaw/pitch in degrees',
+'/lookat <x> <y> <z>': 'Turn the bot toward world coordinates',
+'/hotbar <1-9>': 'Select a hotbar slot in manual mode',
+'/key <control> <down|up>': 'Hold/release forward, back, left, right, jump, sneak, or sprint in manual mode',
+'/dig': 'Mine the block under the bot cursor',
+'/place': 'Place the held block against the block under the cursor',
+'/use': 'Use/activate the currently held item',
+'/attack': 'Attack the entity under the cursor',
+'/window-open': 'Open the container under the cursor without automatic slot clicking',
+'/window': 'Inspect the open window (or player inventory)',
+'/window-click <slot> [l|r]': 'Left/right-click a raw window slot',
+'/move <src> <dst>': 'Move an item between raw window slots',
+'/window-close': 'Close the open container window',
 'anything else': 'Sent directly as a chat message/command from the active bot',
 '/dump': 'dump gear to chest'
 }
@@ -2182,6 +2358,7 @@ clickOnce()
 // windowOpen handler so the shulker box GUI doesn't trigger Fatal Crate logic.
 async function runCrateRoutine(id, blockNameOverride) {
 const entry = bots[id]
+if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /crates.{/yellow-fg}`); return false }
 const blockName = blockNameOverride || CRATE_SHULKER_BLOCK
 logFor(id, `Change the version in .env to 1.21.1 to use this mechanic otherwise SKIP it.`)
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
@@ -2263,6 +2440,7 @@ bots[id].inCrateRoutine = false
 // ── /crates-loop: repeatedly run the crate routine ────────────────────────
 async function runCrateLoop(id, maxIterations = Infinity, blockNameOverride) {
 const entry = bots[id]
+if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /crates-loop.{/yellow-fg}`); return }
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return }
 if (entry.crateLoopRunning) { logFor(id, `{yellow-fg}⚠ /crates-loop is already running for ${id}.{/yellow-fg}`); return }
 entry.crateLoopRunning = true
@@ -2298,6 +2476,7 @@ if (bots[id]) bots[id].crateLoopRunning = false
 function runShardshopLoop(id) {
 return new Promise((resolve) => {
 const entry = bots[id]
+if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /shardshop-loop.{/yellow-fg}`); resolve(null); return }
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-ffg}`); resolve(null); return }
 if (entry.shardshopLoopRunning) { logFor(id, `{yellow-fg}⚠ /shardshop-loop is already running for ${id}.{/yellow-fg}`); resolve(null); return }
 entry.shardshopLoopRunning = true
@@ -2368,6 +2547,7 @@ let cratesAllRunning = false
 
 async function runCratesAllSequenceForBot(id, blockNameOverride) {
 const entry = bots[id]
+if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before running /crates-all on ${id}.{/yellow-fg}`); return }
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned — skipping /crates-all.{/yellow-fg}`); return }
 if (entry.crateRoutineRunning || entry.crateLoopRunning) {
 logFor(id, `{yellow-fg}⚠ ${id} is already busy with a crate routine — skipping /crates-all.{/yellow-fg}`)
@@ -2520,6 +2700,10 @@ const isLocal = LOCAL_COMMANDS.includes(baseCmd)
 const ids = Object.keys(bots)
 const dispatch = id => {
 if (!bots[id]) return false
+
+// Manual commands route per bot through their own router (e.g. /all /manual-stop).
+if (manual.routeCommand(msg, id)) return true
+
 if (isLocal) {
 // Reuse the single-bot router so arguments (e.g. /crates purple) survive.
 handleCommand(msg, { selectedId: id })
@@ -2806,6 +2990,12 @@ logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${
 runCratesAllSequenceForBot(targetId, blockName)
 return
 }
+
+// ── Manual interaction commands (bot-manual.js) ─────────────
+// After the crate/shardshop parsing above but before the local-command switch
+// and the raw Minecraft chat fallback, so /walk, /window-*, /key etc. never
+// leak to the server as chat.
+if (manual.routeCommand(trimmed, activeId)) return
 
 // ── Single-bot local commands ───────────────
 if (activeId && LOCAL_COMMANDS.includes(trimmed)) {

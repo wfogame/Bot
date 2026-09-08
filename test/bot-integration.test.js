@@ -37,6 +37,8 @@ function runtime(env = {}) {
       if (name === 'ws') return fakeWs
       if (name === './bot-controls') return { ...controls, createSlowBroadcast: () => controls.createSlowBroadcast({ setTimer, clearTimer }) }
       if (name === './expose-terminal') return { sshConfig: () => ({ enabled: false }) }
+      if (name === './monitoring') return { createMonitoring: () => ({ getMemorySnapshot: () => null, onDisconnect() {}, onKick() {}, onProxyStall() {}, onReconnectExhausted() {}, onFatal() {}, onSecurityLockout() {}, inspectServerMessage() {}, onRecovered() {} }) }
+      if (name === './bot-manual') return () => ({ routeCommand: () => false, key() {}, onWindowOpen: () => false, onWindowClose() {}, stopManualMode() {}, snapshotFor: () => null })
       if (name === 'mineflayer') return { createBot() { throw Error('Live bot connections forbidden in tests') } }
       if (name === 'mineflayer-armor-manager') return () => {}
       if (name === 'mineflayer-pathfinder') return { goals: {} }

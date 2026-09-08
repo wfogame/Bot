@@ -50,6 +50,19 @@ module.exports = function createManualControls (deps) {
     return viewerFactory
   }
 
+  // Attach the browser-view click→world-action handler. prismarine-viewer's
+  // 'blockClicked' listener can only be bound once the viewer exists, so this
+  // is called from startManualMode AND again after the viewer starts.
+  function bindViewerClicks (id) {
+    const entry = bots[id]
+    const viewer = entry?.bot?.viewer
+    if (!viewer || typeof viewer.on !== 'function') return false
+    if (entry.manualViewerClicksBound) return true
+    viewer.on('blockClicked', (block, face, button) => handleViewerClick(id, block, face, button))
+    entry.manualViewerClicksBound = true
+    return true
+  }
+
   // The viewer's own HTTP server would crash unhandled on a busy port, so find
   // a genuinely free port first (same fallback idea as the dashboard's listen).
   function probeFreePort (startPort, bind, attemptsLeft) {
@@ -89,6 +102,11 @@ module.exports = function createManualControls (deps) {
       return null
     }
     entry.manualViewer = { port }
+    // First start: the viewer is only created after startManualMode checked for
+    // it, so bind the click handler now that it exists (retry once if needed).
+    if (!bindViewerClicks(id)) {
+      setTimeout(() => { if (bots[id]?.manualMode) bindViewerClicks(id) }, 250)
+    }
     okMsg(id, `3D viewer live on port ${port} — open it from the dashboard (🌍 viewer button) or http://<this-host>:${port}`)
     hint(id, 'In the 3D view: LEFT click = mine block · RIGHT click = place held block · MIDDLE click = open container (no auto-clicks).')
     notifyBotsChanged()
@@ -115,11 +133,10 @@ module.exports = function createManualControls (deps) {
     }
     if (!entry.manualMode) {
       entry.manualMode = true
+      entry.manualViewerClicksBound = false
       okMsg(id, 'Manual interact ON — automatic GUI slot clicking + AFK warp are suppressed for this bot.')
       // Clicks inside the browser 3D view act on the world (left=dig, right=place, middle=open)
-      if (bot.viewer && typeof bot.viewer.on === 'function') {
-        bot.viewer.on('blockClicked', (block, face, button) => handleViewerClick(id, block, face, button))
-      }
+      bindViewerClicks(id)
       hint(id, 'Movement: /walk <x> <y> <z> [range] · /walk stop · /look <yaw> <pitch> · /lookat <x> <y> <z> · /hotbar <1-9>')
       hint(id, 'Actions: /dig · /place · /use · /attack — Windows: /window-open · /window · /window-click <slot> [l|r] · /move <src> <dst> · /window-close')
     }
@@ -130,14 +147,19 @@ module.exports = function createManualControls (deps) {
   function stopManualMode (id) {
     const entry = bots[id]
     if (!entry) return
+    const wasManual = entry.manualMode
     entry.suppressNextWindowClick = false
     if (entry.manualWindow) {
       try { if (entry.bot?.currentWindow === entry.manualWindow) entry.bot.closeWindow(entry.manualWindow) } catch (_) {}
       entry.manualWindow = null
     }
-    if (entry.manualMode) {
-      entry.manualMode = false
-      try { entry.bot?.clearControlStates() } catch (_) {}
+    entry.manualMode = false
+    entry.manualViewerClicksBound = false
+    // /manual-stop must also cancel a /walk pathfinder goal, not just release
+    // the direct control states.
+    try { entry.bot?.pathfinder?.stop?.() } catch (_) {}
+    try { entry.bot?.clearControlStates() } catch (_) {}
+    if (wasManual) {
       i(id, 'Manual interact OFF — automatic behavior restored.')
     }
     stopManualViewer(id)
