@@ -100,10 +100,13 @@ check logs before retrying to avoid accidentally executing a command twice.
   the same port — re-open the 🌍 viewer tab if it was already open.
 - `/pos` — show the active bot's location: X/Y/Z, facing yaw/pitch in degrees,
   and dimension.
-- **GUI TUI names** — when an item has a server/anvil-set custom name (e.g. a
-  netherite chestplate renamed "Fatal Chestplate"), the dashboard GUI TUI and
-  `/window` listing show the custom name as the primary name with the registry
-  name (`netherite_chestplate`) underneath, so renamed items are identifiable.
+- **Item names** — Minecraft items carry two names: the registry/base name
+  (e.g. `netherite_chestplate` / "Netherite Chestplate") and an optional custom
+  name set through an anvil or similar (e.g. a chestplate renamed "Fatal
+  Chestplate"). The dashboard GUI TUI, the `/window` listing, and `/inv` all
+  show the custom name as the primary name with the alternative name (the
+  registry key, e.g. `netherite_chestplate`) underneath, so renamed items are
+  identifiable and nothing silently keeps its base name.
 - **Auto-close** — if a manual GUI session is still open after
   `MANUAL_GUI_TIMEOUT_MS` (default 20 minutes), the window is closed
   automatically and automatic GUI handling (slot-scan/click, fatal-crate

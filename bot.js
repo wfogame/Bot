@@ -305,6 +305,55 @@ parts.push(`${s % 60}s`)
 return parts.join(' ')
 }
 
+// ── Item name helpers ────────────────────────────────────────────────────────
+// Minecraft items carry two names: the registry/base name (e.g. "netherite_sword"
+// or "Netherite Sword") and an optional custom name set by the player through an
+// anvil or similar. Custom names are preferred for display, with the base name
+// shown as the alternative so renamed items stay identifiable.
+function textParts (node, out) {
+if (node == null) return out
+if (typeof node === 'string') { out.push(node); return out }
+if (typeof node === 'object') {
+if (typeof node.text === 'string') out.push(node.text)
+if (Array.isArray(node.extra)) node.extra.forEach(n => textParts(n, out))
+}
+return out
+}
+function itemCustomName (item) {
+if (!item) return null
+let raw = null
+try { raw = item.customName } catch (_) {}
+if (raw == null) return null
+let text = null
+if (typeof raw === 'string') {
+try {
+const parts = textParts(JSON.parse(raw), [])
+if (parts.length) text = parts.join('')
+} catch (_) { /* plain string name */ }
+if (!text) text = raw
+} else if (typeof raw === 'object') {
+const parts = textParts(raw, [])
+if (parts.length) text = parts.join('')
+}
+if (!text) return null
+const out = String(text).replace(/\u00a7./g, '').trim()
+return out || null
+}
+function itemDisplayName (item) {
+return itemCustomName(item) || (item && (item.displayName || item.name)) || null
+}
+// The "other" name when an item has two: prefer the registry key (netherite_sword)
+// over the display name, skipping anything identical to what is already shown.
+function itemAltName (item, shown) {
+if (!item) return null
+const candidates = [item.name, item.displayName].filter(Boolean)
+const base = String(shown || '').toLowerCase()
+for (const c of candidates) {
+if (String(c).toLowerCase() !== base) return String(c)
+}
+return null
+}
+
 // ── Multi-bot state + UI-agnostic log bus ────────────────────────────────────
 // logFor() stores the line once; every active interface (TUI, web, plain console)
 // subscribes and renders it in its own format. No interface owns the log pipeline.
@@ -1847,7 +1896,9 @@ const title = window.title?.toString ? window.title.toString() : String(window.t
 
 const getSafeItemString = (item) => {
 if (!item) return 'null';
-return `[Item ${item.displayName || item.name} x${item.count || 1}]`;
+const shown = itemDisplayName(item) || item.name || 'item';
+const alt = itemAltName(item, shown);
+return `[Item ${shown}${alt ? ` (${alt})` : ''} x${item.count || 1}]`;
 };
 
 // Full slot dumps are opt-in (WINDOW_DEBUG=true) — they were the single
@@ -2256,7 +2307,12 @@ if (items.length === 0) {
 logFor(id, `{cyan-fg}› Inventory is empty.{/cyan-fg}`)
 } else {
 logFor(id, `{cyan-fg}› Inventory for ${id}:{/cyan-fg}`)
-items.forEach(item => logFor(id, ` ${item.count}x ${sanitize(item.displayName || item.name)} (slot ${item.slot})`))
+items.forEach(item => {
+const shown = itemDisplayName(item) || item.name || 'item'
+logFor(id, ` ${item.count}x ${sanitize(shown)} (slot ${item.slot})`)
+const alt = itemAltName(item, shown)
+if (alt) logFor(id, `    ↳ ${sanitize(alt)}`)
+})
 }
 return true
 }
