@@ -98,18 +98,22 @@ return null
 const SHARDSHOP_COMMAND = process.env.SHARDSHOP_COMMAND || '/shardshop' // ⚠ verify this matches your server's actual shardshop command
 
 // ── /overview rank detection ─────────────────────────────────────────────
-// /fix is rank-gated on this server: an ERROR / "no access" reply means the
-// bot is a Member; otherwise /rank names the real rank (e.g. Regent). The two
-// commands are spaced RANK_COOLDOWN_MS apart so the server cooldown is safe.
+// /fix is rank-gated: ONLY an access-denied reply proves the bot is a Member
+// (e.g. "You do not have access to the command"). Generic errors like "Error:
+// This item cannot be repaired" happen for valid ranks too, so they do NOT
+// count — the probe moves on to /rank. A "you are on cool down" reply means
+// the probe itself was rate-limited, so the rank shows N/A and /rank is
+// skipped. The two commands are spaced RANK_COOLDOWN_MS apart (default 4.5s =
+// 3× the server's /fix cooldown) so the server never sees them as "too fast".
 const RANK_FIX_COMMAND = process.env.RANK_FIX_COMMAND || '/fix'
 const RANK_COMMAND = process.env.RANK_COMMAND || '/rank'
-const RANK_COOLDOWN_MS = (() => { const n = parseInt(process.env.RANK_COOLDOWN_MS, 10); return Number.isFinite(n) && n >= 0 ? n : 1500 })()
+const RANK_COOLDOWN_MS = (() => { const n = parseInt(process.env.RANK_COOLDOWN_MS, 10); return Number.isFinite(n) && n >= 0 ? n : 4500 })()
 const RANK_REPLY_TIMEOUT_MS = 2500
-const RANK_ERROR_PATTERNS = [
-  /\berror\b/i,
+const RANK_MEMBER_PATTERNS = [
   /you do not have access(?: to the command)?/i,
   /\bno permission\b/i
 ]
+const RANK_COOLDOWN_PATTERN = /you are on cool ?down/i
 const CRATES_ALL_STAGGER_MS = parseInt(process.env.CRATES_ALL_STAGGER_MS || '30000', 10)
 const CRATES_ALL_SHARDSHOP_WAIT_MS = parseInt(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS || '4000', 10)
 const CRATES_ALL_STEP_WAIT_MS = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS || '3000', 10)
@@ -695,6 +699,18 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .mkey.held,.hkey.on{color:#04211d;background:var(--acc);border-color:var(--acc)}
 .action-keys,.hotbar-keys{display:flex;gap:4px;flex-wrap:wrap}
 .hkey{min-width:29px;height:29px;padding:0 6px}
+#guitui{flex:none;max-height:42vh;overflow:auto;margin:0 12px 12px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;box-shadow:0 -6px 18px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:8px}
+#guitui[hidden]{display:none}
+#guitui .ghead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#guitui .gtitle{color:var(--acc);font-weight:700;font-size:12px;letter-spacing:.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#guitui .gsub{color:var(--dim);font-size:10px;margin-right:auto}
+#guitui .gslots{display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:4px}
+.gslot{position:relative;border:1px solid var(--line);background:var(--bg);border-radius:6px;min-height:36px;padding:3px 5px;font:inherit;font-size:10px;line-height:1.3;color:var(--txt);cursor:pointer;overflow:hidden;user-select:none;text-align:left;display:flex;flex-direction:column;gap:1px}
+.gslot .gsidx{color:var(--dim);font-size:9px}
+.gslot .gsitem{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gslot:hover:not(.empty){border-color:var(--acc);background:rgba(45,212,191,.06)}
+.gslot.empty{color:#2b3542;cursor:default}
+.gslot.empty:hover{border-color:var(--line)}
 .prompt{color:var(--grn);font-weight:700}
 #cmd{display:block;flex:1 1 auto;min-width:0;height:32px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 10px;color:var(--txt);font:inherit}
 #cmd:focus{outline:none;border-color:var(--acc)}
@@ -728,6 +744,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
 <button class="tb" id="clearbtn">clear</button><button class="tb" id="helpbtn">? cmds</button></div>
 <div id="logwrap"><div id="log"></div></div>
+<div id="guitui" hidden></div>
 <div id="manualbar" aria-label="Manual bot controls">
 <div class="manual-group"><span class="manual-label">move</span><div class="move-pad">
 <button class="mkey" type="button" data-control="forward" title="Forward">W</button>
@@ -848,6 +865,7 @@ for(i=0;i<cards.length;i++)cards[i].classList.toggle('sel',cards[i].getAttribute
 if(subscribe!==false&&ws&&ws.readyState===1)ws.send(JSON.stringify({t:'sub',id:v}))
 else if(pollTimer)startHttpFallback()
 updateManualBar()
+updateGuiTui()
 setFollow(true)}
 function scrollBottom(){var w=el('logwrap');w.scrollTop=w.scrollHeight;pending=0;el('newchip').style.display='none'}
 function setFollow(f){follow=f;el('followbtn').textContent=f?'⏸ pause':'▶ follow';if(f)scrollBottom()}
@@ -881,7 +899,29 @@ var d=document.createElement('div');d.className='ln';d.innerHTML=l.pre+l.h;frag.
 L.appendChild(frag);if(follow)scrollBottom()}
 el('search').addEventListener('input',function(){if(rt)clearTimeout(rt);rt=setTimeout(rebuild,160)})
 function selectedBotState(){return botStates[view]||null}
-function manualSelected(){var b=selectedBotState();return !!(b&&b.manual)}
+function manualSelected(){var b=selectedBotState();return !!(b&&b.manual&&b.manual.mode)}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function guiTuiState(){var b=selectedBotState();if(!b||!b.manual||!b.manual.guiTui||!b.manual.window)return null;return b.manual.window}
+function updateGuiTui(){var panel=el('guitui');if(!panel)return
+var win=guiTuiState()
+if(!win){panel.hidden=true;el('manualbar').style.bottom='';return}
+panel.hidden=false
+var html='<div class="ghead"><span class="gtitle">╔═ '+esc((win.title||'window').toUpperCase())+' ═╗</span><span class="gsub">'+win.slots.length+' slots · click = left · right-click = right</span>'
+html+='<button class="tb" type="button" data-g="close">✕ close</button><button class="tb" type="button" data-g="hide">hide</button></div>'
+html+='<div class="gslots">'
+for(var gi=0;gi<win.slots.length;gi++){var gs=win.slots[gi]||{slot:gi,label:'slot '+gi,item:null}
+var gname=gs.item||''
+html+='<button class="gslot'+(gname?'':' empty')+'" type="button" data-slot="'+gs.slot+'" title="'+esc(gs.slot+' '+gs.label+(gname?' · '+gname:''))+'">'
+html+='<span class="gsidx">'+gs.slot+'</span><span class="gsitem">'+(gname?esc(gname):'·')+'</span></button>'}
+html+='</div>'
+panel.innerHTML=html
+var gslots=panel.querySelectorAll('.gslot:not(.empty)')
+for(var gi2=0;gi2<gslots.length;gi2++){(function(cell){var slot=cell.getAttribute('data-slot')
+cell.addEventListener('click',function(){sendCmd('/window-click '+slot+' l')})
+cell.addEventListener('contextmenu',function(e){e.preventDefault();sendCmd('/window-click '+slot+' r')})})(gslots[gi2])}
+var gbtns=panel.querySelectorAll('[data-g]')
+for(var gj=0;gj<gbtns.length;gj++){(function(btn){btn.addEventListener('click',function(){btn.getAttribute('data-g')==='close'?sendCmd('/window-close'):sendCmd('/gui-tui')})})(gbtns[gj])}
+el('manualbar').style.bottom=(56+panel.offsetHeight)+'px'}
 function updateManualBar(){var bar=el('manualbar');if(!bar)return;bar.classList.toggle('on',manualSelected())}
 function sendManualKey(control,state){
 if(!manualSelected())return
@@ -964,9 +1004,10 @@ var d=document.createElement('div')
 d.className='bot'+(b.online?' on':'')+(b.id===view?' sel':'')
 d.setAttribute('data-id',b.id)
 var up=b.uptimeSec==null?'':fmtUp(b.uptimeSec)
-var manualHtml=b.manual?'<span class="manual-badge">manual</span>':''
+var manualHtml=b.manual&&b.manual.mode?'<span class="manual-badge">manual</span>':''
+var guiHtml=b.manual&&b.manual.guiTui?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">gui</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
-d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+manualHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
+d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
 +'<canvas width="220" height="16"></canvas>'
 d.querySelector('.bname').textContent=b.id
@@ -976,7 +1017,8 @@ var viewerButton=d.querySelector('.manual-viewer')
 if(viewerButton)viewerButton.onclick=(function(port){return function(e){e.preventDefault();e.stopPropagation();window.open('http://'+location.hostname+':'+port+'/','_blank','noopener')}})(b.manual.viewerHostPort||b.manual.viewerPort)
 box.appendChild(d)
 drawSpark(d.querySelector('canvas'),b.pingHist||[])}
-updateManualBar()}
+updateManualBar()
+updateGuiTui()}
 function drawSpark(cv,h){var ctx=cv.getContext('2d');ctx.clearRect(0,0,cv.width,cv.height)
 if(!h||h.length<2)return
 var mx=0;for(var i=0;i<h.length;i++)mx=Math.max(mx,h[i]);if(mx<=0)mx=1
@@ -1525,6 +1567,7 @@ pingHist: [], // web GUI sparkline
 manualMode: false, // manual interact mode (bot-manual.js)
 manualViewer: null, // { port } when the 3D viewer is live
 manualWindow: null, // window tracked for manual /window-* commands
+guiTui: false, // dashboard ASCII GUI TUI toggle (/gui-tui)
 suppressNextWindowClick: false, // suppress auto slot-click for the next windowOpen
 suppressWindowTimer: null, // clears the above when no window opens within 5s
 }
@@ -2040,6 +2083,7 @@ const COMMANDS = {
 '/drop [count]': 'Drop the held stack (all of it, or [count] items from it)',
 '/pickup [all]': 'Walk to the nearest dropped item and collect it; /pickup all sweeps everything within reach',
 '/gui <cmd>': 'Send a server command (e.g. /gui /shardshop) and treat the GUI it opens as manual — no auto scan/click or warp',
+'/gui-tui': 'Toggle the ASCII GUI overlay on the dashboard for the open window (click a slot to interact, right-click for right button)',
 '/walk <x> <y> <z> [range]': 'Pathfind near coordinates (range defaults to 1, capped at 16); /walk stop cancels',
 '/look <yaw> <pitch>': 'Turn the bot using yaw/pitch in degrees',
 '/lookat <x> <y> <z>': 'Turn the bot toward world coordinates',
@@ -2685,10 +2729,10 @@ try { bot.chat(command) } catch (_) { finish(null) }
 }
 
 // ── /overview rank detection ──────────────────────────────────────────────
-// /fix is rank-gated: if its reply errors or says there's no access, the bot
-// is a Member. Otherwise /rank names the real rank (e.g. Regent). Commands are
-// spaced RANK_COOLDOWN_MS (default 1.5s) apart to stay under the cooldown.
-function listenForRankReply (bot, command, ms, isErrorLine) {
+// /fix is rank-gated: only an access-denied reply means Member; generic errors
+// ("This item cannot be repaired") still happen for valid ranks. Cooldown
+// replies mean N/A. Commands are spaced RANK_COOLDOWN_MS (default 4.5s) apart.
+function listenForRankReply (bot, command, ms, classify) {
   return new Promise((resolve) => {
     const lines = []
     let done = false
@@ -2703,15 +2747,18 @@ function listenForRankReply (bot, command, ms, isErrorLine) {
     const onMessage = (jsonMsg) => {
       try {
         const text = jsonMsg.toString()
-        if (isErrorLine && isErrorLine(text)) { finish({ lines, member: true }); return }
+        if (classify) {
+          const verdict = classify(text)
+          if (verdict) { finish({ lines, verdict }); return }
+        }
         lines.push(text)
       } catch (_) {}
     }
-    const onEnd = () => finish({ lines, member: false })
-    const timer = setTimeout(() => finish({ lines, member: false }), ms)
+    const onEnd = () => finish({ lines, verdict: null })
+    const timer = setTimeout(() => finish({ lines, verdict: null }), ms)
     bot.on('message', onMessage)
     bot.on('end', onEnd)
-    try { bot.chat(command) } catch (_) { finish({ lines, member: false }) }
+    try { bot.chat(command) } catch (_) { finish({ lines, verdict: null }) }
   })
 }
 
@@ -2738,17 +2785,27 @@ async function queryRank (id) {
   const entry = bots[id]
   if (!entry?.bot?.entity) return null
   const bot = entry.bot
-  const isErrorLine = (text) => RANK_ERROR_PATTERNS.some(re => re.test(text))
+  const classifyFix = (text) => {
+    if (RANK_COOLDOWN_PATTERN.test(text)) return 'cooldown'
+    if (RANK_MEMBER_PATTERNS.some(re => re.test(text))) return 'member'
+    return null
+  }
 
-  // 1. /fix — the Member gate; short-circuits the moment an error shows up.
-  const fix = await listenForRankReply(bot, RANK_FIX_COMMAND, RANK_REPLY_TIMEOUT_MS, isErrorLine)
-  if (fix.member) return 'Member'
+  // 1. /fix — access denied ⇒ Member; rate-limited ⇒ N/A (skip /rank). Any
+  // other reply (including generic errors like "cannot be repaired") means the
+  // bot CAN use /fix, so keep going and let /rank name the rank.
+  const fix = await listenForRankReply(bot, RANK_FIX_COMMAND, RANK_REPLY_TIMEOUT_MS, classifyFix)
+  if (fix.verdict === 'member') return 'Member'
+  if (fix.verdict === 'cooldown') return 'N/A'
   if (!bot.entity) return null
 
   // 2. Not a Member — wait out the cooldown, then /rank for the real name.
   await new Promise(resolve => setTimeout(resolve, RANK_COOLDOWN_MS))
   if (!bot.entity) return null
-  const rank = await listenForRankReply(bot, RANK_COMMAND, RANK_REPLY_TIMEOUT_MS, isErrorLine)
+  const rank = await listenForRankReply(bot, RANK_COMMAND, RANK_REPLY_TIMEOUT_MS, (text) =>
+    RANK_COOLDOWN_PATTERN.test(text) ? 'cooldown' : null
+  )
+  if (rank.verdict === 'cooldown') return 'N/A'
   return parseRankReply(rank.lines)
 }
 
@@ -2838,7 +2895,7 @@ queryBalance(name, 'Coins', '/coins'),
 queryBalance(name, 'Balance', '/bal')
 ]).then(([shards, coins, money]) =>
 // Rank detection runs after the balances settle so its /fix + /rank land
-// RANK_COOLDOWN_MS (1.5s) apart — safe from the server's command cooldown.
+// RANK_COOLDOWN_MS (4.5s) apart — safe from the server's command cooldown.
 queryRank(name).then(rank => ({ name, shards, coins, money, rank }))
 )
 })).then(results => {

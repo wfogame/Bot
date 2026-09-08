@@ -83,6 +83,28 @@ check logs before retrying to avoid accidentally executing a command twice.
   messages are unaffected, and the suppression expires after 5 seconds if no
   window opens. Crate/shardshop routines clear it defensively at startup so a
   stale arm can never swallow a routine's window.
+- `/gui-tui` — with a window open, toggles the dashboard's ASCII GUI overlay
+  (a clickable slot grid that shrinks the log view). Left-click a slot for a
+  left click, right-click for a right click; `✕ close` closes the window and
+  `hide` dismisses the panel. The panel refreshes automatically as the server
+  updates slots.
+
+## `/overview` rank detection
+
+`/overview` detects each bot's rank with a two-step probe:
+
+1. `/fix` — only an access-denied reply (`You do not have access to the
+   command`, `no permission`) means the bot is a **Member**. Generic errors
+   such as `Error: This item cannot be repaired` do NOT count — the bot can
+   still be a valid rank, so the probe continues.
+2. `/rank` — otherwise, after the cooldown, names the actual rank (e.g.
+   **Regent**).
+
+A `you are on cool down` reply (case-insensitive) shows **N/A** and skips the
+`/rank` step. Commands are spaced `RANK_COOLDOWN_MS` apart (default 4500ms —
+3× the server's `/fix` cooldown) so the server never sees them as too fast.
+Override the commands and spacing with `RANK_FIX_COMMAND`, `RANK_COMMAND`, and
+`RANK_COOLDOWN_MS`.
 
 ## Tests
 
