@@ -689,8 +689,15 @@ module.exports = function createManualControls (deps) {
         endGuiSession(entry)
         if (!bot.currentWindow) { i(activeId, 'No extra window open — manual GUI session ended, automatic GUI handling restored.'); notifyBotsChanged(); return true }
         const win = bot.currentWindow
-        bot.closeWindow(win).then(() => { okMsg(activeId, `Closed "${windowTitle(win)}" — automatic GUI handling restored.`); notifyBotsChanged() })
-          .catch(err => fail(activeId, `Close failed: ${sanitize(err.message)}`))
+        // mineflayer's closeWindow() is synchronous (writes close_window and
+        // emits 'windowClose') and returns nothing — never chain a promise.
+        try {
+          bot.closeWindow(win)
+          okMsg(activeId, `Closed "${windowTitle(win)}" — automatic GUI handling restored.`)
+          notifyBotsChanged()
+        } catch (err) {
+          fail(activeId, `Close failed: ${sanitize(err.message)}`)
+        }
         return true
       }
       case '/window-click': {

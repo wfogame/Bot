@@ -3147,7 +3147,15 @@ return
 // After the crate/shardshop parsing above but before the local-command switch
 // and the raw Minecraft chat fallback, so /walk, /window-*, /key etc. never
 // leak to the server as chat.
-if (manual.routeCommand(trimmed, activeId)) return
+// Guard so a bug inside the manual router can never take down the command
+// channel — an uncaught throw here would propagate into the WebSocket handler
+// and make the UI stop accepting commands.
+try {
+  if (manual.routeCommand(trimmed, activeId)) return
+} catch (err) {
+  logError('Manual command failed: ' + sanitize((err && err.message) || String(err)))
+  return
+}
 
 // ── Single-bot local commands ───────────────
 if (activeId && LOCAL_COMMANDS.includes(trimmed)) {
