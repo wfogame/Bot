@@ -76,6 +76,17 @@ module.exports = function createManualControls (deps) {
     return out || null
   }
   const itemDisplayName = item => itemCustomName(item) || (item && (item.displayName || item.name)) || null
+  // The "other" name when an item carries two (anvil custom name vs base item):
+  // prefer the registry key (netherite_sword), skip anything identical to shown.
+  const itemAltName = (item, shown) => {
+    if (!item) return null
+    const candidates = [item.name, item.displayName].filter(Boolean)
+    const base = String(shown || '').toLowerCase()
+    for (const c of candidates) {
+      if (String(c).toLowerCase() !== base) return String(c)
+    }
+    return null
+  }
   const itemLabel = item => item ? `${item.count}x ${itemDisplayName(item) || 'item'}` : 'item'
 
   // ── 3D viewer (prismarine-viewer web client) ────────────────────────────────
@@ -426,6 +437,8 @@ module.exports = function createManualControls (deps) {
     win.slots.forEach((item, idx) => {
       if (!item) return
       logFor(id, ` ${label(idx)} (slot ${idx}): ${sanitize(itemLabel(item))}`)
+      const alt = itemAltName(item, itemDisplayName(item))
+      if (alt) hint(id, `↳ ${sanitize(alt)}`)
       printed++
     })
     if (!printed) i(id, '(empty)')
@@ -947,8 +960,7 @@ module.exports = function createManualControls (deps) {
       // Alternative/internal registry name (displayName "Diamond Sword" vs name
       // "diamond_sword", or a custom name vs its base item) — shown on its own
       // line in the dashboard GUI TUI when it differs from what is displayed.
-      const alt = item && item.name && String(item.name).toLowerCase() !== String(shown || '').toLowerCase()
-        ? String(item.name) : null
+      const alt = itemAltName(item, shown)
       slots.push({
         slot: idx,
         label: label(idx),

@@ -155,3 +155,28 @@ test('bare broadcasts give usage; normal /all stays immediate', () => {
   r.run(`handleCommand('/all hello')`)
   assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['B', 'hello'], ['C', 'hello']])
 })
+
+test('item name helpers prefer anvil custom names and expose the alternative name', () => {
+  const r = runtime()
+  const out = r.run(`(() => {
+    const named = { name: 'netherite_sword', displayName: 'Netherite Sword', customName: '{"text":"Sword"}' }
+    const componentName = { name: 'diamond_pickaxe', displayName: 'Diamond Pickaxe', customName: { text: 'My Pick', extra: ['!'] } }
+    const plainName = { name: 'diamond_sword', displayName: 'Diamond Sword', customName: 'Sword' }
+    const unrenamed = { name: 'netherite_sword', displayName: 'Netherite Sword', customName: null }
+    const noCustom = { name: 'diamond', displayName: 'Diamond' }
+    return [
+      itemDisplayName(named), itemAltName(named, itemDisplayName(named)),
+      itemDisplayName(componentName), itemAltName(componentName, itemDisplayName(componentName)),
+      itemDisplayName(plainName), itemAltName(plainName, itemDisplayName(plainName)),
+      itemDisplayName(unrenamed), itemAltName(unrenamed, itemDisplayName(unrenamed)),
+      itemDisplayName(noCustom), itemAltName(noCustom, itemDisplayName(noCustom))
+    ]
+  })()`)
+  assert.deepEqual(plain(out), [
+    'Sword', 'netherite_sword',
+    'My Pick!', 'diamond_pickaxe',
+    'Sword', 'diamond_sword',
+    'Netherite Sword', 'netherite_sword',
+    'Diamond', null
+  ])
+})
