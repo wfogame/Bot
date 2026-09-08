@@ -290,6 +290,19 @@ let markBotsDirtyFn = null
 let webClearFn = null
 const slowBroadcast = createSlowBroadcast()
 
+// ── Manual interact mode (prismarine-viewer 3D + hand-driven controls) ───────
+// /manual-interact turns one bot into a slow, hand-driven avatar: browser 3D
+// view, hold-to-move pad, raw window/slot control — while suppressing this
+// file's automatic windowOpen click-slot + AFK-warp logic for that bot.
+const createManualControls = require('./bot-manual')
+function loadViewerFactory() {
+try {
+const pv = require('prismarine-viewer')
+return typeof pv.mineflayer === 'function' ? pv.mineflayer : (typeof pv === 'function' ? pv : null)
+} catch (_) { return null }
+}
+const manual = createManualControls({ bots, logFor, sanitize, notifyBotsChanged, SYSTEM_ID, WEB_BIND, loadViewerFactory })
+
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
 

@@ -13,6 +13,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "canvas": "^3.2.3",
     "dotenv": "^17.4.2",
     "minecraft-data": "^3.113.1",
     "minecraft-protocol": "^1.66.2",
@@ -22,6 +23,7 @@
     "neo-blessed": "^0.2.0",
     "patch-package": "^8.0.1",
     "prismarine-chunk": "^1.41.0",
+    "prismarine-viewer": "^1.33.0",
     "socks": "^2.8.9",
     "ssh2": "^1.16.0",
     "ws": "^8.21.3"
