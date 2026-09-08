@@ -164,12 +164,20 @@ test('item name helpers prefer anvil custom names and expose the alternative nam
     const plainName = { name: 'diamond_sword', displayName: 'Diamond Sword', customName: 'Sword' }
     const unrenamed = { name: 'netherite_sword', displayName: 'Netherite Sword', customName: null }
     const noCustom = { name: 'diamond', displayName: 'Diamond' }
+    // 1.20.5+ sends custom_name as an NBT compound text component; prismarine-item
+    // surfaces it through item.customName in this exact shape.
+    const nbtCompound = { name: 'netherite_sword', displayName: 'Netherite Sword', customName: { type: 'compound', name: '', value: { text: { type: 'string', value: 'Sword' }, italic: { type: 'byte', value: 0 } } } }
+    const nbtString = { name: 'diamond_sword', displayName: 'Diamond Sword', customName: { type: 'string', value: '{"text":"Blade"}' } }
+    const legacyNbt = { name: 'netherite_sword', displayName: 'Netherite Sword', customName: null, nbt: { type: 'compound', value: { display: { type: 'compound', value: { Name: { type: 'string', value: '{"text":"Legacy"}' } } } } } }
     return [
       itemDisplayName(named), itemAltName(named, itemDisplayName(named)),
       itemDisplayName(componentName), itemAltName(componentName, itemDisplayName(componentName)),
       itemDisplayName(plainName), itemAltName(plainName, itemDisplayName(plainName)),
       itemDisplayName(unrenamed), itemAltName(unrenamed, itemDisplayName(unrenamed)),
-      itemDisplayName(noCustom), itemAltName(noCustom, itemDisplayName(noCustom))
+      itemDisplayName(noCustom), itemAltName(noCustom, itemDisplayName(noCustom)),
+      itemDisplayName(nbtCompound), itemAltName(nbtCompound, itemDisplayName(nbtCompound)),
+      itemDisplayName(nbtString), itemAltName(nbtString, itemDisplayName(nbtString)),
+      itemDisplayName(legacyNbt), itemAltName(legacyNbt, itemDisplayName(legacyNbt))
     ]
   })()`)
   assert.deepEqual(plain(out), [
@@ -177,6 +185,9 @@ test('item name helpers prefer anvil custom names and expose the alternative nam
     'My Pick!', 'diamond_pickaxe',
     'Sword', 'diamond_sword',
     'Netherite Sword', 'netherite_sword',
-    'Diamond', null
+    'Diamond', null,
+    'Sword', 'netherite_sword',
+    'Blade', 'diamond_sword',
+    'Legacy', 'netherite_sword'
   ])
 })

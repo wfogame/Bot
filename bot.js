@@ -310,12 +310,36 @@ return parts.join(' ')
 // or "Netherite Sword") and an optional custom name set by the player through an
 // anvil or similar. Custom names are preferred for display, with the base name
 // shown as the alternative so renamed items stay identifiable.
+// Flatten any text-component shape into plain text. Handles: plain strings,
+// JSON text components ({text, extra, …}), NBT tags ({type, value} — 1.20.5+
+// components arrive as prismarine-nbt), NBT compounds (custom_name's data is a
+// compound like {type:'compound', value:{text:{type:'string', value:'Sword'}}}),
+// and arrays (extra lists).
 function textParts (node, out) {
 if (node == null) return out
-if (typeof node === 'string') { out.push(node); return out }
+if (typeof node === 'string') {
+try {
+const parsed = JSON.parse(node)
+if (typeof parsed === 'string') { out.push(parsed); return out }
+return textParts(parsed, out)
+} catch (_) { out.push(node); return out }
+}
+if (typeof node === 'number' || typeof node === 'boolean') { out.push(String(node)); return out }
+if (Array.isArray(node)) { node.forEach(n => textParts(n, out)); return out }
 if (typeof node === 'object') {
-if (typeof node.text === 'string') out.push(node.text)
-if (Array.isArray(node.extra)) node.extra.forEach(n => textParts(n, out))
+// NBT tag wrapper: { type: 'string'|'compound'|'list'|…, value: … }
+if (typeof node.type === 'string' && Object.prototype.hasOwnProperty.call(node, 'value')) {
+if (node.type === 'string') {
+const rawStr = String(node.value)
+try { return textParts(JSON.parse(rawStr), out) } catch (_) { out.push(rawStr); return out }
+}
+return textParts(node.value, out)
+}
+// Plain JSON text component (or NBT compound's inner object)
+if (node.text !== undefined) textParts(node.text, out)
+if (node.extra !== undefined) textParts(node.extra, out)
+if (node.with !== undefined) textParts(node.with, out)
+if (node.translate !== undefined && out.length === 0 && node.fallback !== undefined) textParts(node.fallback, out)
 }
 return out
 }
@@ -323,18 +347,17 @@ function itemCustomName (item) {
 if (!item) return null
 let raw = null
 try { raw = item.customName } catch (_) {}
-if (raw == null) return null
-let text = null
-if (typeof raw === 'string') {
+if (raw == null && item.nbt) {
+// Belt-and-braces: if the getter surfaced nothing (older item instances,
+// items built by hand), read legacy NBT display.Name directly.
 try {
-const parts = textParts(JSON.parse(raw), [])
-if (parts.length) text = parts.join('')
-} catch (_) { /* plain string name */ }
-if (!text) text = raw
-} else if (typeof raw === 'object') {
-const parts = textParts(raw, [])
-if (parts.length) text = parts.join('')
+raw = item.nbt.value?.display?.value?.Name?.value ?? null
+} catch (_) { raw = null }
 }
+if (raw == null) return null
+const parts = []
+textParts(raw, parts)
+const text = parts.length ? parts.join('') : null
 if (!text) return null
 const out = String(text).replace(/\u00a7./g, '').trim()
 return out || null
