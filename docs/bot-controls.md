@@ -75,35 +75,48 @@ check logs before retrying to avoid accidentally executing a command twice.
   16 blocks, capped at `MANUAL_PICKUP_MAX_ITEMS`). Item collection is passive in
   Minecraft, so the bot walks onto the item and waits for it to vanish.
 - `/gui <server command>` — send a server command (e.g. `/gui /shardshop`) and
-  treat the window it opens as a manual window: the automatic slot-scan/click
-  and the delayed AFK warp are suppressed, and `/window` / `/window-click` /
-  `/move` / `/window-close` take over.
+  treat the window it opens as a **manual window session**: the automatic
+  slot-scan/click and the delayed AFK warp are suppressed, and `/window` /
+  `/window-click` / `/move` / `/window-close` take over. The session stays
+  manual for as long as the window is open — even when the server closes and
+  re-opens the GUI on click (which shop GUIs do) the auto-click and fatal-crate
+  search stay off, and this holds whether or not `/gui-tui` was toggled. The
+  session ends on `/window-close`, `/manual-stop`, or the auto-close below.
 - `/chat /<command>` — the same suppression is armed for `/`-prefixed server
   commands sent through `/chat` (e.g. `/chat /shardshop`). Plain `/chat`
   messages are unaffected, and the suppression expires after 5 seconds if no
   window opens. Crate/shardshop routines clear it defensively at startup so a
   stale arm can never swallow a routine's window.
+- **Auto-close** — if a manual GUI session is still open after
+  `MANUAL_GUI_TIMEOUT_MS` (default 20 minutes), the window is closed
+  automatically and automatic GUI handling (slot-scan/click, fatal-crate
+  search, AFK warp) is restored.
 - `/gui-tui` — with a window open, toggles the dashboard's ASCII GUI overlay
   (a clickable slot grid that shrinks the log view). Left-click a slot for a
   left click, right-click for a right click; `✕ close` closes the window and
-  `hide` dismisses the panel. The panel refreshes automatically as the server
-  updates slots.
+  `hide` dismisses the panel. Each slot shows both the display name and the
+  internal (alternative) name. The panel refreshes automatically: server slot
+  updates push live, clicks sent from the panel update the window, and if the
+  server closes/reopens the GUI on click the session is re-tracked so the
+  panel keeps following it.
 
 ## `/overview` rank detection
 
-`/overview` detects each bot's rank with a two-step probe:
+`/overview` detects each bot's rank with a single `/fix` probe (no `/rank`):
 
-1. `/fix` — only an access-denied reply (`You do not have access to the
-   command`, `no permission`) means the bot is a **Member**. Generic errors
-   such as `Error: This item cannot be repaired` do NOT count — the bot can
-   still be a valid rank, so the probe continues.
-2. `/rank` — otherwise, after the cooldown, names the actual rank (e.g.
-   **Regent**).
+- An access-denied reply (`You do not have access to the command`,
+  `no permission`) means the bot is a **Member**.
+- A `you are on cool down` reply (case-insensitive) means the probe itself was
+  rate-limited, so the rank shows **N/A**.
+- Any other reply — including generic errors like
+  `Error: This item cannot be repaired` — means the bot passed the `/fix` rank
+  gate, so the rank is **Regent**.
 
-A `you are on cool down` reply (case-insensitive) shows **N/A** and skips the
-`/rank` step. Commands are spaced `RANK_COOLDOWN_MS` apart (default 4500ms —
-3× the server's `/fix` cooldown) so the server never sees them as too fast.
-Override the commands and spacing with `RANK_FIX_COMMAND`, `RANK_COMMAND`, and
+`RANK_COOLDOWN_MS` (default 4500ms — 3× the server's `/fix` cooldown) is
+waited *before* `/fix` fires, because the balance queries that precede it send
+several commands back-to-back and would otherwise trip the server cooldown
+(the old code only spaced `/fix` → `/rank`, so `/fix` still got rate-limited
+and showed N/A). Override the command and spacing with `RANK_FIX_COMMAND` and
 `RANK_COOLDOWN_MS`.
 
 ## Tests
