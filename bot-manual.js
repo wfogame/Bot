@@ -22,6 +22,7 @@ const VIEW_DISTANCE = envInt(process.env.MANUAL_VIEW_DISTANCE, 6) // viewer chun
 const PICKUP_RANGE = envFloat(process.env.MANUAL_PICKUP_RANGE, 16) // blocks scanned by /pickup
 const PICKUP_TIMEOUT_MS = envInt(process.env.MANUAL_PICKUP_TIMEOUT_MS, 10000) // max wait for item collection
 const PICKUP_MAX_ITEMS = envInt(process.env.MANUAL_PICKUP_MAX_ITEMS, 32) // /pickup all safety cap
+const GUI_SESSION_TIMEOUT_MS = envInt(process.env.MANUAL_GUI_TIMEOUT_MS, 20 * 60 * 1000) // auto-close a /gui window after 20 min of no /window-close
 
 function envInt (value, fallback) { const n = parseInt(value, 10); return Number.isFinite(n) ? n : fallback }
 function envFloat (value, fallback) { const n = parseFloat(value, 10); return Number.isFinite(n) ? n : fallback }
@@ -162,6 +163,7 @@ module.exports = function createManualControls (deps) {
       try { if (entry.bot?.currentWindow === entry.manualWindow) entry.bot.closeWindow(entry.manualWindow) } catch (_) {}
       entry.manualWindow = null
     }
+    endGuiSession(entry)
     entry.manualMode = false
     entry.manualViewerClicksBound = false
     // /manual-stop must also cancel a /walk pathfinder goal, not just release
@@ -189,6 +191,43 @@ module.exports = function createManualControls (deps) {
     if (entry.suppressWindowTimer.unref) entry.suppressWindowTimer.unref()
   }
 
+  // ── Manual GUI session lifecycle ───────────────────────────────────────────
+  // A window opened via /gui (or /chat server-command) stays "manual" for its
+  // whole session: even if the server closes and re-opens the GUI on click, the
+  // automatic slot-scan/click and the delayed AFK warp stay off until the user
+  // runs /window-close, stops manual mode, or the session times out (default
+  // 20 min) and the window is auto-closed, restoring automatic behavior. The
+  // session is tracked independently of /gui-tui so it holds even when the
+  // ASCII overlay was never toggled on.
+  function startGuiSessionTimer (entry, id) {
+    if (entry.guiSessionTimer) clearTimeout(entry.guiSessionTimer)
+    entry.guiSessionTimer = setTimeout(() => autoCloseGuiSession(id), GUI_SESSION_TIMEOUT_MS)
+    if (entry.guiSessionTimer.unref) entry.guiSessionTimer.unref()
+  }
+
+  function endGuiSession (entry) {
+    entry.manualSession = false
+    if (entry.guiSessionTimer) {
+      clearTimeout(entry.guiSessionTimer)
+      entry.guiSessionTimer = null
+    }
+  }
+
+  function autoCloseGuiSession (id) {
+    const entry = bots[id]
+    if (!entry) return
+    entry.guiSessionTimer = null
+    if (!entry.manualSession && !entry.manualWindow) return
+    entry.manualSession = false
+    const win = entry.manualWindow || entry.bot?.currentWindow
+    if (win && entry.bot?.currentWindow === win) {
+      try { entry.bot.closeWindow(win) } catch (_) {}
+    }
+    entry.manualWindow = null
+    i(id, `Manual GUI session timed out (${Math.round(GUI_SESSION_TIMEOUT_MS / 60000)} min) — window closed, automatic GUI handling restored.`)
+    notifyBotsChanged()
+  }
+
   // ── Window tracking (auto-click suppression hooks for bot.js) ───────────────
   // Track a manually-opened window and keep the dashboard GUI TUI fresh as the
   // server updates slots (shop stock, moved items, etc.).
@@ -214,11 +253,29 @@ module.exports = function createManualControls (deps) {
         entry.suppressWindowTimer = null
       }
       trackManualWindow(entry, window)
+      // The manual session stays active for this whole GUI — even if the
+      // server closes and re-opens the window on click — until /window-close,
+      // /manual-stop, or the session timeout auto-close.
+      entry.manualSession = true
+      startGuiSessionTimer(entry, id)
       i(id, `Window "${windowTitle(window)}" opened manually (${window.slots.length} slots) — auto-click suppressed. /window to inspect · /window-close when done.`)
+      return true
+    }
+    // A manual GUI session is already open (/gui, /chat, /window-open, or
+    // manual mode). Some shop GUIs close and reopen the window when you click —
+    // re-track the fresh instance so the dashboard TUI keeps following it, and
+    // keep the automatic scan/click suppressed for the whole session. Never
+    // claim a window while a crate/shardshop routine is running.
+    const inRoutine = entry.inCrateRoutine || entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning
+    if (entry.manualSession && !inRoutine) {
+      trackManualWindow(entry, window)
+      i(id, `Window "${windowTitle(window)}" re-opened (${window.slots.length} slots) — still manual.`)
       return true
     }
     if (entry.manualMode) {
       trackManualWindow(entry, window)
+      entry.manualSession = true
+      startGuiSessionTimer(entry, id)
       i(id, `Manual mode: "${windowTitle(window)}" open (${window.slots.length} slots) — auto-click suppressed. /window to inspect · /window-click <slot> [l|r] · /move <src> <dst> · /window-close`)
       return true
     }
@@ -627,9 +684,12 @@ module.exports = function createManualControls (deps) {
         const entry = needsBot()
         if (!entry) return true
         const bot = entry.bot
-        if (!bot.currentWindow) { i(activeId, 'No extra window open.'); return true }
+        // Explicit close ends the manual GUI session (even if no window is
+        // open anymore) so automatic GUI handling comes back.
+        endGuiSession(entry)
+        if (!bot.currentWindow) { i(activeId, 'No extra window open — manual GUI session ended, automatic GUI handling restored.'); notifyBotsChanged(); return true }
         const win = bot.currentWindow
-        bot.closeWindow(win).then(() => okMsg(activeId, `Closed "${windowTitle(win)}".`))
+        bot.closeWindow(win).then(() => { okMsg(activeId, `Closed "${windowTitle(win)}" — automatic GUI handling restored.`); notifyBotsChanged() })
           .catch(err => fail(activeId, `Close failed: ${sanitize(err.message)}`))
         return true
       }
@@ -682,10 +742,16 @@ module.exports = function createManualControls (deps) {
     }
     const slots = []
     win.slots.forEach((item, idx) => {
+      const primary = item ? `${item.count}x ${sanitize(item.displayName || item.name)}` : null
+      // Alternative/internal name (displayName "Diamond Sword" vs name
+      // "diamond_sword") — shown on its own line in the dashboard GUI TUI.
+      const alt = item && item.name && String(item.name).toLowerCase() !== String(item.displayName || item.name).toLowerCase()
+        ? String(item.name) : null
       slots.push({
         slot: idx,
         label: label(idx),
-        item: item ? `${item.count}x ${sanitize(item.displayName || item.name)}` : null
+        item: primary,
+        alt
       })
     })
     return { title: windowTitle(win), isInventory, slots }
@@ -697,9 +763,10 @@ module.exports = function createManualControls (deps) {
   function snapshotFor (entry) {
     const win = entry?.manualWindow && entry.manualWindow.slots ? entry.manualWindow : null
     const hasMode = !!entry?.manualMode
+    const hasSession = !!entry?.manualSession
     const hasTui = !!entry?.guiTui && !!win
-    if (!hasMode && !hasTui) return null
-    const out = { mode: hasMode }
+    if (!hasMode && !hasSession && !hasTui) return null
+    const out = { mode: hasMode, session: hasSession }
     if (hasMode) {
       const viewerPort = entry.manualViewer ? entry.manualViewer.port : null
       // Docker/run-docker.sh maps the container viewer range to a per-instance

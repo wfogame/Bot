@@ -98,15 +98,16 @@ return null
 const SHARDSHOP_COMMAND = process.env.SHARDSHOP_COMMAND || '/shardshop' // ⚠ verify this matches your server's actual shardshop command
 
 // ── /overview rank detection ─────────────────────────────────────────────
-// /fix is rank-gated: ONLY an access-denied reply proves the bot is a Member
-// (e.g. "You do not have access to the command"). Generic errors like "Error:
-// This item cannot be repaired" happen for valid ranks too, so they do NOT
-// count — the probe moves on to /rank. A "you are on cool down" reply means
-// the probe itself was rate-limited, so the rank shows N/A and /rank is
-// skipped. The two commands are spaced RANK_COOLDOWN_MS apart (default 4.5s =
-// 3× the server's /fix cooldown) so the server never sees them as "too fast".
+// /fix is the ONLY rank probe (no /rank): an access-denied reply ("You do not
+// have access to the command", "no permission") proves the bot is a Member; a
+// "you are on cool down" reply (case-insensitive) means the probe was
+// rate-limited so the rank shows N/A; any other reply — including generic
+// errors like "Error: This item cannot be repaired" — means the bot passed the
+// /fix rank gate, so the rank is Regent. RANK_COOLDOWN_MS (default 4.5s = 3×
+// the server's /fix cooldown) is waited BEFORE /fix fires, because the balance
+// queries preceding it send several commands back-to-back and would otherwise
+// trip the server cooldown.
 const RANK_FIX_COMMAND = process.env.RANK_FIX_COMMAND || '/fix'
-const RANK_COMMAND = process.env.RANK_COMMAND || '/rank'
 const RANK_COOLDOWN_MS = (() => { const n = parseInt(process.env.RANK_COOLDOWN_MS, 10); return Number.isFinite(n) && n >= 0 ? n : 4500 })()
 const RANK_REPLY_TIMEOUT_MS = 2500
 const RANK_MEMBER_PATTERNS = [
@@ -699,15 +700,16 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 .mkey.held,.hkey.on{color:#04211d;background:var(--acc);border-color:var(--acc)}
 .action-keys,.hotbar-keys{display:flex;gap:4px;flex-wrap:wrap}
 .hkey{min-width:29px;height:29px;padding:0 6px}
-#guitui{flex:none;max-height:42vh;overflow:auto;margin:0 12px 12px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;box-shadow:0 -6px 18px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:8px}
+#guitui{flex:none;max-height:60vh;overflow:auto;margin:0 12px 12px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;box-shadow:0 -6px 18px rgba(0,0,0,.3);display:flex;flex-direction:column;gap:8px}
 #guitui[hidden]{display:none}
 #guitui .ghead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 #guitui .gtitle{color:var(--acc);font-weight:700;font-size:12px;letter-spacing:.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #guitui .gsub{color:var(--dim);font-size:10px;margin-right:auto}
 #guitui .gslots{display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:4px}
-.gslot{position:relative;border:1px solid var(--line);background:var(--bg);border-radius:6px;min-height:36px;padding:3px 5px;font:inherit;font-size:10px;line-height:1.3;color:var(--txt);cursor:pointer;overflow:hidden;user-select:none;text-align:left;display:flex;flex-direction:column;gap:1px}
+.gslot{position:relative;border:1px solid var(--line);background:var(--bg);border-radius:6px;min-height:50px;padding:3px 5px;font:inherit;font-size:11px;line-height:1.35;color:var(--txt);cursor:pointer;overflow:hidden;user-select:none;text-align:left;display:flex;flex-direction:column;gap:1px}
 .gslot .gsidx{color:var(--dim);font-size:9px}
 .gslot .gsitem{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gslot .gsalt{color:var(--dim);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .gslot:hover:not(.empty){border-color:var(--acc);background:rgba(45,212,191,.06)}
 .gslot.empty{color:#2b3542;cursor:default}
 .gslot.empty:hover{border-color:var(--line)}
@@ -910,9 +912,9 @@ var html='<div class="ghead"><span class="gtitle">╔═ '+esc((win.title||'wind
 html+='<button class="tb" type="button" data-g="close">✕ close</button><button class="tb" type="button" data-g="hide">hide</button></div>'
 html+='<div class="gslots">'
 for(var gi=0;gi<win.slots.length;gi++){var gs=win.slots[gi]||{slot:gi,label:'slot '+gi,item:null}
-var gname=gs.item||''
-html+='<button class="gslot'+(gname?'':' empty')+'" type="button" data-slot="'+gs.slot+'" title="'+esc(gs.slot+' '+gs.label+(gname?' · '+gname:''))+'">'
-html+='<span class="gsidx">'+gs.slot+'</span><span class="gsitem">'+(gname?esc(gname):'·')+'</span></button>'}
+var gname=gs.item||'',galt=gs.alt||''
+html+='<button class="gslot'+(gname?' ':' empty')+'" type="button" data-slot="'+gs.slot+'" title="'+esc(gs.slot+' '+gs.label+(gname?' · '+gname:'')+(galt?' ['+galt+']':''))+'">'
+html+='<span class="gsidx">'+gs.slot+'</span><span class="gsitem">'+(gname?esc(gname):'·')+'</span>'+(galt?'<span class="gsalt">'+esc(galt)+'</span>':'')+'</button>'}
 html+='</div>'
 panel.innerHTML=html
 var gslots=panel.querySelectorAll('.gslot:not(.empty)')
@@ -1005,7 +1007,7 @@ d.className='bot'+(b.online?' on':'')+(b.id===view?' sel':'')
 d.setAttribute('data-id',b.id)
 var up=b.uptimeSec==null?'':fmtUp(b.uptimeSec)
 var manualHtml=b.manual&&b.manual.mode?'<span class="manual-badge">manual</span>':''
-var guiHtml=b.manual&&b.manual.guiTui?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">gui</span>':''
+var guiHtml=b.manual&&(b.manual.guiTui||b.manual.session)?'<span class="manual-badge" style="color:var(--cyan);border-color:rgba(103,232,249,.4)">gui</span>':''
 var viewerHtml=b.manual&&b.manual.viewerPort?'<button class="manual-viewer" type="button" data-port="'+String(b.manual.viewerPort)+'">🌐 viewer</button>':''
 d.innerHTML='<div class="bhead"><div class="dot"></div><div class="bname"></div>'+manualHtml+guiHtml+viewerHtml+(b.attempts?'<div class="batt">↻'+b.attempts+'</div>':'')+'</div>'
 +'<div class="bmeta"><span>'+(b.ping==null?'—':b.ping)+'ms</span><span>'+(b.health==null?'—':b.health)+'❤</span><span>'+(b.food==null?'—':b.food)+'🍗</span>'+(up?'<span>'+up+'</span>':'')+'</div>'
@@ -1570,6 +1572,8 @@ manualWindow: null, // window tracked for manual /window-* commands
 guiTui: false, // dashboard ASCII GUI TUI toggle (/gui-tui)
 suppressNextWindowClick: false, // suppress auto slot-click for the next windowOpen
 suppressWindowTimer: null, // clears the above when no window opens within 5s
+manualSession: false, // sticky manual GUI session (set when a /gui window opens)
+guiSessionTimer: null, // 20-min auto-close timer for the manual GUI session
 }
 const entry = bots[id]
 
@@ -2424,6 +2428,9 @@ if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manua
 // A GUI session armed by /chat or /gui must not swallow this routine's window
 if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
 if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
+if (entry.manualWindow) entry.manualWindow = null
+if (entry.manualSession) { entry.manualSession = false }
+if (entry.guiSessionTimer) { clearTimeout(entry.guiSessionTimer); entry.guiSessionTimer = null }
 const blockName = blockNameOverride || CRATE_SHULKER_BLOCK
 logFor(id, `Change the version in .env to 1.21.1 to use this mechanic otherwise SKIP it.`)
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
@@ -2544,6 +2551,9 @@ const entry = bots[id]
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /shardshop-loop.{/yellow-fg}`); resolve(null); return }
 if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
 if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
+if (entry.manualWindow) entry.manualWindow = null
+if (entry.manualSession) { entry.manualSession = false }
+if (entry.guiSessionTimer) { clearTimeout(entry.guiSessionTimer); entry.guiSessionTimer = null }
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-ffg}`); resolve(null); return }
 if (entry.shardshopLoopRunning) { logFor(id, `{yellow-fg}⚠ /shardshop-loop is already running for ${id}.{/yellow-fg}`); resolve(null); return }
 entry.shardshopLoopRunning = true
@@ -2617,6 +2627,9 @@ const entry = bots[id]
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before running /crates-all on ${id}.{/yellow-fg}`); return }
 if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
 if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
+if (entry.manualWindow) entry.manualWindow = null
+if (entry.manualSession) { entry.manualSession = false }
+if (entry.guiSessionTimer) { clearTimeout(entry.guiSessionTimer); entry.guiSessionTimer = null }
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned — skipping /crates-all.{/yellow-fg}`); return }
 if (entry.crateRoutineRunning || entry.crateLoopRunning) {
 logFor(id, `{yellow-fg}⚠ ${id} is already busy with a crate routine — skipping /crates-all.{/yellow-fg}`)
@@ -2729,9 +2742,9 @@ try { bot.chat(command) } catch (_) { finish(null) }
 }
 
 // ── /overview rank detection ──────────────────────────────────────────────
-// /fix is rank-gated: only an access-denied reply means Member; generic errors
-// ("This item cannot be repaired") still happen for valid ranks. Cooldown
-// replies mean N/A. Commands are spaced RANK_COOLDOWN_MS (default 4.5s) apart.
+// /fix is the ONLY probe: access denied ⇒ Member, cooldown ⇒ N/A, anything
+// else ("cannot be repaired", ERROR, …) ⇒ Regent. RANK_COOLDOWN_MS (default
+// 4.5s) is waited before /fix so the balance-query cooldown has worn off.
 function listenForRankReply (bot, command, ms, classify) {
   return new Promise((resolve) => {
     const lines = []
@@ -2762,25 +2775,6 @@ function listenForRankReply (bot, command, ms, classify) {
   })
 }
 
-function parseRankReply (lines) {
-  const cleaned = (lines || []).map(l => String(l).replace(/§[0-9a-fk-or]/gi, '').trim())
-  const joined = cleaned.join(' ').replace(/\s+/g, ' ').trim()
-  if (!joined) return 'Unknown'
-  // "Your rank is Regent" / "Rank: Regent" — ranks are capitalized, so filler
-  // like "not" / "currently" can't be captured as the rank name.
-  const labeled = joined.match(/(?:rank|rango)\s*(?:is|:)?\s*:?\s*([A-Za-zÀ-ž]+)/i)
-  if (labeled && /^[A-ZÀ-Ž]/.test(labeled[1])) return labeled[1]
-  // "You are Regent" / "You're Regent"
-  const youAre = joined.match(/(?:you are|you're|ur)\s+([A-Za-zÀ-ž]+)/i)
-  if (youAre && /^[A-ZÀ-Ž]/.test(youAre[1])) return youAre[1]
-  // Bare reply ("Regent") — last short, single-word-looking line wins
-  for (let i = cleaned.length - 1; i >= 0; i--) {
-    const line = cleaned[i]
-    if (line && line.length <= 24 && /^[A-ZÀ-Ž][A-Za-zÀ-ž' -]*$/.test(line)) return line
-  }
-  return 'Unknown'
-}
-
 async function queryRank (id) {
   const entry = bots[id]
   if (!entry?.bot?.entity) return null
@@ -2791,22 +2785,19 @@ async function queryRank (id) {
     return null
   }
 
-  // 1. /fix — access denied ⇒ Member; rate-limited ⇒ N/A (skip /rank). Any
-  // other reply (including generic errors like "cannot be repaired") means the
-  // bot CAN use /fix, so keep going and let /rank name the rank.
+  // The balance queries that ran just before this fired three commands
+  // back-to-back — wait out the server cooldown BEFORE /fix, otherwise the
+  // server answers "you are on cool down" and the rank comes back N/A.
+  await new Promise(resolve => setTimeout(resolve, RANK_COOLDOWN_MS))
+  if (!bot.entity) return null
+
+  // /fix is the ONLY probe: access denied ⇒ Member, rate-limited ⇒ N/A, any
+  // other reply (including "Error: This item cannot be repaired") means the
+  // bot passed the /fix rank gate ⇒ Regent.
   const fix = await listenForRankReply(bot, RANK_FIX_COMMAND, RANK_REPLY_TIMEOUT_MS, classifyFix)
   if (fix.verdict === 'member') return 'Member'
   if (fix.verdict === 'cooldown') return 'N/A'
-  if (!bot.entity) return null
-
-  // 2. Not a Member — wait out the cooldown, then /rank for the real name.
-  await new Promise(resolve => setTimeout(resolve, RANK_COOLDOWN_MS))
-  if (!bot.entity) return null
-  const rank = await listenForRankReply(bot, RANK_COMMAND, RANK_REPLY_TIMEOUT_MS, (text) =>
-    RANK_COOLDOWN_PATTERN.test(text) ? 'cooldown' : null
-  )
-  if (rank.verdict === 'cooldown') return 'N/A'
-  return parseRankReply(rank.lines)
+  return bot.entity ? 'Regent' : null
 }
 
 // ── Command router (real tail + context routing prologue for the web GUI) ────
