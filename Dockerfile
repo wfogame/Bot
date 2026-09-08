@@ -24,6 +24,7 @@ RUN npm install --omit=dev --no-audit --no-fund
 COPY expose-terminal.js ./expose-terminal.js
 COPY bot-controls.js ./bot-controls.js
 COPY monitoring.js ./monitoring.js
+COPY bot-manual.js ./bot-manual.js
 COPY ${APP_FILE} ./index.js
 
 # Tor config: local SOCKS5 on 127.0.0.1:9050, drops privileges to debian-tor.
@@ -41,6 +42,12 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Web GUI port (container-internal; run-docker.sh maps host 80/81/82… onto it)
 EXPOSE 80
+
+# Manual-mode 3D viewer ports (prismarine-viewer). /manual-interact picks the
+# first free port starting at MANUAL_VIEWER_PORT (default 3000, up to 10
+# attempts). run-docker.sh maps a free 10-port host block onto this range per
+# instance; a plain `docker run` can map it manually with -p 3000-3009:3000-3009.
+EXPOSE 3000-3009
 
 # Liveness via the app's unauthenticated /health endpoint
 HEALTHCHECK --interval=60s --timeout=5s --start-period=120s --retries=3 \

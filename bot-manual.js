@@ -499,7 +499,19 @@ module.exports = function createManualControls (deps) {
 
   function snapshotFor (entry) {
     if (!entry?.manualMode) return null
-    return { viewerPort: entry.manualViewer ? entry.manualViewer.port : null }
+    const viewerPort = entry.manualViewer ? entry.manualViewer.port : null
+    // Docker/run-docker.sh maps the container viewer range to a per-instance
+    // host block and injects MANUAL_VIEWER_HOST_PORT — translate so the
+    // dashboard's viewer button opens the right host URL (falls back to the
+    // container port when unset, i.e. plain local runs).
+    let viewerHostPort = null
+    const hostBase = parseInt(process.env.MANUAL_VIEWER_HOST_PORT, 10)
+    if (viewerPort && Number.isFinite(hostBase)) {
+      const containerBase = parseInt(process.env.MANUAL_VIEWER_PORT, 10)
+      const base = Number.isFinite(containerBase) ? containerBase : VIEWER_PORT
+      viewerHostPort = hostBase + (viewerPort - base)
+    }
+    return { viewerPort, viewerHostPort }
   }
 
   return {

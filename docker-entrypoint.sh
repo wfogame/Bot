@@ -12,6 +12,10 @@ export PROXY_PORT="${PROXY_PORT-9050}"
 export PROXY_TYPE="${PROXY_TYPE-socks5}"
 export PROXY_RESTART_CMD="${PROXY_RESTART_CMD-/usr/local/bin/restart-tor}"
 
+# Manual interact 3D viewer: first free port from here, up to 10 attempts
+# (prismarine-viewer; served from the same node process, bound to WEB_BIND).
+export MANUAL_VIEWER_PORT="${MANUAL_VIEWER_PORT-3000}"
+
 is_local_proxy() {
   [ "$PROXY_HOST" = "127.0.0.1" ] || [ "$PROXY_HOST" = "localhost" ] || [ "$PROXY_HOST" = "::1" ]
 }
@@ -38,5 +42,6 @@ else
   echo "[entrypoint] PROXY_HOST='${PROXY_HOST}' — not starting local Tor (direct or remote proxy mode)."
 fi
 
+echo "[entrypoint] starting app — manual 3D viewer will bind ${WEB_BIND:-0.0.0.0}:${MANUAL_VIEWER_PORT}+ when /manual-interact is used (map host ports to reach it)"
 exec node index.js
 exec monitoring.js
