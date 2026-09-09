@@ -216,7 +216,10 @@ channel.
 The WebGUI sidebar's **PLAY** button opens `/play`, an embedded browser
 Minecraft client (zardoy/minecraft-web-client) served **fully self-hosted**
 from this app on its own local port (`web-client.js`, default 8090) — no
-third-party hosted client is embedded. The client build lives in
+third-party hosted client is embedded. The client server is started lazily on
+first `/play` request and stopped completely when you leave the page (exit
+beacon + heartbeat watchdog) — it never sits in memory while unused. Assets
+are gzipped with streaming compression; nothing is cached in RAM. The client build lives in
 `web-client/dist`; build it with `npm run web-client:build` or let the Docker
 image bake it in (the `/play` page explains this if the build is missing). It
 connects through a WebSocket → TCP proxy, works with offline-mode (cracked)
