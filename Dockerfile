@@ -20,7 +20,8 @@ COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
 RUN if [ "$BUILD_WEB_CLIENT" = "1" ]; then \
   apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* && \
   corepack enable && \
-  bash ./scripts/build-web-client.sh; \
+  bash ./scripts/build-web-client.sh && \
+  test -f web-client/dist/index.html || { echo "✗ web-client build did not produce web-client/dist/index.html — see the build log above for the real error (git clone / pnpm install / pnpm run build)." >&2; exit 1; }; \
   else mkdir -p web-client/dist; fi
 
 # ── App stage ─────────────────────────────────────────────────────────────────
