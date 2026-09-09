@@ -6,3 +6,4 @@ patches/.git
 .command_history
 *.log
 run-docker.sh
+web-client

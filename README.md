@@ -51,6 +51,11 @@ npm run postinstall
 The patch is included for the server/proxy behavior this project targets. Do
 not omit it when setting up a fresh environment.
 
+It also fixes mineflayer's dig-time calculation on 1.20.5+ servers, where the
+enchantments component arrives as an object instead of an array and every dig
+used to fail with "enchantments.concat is not a function" (see
+test/mineflayer-digging.test.js).
+
 ## Minimal Configuration
 
 Create `.env` in the repository root:
@@ -254,6 +259,72 @@ Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOS
 | `LOG_MAX_LINES` | `5000` | Stored lines per bot/system channel |
 | `WINDOW_DEBUG` | `false` | Include complete inventory slot dumps |
 | `CONFIG_PACKET_LOG_LIMIT` | `120` | Configuration packet log limit; `0` means unlimited |
+
+### Minecraft web client (`/play` tab)
+
+The dashboard's **PLAY** button opens a browser-based Minecraft client
+([zardoy/minecraft-web-client](https://github.com/zardoy/minecraft-web-client))
+embedded on `/play` — **fully self-hosted**: the client is built from source
+and served by this app on its own local port (`web-client.js`); nothing is
+loaded from a third-party hosted client. It connects through a WebSocket → TCP
+bridge, works with **offline-mode (cracked) servers** — any username, no
+account needed — and supports server versions 1.8 through 1.21.5
+(first-class 1.21.4). No server-side plugins required.
+
+**Building the client.** The Docker image builds it automatically from
+`zardoy/minecraft-web-client` (set `BUILD_WEB_CLIENT=0` as a `--build-arg` to
+skip that stage). Without Docker, build it once:
+
+```bash
+npm run web-client:build      # clones upstream + pnpm build → web-client/dist
+npm run web-client:serve      # optional standalone: serve it on :8090 by itself
+```
+
+If the build is missing, `/play` shows a "build not found" page with these
+instructions instead of embedding anything remote.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MC_WEB_ENABLED` | `true` | Show the PLAY button and `/play` route |
+| `MC_WEB_CLIENT_URL` | *(empty)* | Override client page URL (e.g. `https://client.example.com`); empty = serve the local build |
+| `MC_WEB_CLIENT_PORT` | `8090` | Local port serving the client build |
+| `MC_WEB_CLIENT_PORT_MAX_ATTEMPTS` | `10` | Fallback ports tried if 8090 is taken |
+| `MC_WEB_CLIENT_DIR` | `web-client/dist` | Directory of the client build |
+| `MC_WEB_CLIENT_HOST_PORT` | *(empty)* | Host-side client port when Docker maps it (set by `run-docker.sh`) |
+| `MC_WEB_SERVER` | *(empty)* | Server address prefilled in the connect screen, e.g. `play.example.com:25565` |
+| `MC_WEB_VERSION` | `1.21.4` | Protocol version prefilled in the client |
+| `MC_WEB_USERNAME` | *(empty)* | Offline-mode username prefilled in the client |
+| `MC_WEB_PROXY` | *(empty)* | Your self-hosted mwc-proxy URL (see below) |
+
+**Proxy setup.** Browsers cannot open raw TCP sockets, so the browser client
+talks WebSocket and a bridge relays to the Minecraft server over TCP. For a
+publicly reachable server, the hosted client's public proxies work out of the
+box — just open PLAY and connect. For a private/LAN server, self-host the
+bridge next to it:
+
+```bash
+./run-docker.sh proxy          # runs ghcr.io/zardoy/mwc-proxy on :8080
+# or, without Docker:
+npx minecraft-web-proxy
+```
+
+Then set `MC_WEB_PROXY` in `.env` / `.env.dockerN`:
+
+```dotenv
+MC_WEB_SERVER=play.example.com:25565
+MC_WEB_VERSION=1.21.4
+MC_WEB_USERNAME=PlayerName
+MC_WEB_PROXY=ws://localhost:8080
+```
+
+**`ws://` vs `wss://`, and https dashboards.** If the dashboard is served over
+**https**, browsers block insecure `ws://` *and* plain-`http://` iframe pages
+(mixed content) — so serve the client page over TLS too (point
+`MC_WEB_CLIENT_URL` at an https URL via a reverse proxy / Cloudflare Tunnel,
+and use `wss://` for `MC_WEB_PROXY`). Over plain http everything is fine as
+shipped. Optional proxy env vars: `MWC_PORT`, `MWC_HOST_PORT`,
+`MWC_ALLOW_ORIGIN`, `MWC_ACCESS_CODE`, `MWC_MAX_CONNECTIONS_PER_IP`,
+`MWC_SIGNAL_URL` (mcraft.fun listing).
 
 ### Cron jobs
 
