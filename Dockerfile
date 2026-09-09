@@ -18,7 +18,7 @@ RUN if [ "$BUILD_WEB_CLIENT" = "1" ]; then \
   git clone --depth 1 --branch next https://github.com/zardoy/minecraft-web-client.git /client && \
   cd /client && \
   node ./scripts/dockerPrepare.mjs && \
-  pnpm i --no-audit --no-fund && \
+  pnpm i && \
   pnpm run build && \
   printf '{"allowAutoConnect":false}\n' > dist/config.json; \
   else mkdir -p /client/dist; fi

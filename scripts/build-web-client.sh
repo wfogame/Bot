@@ -33,7 +33,7 @@ command -v pnpm >/dev/null 2>&1 || npm install -g pnpm@10.32.1
 
 echo "▸ preparing + installing dependencies…"
 node ./scripts/dockerPrepare.mjs
-pnpm i --no-audit --no-fund
+pnpm i
 
 echo "▸ building (pnpm run build)…"
 pnpm run build
