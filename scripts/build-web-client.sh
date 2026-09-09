@@ -82,11 +82,14 @@ echo "▸ preparing + installing dependencies…"
 node ./scripts/dockerPrepare.mjs
 pnpm i
 
-# Fix block breaking on 1.20.5+ servers BEFORE building (see header comment).
+# Fix block breaking + cap mc-data prep memory BEFORE building (see header
+# comment). Pass the ABSOLUTE src dir: this script has already cd'd into
+# $SRC_DIR, so a relative "$SRC_DIR" would resolve one level too deep and the
+# makeOptimizedMcData.mjs patch would fail with ENOENT (seen in Docker builds).
 echo "▸ applying prismarine-item enchants fix (digging on 1.20.5+ servers)…"
-node "$PROJECT_ROOT/scripts/patch-web-client-enchants.js" "$SRC_DIR"
+node "$PROJECT_ROOT/scripts/patch-web-client-enchants.js" "$PROJECT_ROOT/$SRC_DIR"
 
-echo "▸ minecraft-data corpus: ${MIN_MC_VERSION:-all} → ${MAX_MC_VERSION:-all}"
+echo "▸ minecraft-data corpus: ${MIN_MC_VERSION:-full} → ${MAX_MC_VERSION:-latest}"
 export MIN_MC_VERSION MAX_MC_VERSION
 
 echo "▸ building (pnpm run build)…"

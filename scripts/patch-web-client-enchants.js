@@ -195,7 +195,10 @@ function findPrismarineItem (srcDir) {
 }
 
 function main (argv) {
-  const srcDir = argv[2] || path.resolve(__dirname, '..', 'web-client', 'src')
+  // Resolve to an absolute path: the build script passes the src dir while its
+  // own cwd is already inside it, so a relative arg would resolve one level
+  // too deep ("web-client/src/web-client/src/...") and fail with ENOENT.
+  const srcDir = path.resolve(argv[2] || path.resolve(__dirname, '..', 'web-client', 'src'))
   const indexFile = findPrismarineItem(srcDir)
   if (!indexFile) {
     console.error(`✗ prismarine-item not found under ${srcDir} — did "pnpm i" run inside the web client source?`)
