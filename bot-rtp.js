@@ -72,7 +72,7 @@ const RECONNECT_BASE_MS  = 8000
 const RECONNECT_MAX_MS   = 5 * 60_000
 
 // ── Memory limits ─────────────────────────────────────────────────────────────
-const MAX_LOG_LINES        = 5000
+const MAX_LOG_LINES        = 2000 // per-bot scrollback cap (was 5000 — small-host friendly)
 const MAX_RTP_HISTORY_SIZE = 5000
 
 // ── Discord rate limiting ────────────────────────────────────────────────────

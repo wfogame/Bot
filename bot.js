@@ -91,7 +91,10 @@ return u.toString()
 const SSH_CONFIG = sshConfig()
 const SSH_ENABLED = SSH_CONFIG.enabled
 const WS_BROADCAST_INTERVAL_MS = parseInt(process.env.WS_BROADCAST_INTERVAL_MS || '100', 10)
-const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '5000', 10)
+const WS_SEND_MAX_BUFFERED = 1 << 20 // 1MB; drop pushes to clients this far behind instead of buffering
+// Dashboard only renders the last 400 lines/bot, so 1500 is generous headroom
+// while keeping memory low on small hosts (env override still available).
+const LOG_MAX_LINES = parseInt(process.env.LOG_MAX_LINES || '1500', 10)
 const WINDOW_DEBUG = /^(1|true|yes|on)$/i.test(process.env.WINDOW_DEBUG || '') // true restores full window slot dumps
 const CONFIG_PACKET_LOG_LIMIT = parseInt(process.env.CONFIG_PACKET_LOG_LIMIT || '120', 10) // 0 = unlimited config packet logging
 
@@ -1671,6 +1674,7 @@ if (!clients.size) { pendingLogs.length = 0; return }
 const batch = pendingLogs.map(e => ({ id: e.id, text: escHtml(e.text) }))
 pendingLogs.length = 0
 for (const ctx of clients) {
+if (ctx.ws && ctx.ws.bufferedAmount > WS_SEND_MAX_BUFFERED) continue
 let entries
 if (ctx.view === 'all') entries = batch
 else if (ctx.view === 'system') entries = batch.filter(e => e.id === SYSTEM_ID)
@@ -1698,7 +1702,7 @@ if (!clients.size) { botsDirty = false; return }
 if (botsDirty || snapTick % 5 === 0) {
 botsDirty = false
 const msg = { t: 'bots', bots: botSnapshot(), stats: globalStats() }
-for (const ctx of clients) ctx.send(msg)
+for (const ctx of clients) if (!(ctx.ws && ctx.ws.bufferedAmount > WS_SEND_MAX_BUFFERED)) ctx.send(msg)
 }
 }, 1000)
 if (snapTimer.unref) snapTimer.unref()
@@ -1710,6 +1714,9 @@ if (ctx.alive === false) { try { ctx.ws.terminate() } catch (_) {} ; continue }
 ctx.alive = false
 try { ctx.ws.ping() } catch (_) {}
 }
+// Sweep expired sessions + failed-login bookkeeping so those maps never grow unbounded.
+for (const [tok, exp] of sessions) if (Date.now() > exp) sessions.delete(tok)
+for (const [ip, f] of fails) if (Date.now() > f.until) fails.delete(ip)
 }, 30000)
 if (hb.unref) hb.unref()
 
@@ -1839,7 +1846,11 @@ const entry = bots[id]
 
 // Managed timers — all cleared on disconnect so nothing fires against a dead bot
 const timeouts = []
-const pushT = (fn, delay) => { const t = setTimeout(fn, delay); timeouts.push(t); return t }
+const pushT = (fn, delay) => {
+const t = setTimeout(() => { const i = timeouts.indexOf(t); if (i >= 0) timeouts.splice(i, 1); fn() }, delay)
+timeouts.push(t)
+return t
+}
 const clearAll = () => { timeouts.forEach(clearTimeout); timeouts.length = 0 }
 
 // Detect whether a disconnect was caused by a Velocity proxy transfer crash
