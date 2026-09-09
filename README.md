@@ -340,7 +340,9 @@ compression — nothing is cached in memory** (the multi-MB bundle never sits in
 RAM). It connects through a WebSocket → TCP
 bridge, works with **offline-mode (cracked) servers** — any username, no
 account needed — and supports server versions 1.8 through 1.21.5
-(first-class 1.21.4). No server-side plugins required.
+(first-class 1.21.4; the default build ships data for the full 1.21.x
+generation — widen `MIN_MC_VERSION`/`MAX_MC_VERSION` to include older
+servers). No server-side plugins required.
 
 The client is pinned to the **latest upstream release tag** (`v2.3.0`,
 verified against the GitHub releases page — the upstream `next` branch is the
@@ -372,6 +374,19 @@ tool meant the dig packet was never sent and blocks could never be broken.
 `pnpm i`, covered by `test/web-client-enchants.test.js`) normalizes the
 getter to the classic `[{ name, lvl }]` array so digging and the inventory
 UI work again.
+
+**Build memory is capped by default.** The upstream build loads the full
+minecraft-data corpus (every version 1.8 → 1.21.11) into memory at once — a
+fresh build peaks at **~2.3 GB RSS** (measured), which OOMs or swap-thrashes
+a 4 GB machine. The same patch script defaults the build-time prep to the
+current **1.21.x generation only** (1.21 → 1.21.11, measured fresh-build peak
+~1.8 GB) — and because the patch rewrites the upstream source, it applies to
+*any* build invocation (script, Docker, or a manual `pnpm run build` inside
+`web-client/src`). Going stricter than 1.21.x (e.g. 1.21.11 only) would break
+connecting to other server versions: when a version is absent from the bundle
+the client silently falls back to the base version's protocol data. To cover
+older servers, widen the range, e.g. `MIN_MC_VERSION=1.8
+MAX_MC_VERSION=1.21.11 npm run web-client:build`.
 
 If the build is missing, `/play` shows a "build not found" page with these
 instructions instead of embedding anything remote.

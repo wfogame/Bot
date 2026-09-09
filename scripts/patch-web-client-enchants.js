@@ -1,19 +1,33 @@
 'use strict'
-// ── Fix block breaking in the self-hosted Minecraft web client ──────────────
-// The browser client (zardoy/minecraft-web-client) bundles prismarine-item,
-// whose `enchants` getter returns the RAW 1.20.5+ component object
-// ({ enchantments: [{ id, level }] }) instead of a flat array — and throws on
-// versions it does not recognize. mineflayer's digTime then crashes with
-// "(enchantments ?? []) is not iterable" while spreading item.enchants, so the
-// dig packet is never sent and blocks can never be broken (holding an
-// enchanted tool on a 1.20.5+ server reproduces it 100%). The web client's
-// inventory UI hits the same getter and crashes on `.enchants.map(...)`.
-//
+// ── Fix block breaking + build memory in the self-hosted Minecraft web client ──
 // This script runs inside scripts/build-web-client.sh right after `pnpm i` and
-// before `pnpm run build`, patching the installed prismarine-item so the
-// getter always returns the classic [{ name, lvl }] array and never throws.
-// It is a no-op (idempotent) if the patch is already applied, and fails loudly
-// if the upstream file layout changes so the fix can be re-baselined.
+// before `pnpm run build`, and applies two source patches to the upstream
+// client (zardoy/minecraft-web-client, pinned to the latest release tag):
+//
+// 1. prismarine-item (block breaking): the `enchants` getter returns the RAW
+//    1.20.5+ component object ({ enchantments: [{ id, level }] }) instead of a
+//    flat array — and throws on versions it does not recognize. mineflayer's
+//    digTime then crashes with "(enchantments ?? []) is not iterable" while
+//    spreading item.enchants, so the dig packet is never sent and blocks can
+//    never be broken (holding an enchanted tool on a 1.20.5+ server
+//    reproduces it 100%). The web client's inventory UI hits the same getter
+//    and crashes on `.enchants.map(...)`.
+//
+// 2. scripts/makeOptimizedMcData.mjs (build memory): the build-time data prep
+//    loads the minecraft-data corpus for EVERY supported MC version
+//    (1.8 → 1.21.11) into memory at once — a fresh build peaks at ~2.3 GB RSS
+//    (measured), which OOMs / swap-thrashes small machines. The patch makes it
+//    load only the current 1.21.x generation by default (1.21 → latest, ~10
+//    versions; fresh-build peak ~1.8 GB, also measured). Going stricter than
+//    the 1.21.x range (e.g. 1.21.11 only) would BREAK connecting to other
+//    server versions: when a version is absent from the blob the client
+//    silently falls back to the base version's protocol data (restoreData in
+//    src/optimizeJson.ts never throws). MIN_MC_VERSION / MAX_MC_VERSION
+//    override the range. Patching the source (not just exporting env vars)
+//    means even a manual `pnpm run build` inside web-client/src is clipped.
+//
+// Both patches are no-ops (idempotent) if already applied, and fail loudly if
+// the upstream file layout changes so they can be re-baselined.
 //
 // Usage: node scripts/patch-web-client-enchants.js [web-client/src-dir]
 //   (defaults to <repo root>/web-client/src — what build-web-client.sh passes)
@@ -72,6 +86,29 @@ const THROW_NEW = `      // Never throw: an unenchanted item on a version this p
       // recognize used to crash every digTime call — and with it, digging.
       return []`
 
+// ── Second patch: makeOptimizedMcData.mjs (build-time mc-data prep) ──
+// Upstream defaults to loading the full corpus (every supported MC version,
+// 1.8 → latest) into memory at once. Measured on fresh builds: peak RSS
+// 2.3 GB (full corpus) vs 1.8 GB (1.21.x generation). Patch the source so ANY
+// build invocation is clipped by default; MIN_MC_VERSION / MAX_MC_VERSION
+// override the range. Anchor is the exact v2.3.0 snippet.
+const CLIP_ANCHOR = `// Version clipping support
+const minVersion = process.env.MIN_MC_VERSION
+const maxVersion = process.env.MAX_MC_VERSION`
+
+const CLIP_NEW = `// Version clipping support
+const supportedVersionsList = Object.keys(versions)
+// Default: only the current 1.21.x generation (1.21 -> latest, ~10 versions).
+// Loading every supported version (1.8 -> latest, ~40) peaks at ~2.3 GB during
+// a fresh build (measured) and OOMs small machines. A single version would
+// break other server versions — the client silently falls back to the base
+// version's protocol data when a version is absent from the blob (restoreData
+// in src/optimizeJson.ts never throws). Set MIN_MC_VERSION / MAX_MC_VERSION
+// to override, e.g. MIN_MC_VERSION=1.21.11 MAX_MC_VERSION=1.21.11 for a
+// strictly single-version build.
+const minVersion = process.env.MIN_MC_VERSION || '1.21'
+const maxVersion = process.env.MAX_MC_VERSION || supportedVersionsList.at(-1)`
+
 const HELPER_BLOCK = `const nbt = require('prismarine-nbt')
 
 // 1.20.5+ deserializes the enchantments item component as an object
@@ -123,6 +160,20 @@ function patchItemsJs (content) {
   return { changed: true, content: out }
 }
 
+// Transform the content of makeOptimizedMcData.mjs so the mc-data prep loads
+// only the latest supported MC version by default. Returns { changed, content }.
+// Throws if the expected upstream snippet is absent (layout changed) or the
+// file already looks patched in an unverifiable way.
+function patchMakeOptimizedMcData (content) {
+  if (content.includes('const supportedVersionsList = Object.keys(versions)')) {
+    return { changed: false, content }
+  }
+  if (!content.includes(CLIP_ANCHOR)) {
+    throw new Error('makeOptimizedMcData.mjs no longer contains the expected version-clipping anchor — update scripts/patch-web-client-enchants.js')
+  }
+  return { changed: true, content: content.replace(CLIP_ANCHOR, CLIP_NEW) }
+}
+
 // Locate the installed prismarine-item under the web client source dir
 // (pnpm: usually a root symlink; falls back to a .pnpm store scan).
 function findPrismarineItem (srcDir) {
@@ -158,19 +209,44 @@ function main (argv) {
     process.exit(1)
   }
   const { changed, content: out } = patchItemsJs(content)
-  if (!changed) {
+  if (changed) {
+    try {
+      fs.writeFileSync(indexFile, out)
+    } catch (err) {
+      console.error(`✗ could not write ${indexFile}: ${err.message}`)
+      process.exit(1)
+    }
+    console.log(`✓ patched ${path.relative(process.cwd(), indexFile)} — enchants normalized, block breaking fixed on 1.20.5+ servers`)
+  } else {
     console.log(`✓ ${path.relative(process.cwd(), indexFile)} already patched`)
-    return
   }
+
+  // Second patch: the build-time mc-data prep (upstream source file in the
+  // cloned repo, not node_modules). Runs every time — both patches are
+  // idempotent, so rebuilds just re-confirm them.
+  const mcDataScript = path.join(srcDir, 'scripts', 'makeOptimizedMcData.mjs')
+  let mcContent
   try {
-    fs.writeFileSync(indexFile, out)
+    mcContent = fs.readFileSync(mcDataScript, 'utf8')
   } catch (err) {
-    console.error(`✗ could not write ${indexFile}: ${err.message}`)
+    console.error(`✗ could not read ${mcDataScript}: ${err.message}`)
     process.exit(1)
   }
-  console.log(`✓ patched ${path.relative(process.cwd(), indexFile)} — enchants normalized, block breaking fixed on 1.20.5+ servers`)
+  const mcRes = patchMakeOptimizedMcData(mcContent)
+  if (mcRes.changed) {
+    try {
+      fs.writeFileSync(mcDataScript, mcRes.content)
+    } catch (err) {
+      console.error(`✗ could not write ${mcDataScript}: ${err.message}`)
+      process.exit(1)
+    }
+    console.log('✓ patched scripts/makeOptimizedMcData.mjs — mc-data prep now loads only the 1.21.x generation by default (override with MIN_MC_VERSION/MAX_MC_VERSION)')
+
+  } else {
+    console.log('✓ scripts/makeOptimizedMcData.mjs already patched')
+  }
 }
 
 if (require.main === module) main(process.argv)
 
-module.exports = { mapEnchants, normalizeEnchants, patchItemsJs, findPrismarineItem }
+module.exports = { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, findPrismarineItem }

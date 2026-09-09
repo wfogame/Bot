@@ -16,16 +16,17 @@ ARG BUILD_WEB_CLIENT=1
 FROM node:22-bookworm-slim AS webclient
 ARG BUILD_WEB_CLIENT
 # Version-range clipping for the web client's build-time minecraft-data prep
-# (see scripts/build-web-client.sh). The default is 1.21.11 ONLY (set inside
-# the script) so the build never loads every supported MC version into memory
-# at once — widen with --build-arg MIN_MC_VERSION / MAX_MC_VERSION only if
-# the client must connect to other server versions.
+# (see scripts/build-web-client.sh). The patch script makes the prep load only
+# the 1.21.x generation by default (fresh-build peak RSS ~1.8 GB vs ~2.3 GB
+# for the full corpus) — override with --build-arg MIN_MC_VERSION /
+# MAX_MC_VERSION only if the client must connect to other server versions.
 ARG MIN_MC_VERSION
 ARG MAX_MC_VERSION
 WORKDIR /build
 COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
 # The build script runs scripts/patch-web-client-enchants.js (dig fix for
-# 1.20.5+ servers) — ship it alongside so the image build can apply it.
+# 1.20.5+ servers + single-version mc-data prep default) — ship it alongside
+# so the image build can apply it.
 COPY scripts/patch-web-client-enchants.js ./scripts/patch-web-client-enchants.js
 RUN if [ "$BUILD_WEB_CLIENT" = "1" ]; then \
   apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* && \

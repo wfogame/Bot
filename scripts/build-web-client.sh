@@ -9,13 +9,21 @@
 # rebuild. Override the tag with MC_WEB_CLIENT_TAG if you ever need a
 # different upstream version.
 #
-# Before building, scripts/patch-web-client-enchants.js is applied: on
-# 1.20.5+ servers prismarine-item's `enchants` getter returns the raw
-# component object instead of an array (and throws on versions it doesn't
-# know), which crashes mineflayer's digTime with "(enchantments ?? []) is not
-# iterable" — so the browser client could never break blocks while holding an
-# enchanted item. The patch normalizes the getter; see
-# test/web-client-enchants.test.js.
+# Before building, scripts/patch-web-client-enchants.js applies two source
+# patches to the upstream client:
+# 1. prismarine-item's `enchants` getter (on 1.20.5+ servers it returns the raw
+#    component object instead of an array and throws on unknown versions, which
+#    crashes mineflayer's digTime with "(enchantments ?? []) is not iterable"
+#    — so the browser client could never break blocks while holding an
+#    enchanted item). The patch normalizes the getter.
+# 2. makeOptimizedMcData.mjs so the build-time mc-data prep loads only the
+#    current 1.21.x generation (1.21 → latest, ~10 versions) by default
+#    instead of every version (1.8 → 1.21.11): a fresh build peaks at
+#    ~2.3 GB RSS with the full corpus vs ~1.8 GB with the 1.21.x range (both
+#    measured). Going stricter than 1.21.x would break connecting to other
+#    server versions. Patching the source means even a manual `pnpm run build`
+#    inside web-client/src is clipped.
+# Both are covered by test/web-client-enchants.test.js.
 #
 # Usage:  npm run web-client:build        (or:  sh ./scripts/build-web-client.sh)
 set -euo pipefail
@@ -32,19 +40,22 @@ DIST_DIR="$BUILD_DIR/dist"
 MC_WEB_CLIENT_TAG="${MC_WEB_CLIENT_TAG:-v2.3.0}"
 
 # Version-range clipping for the build-time minecraft-data prep
-# (scripts/makeOptimizedMcData.mjs). That step loads the ENTIRE data corpus for
-# every supported MC version (1.8 → 1.21.11, ~18 MB raw each) into memory at
-# once, then diffs + gzips it — the single biggest memory peak of the whole
-# build (can exceed 2 GB; a 4 GB machine will swap/OOM). DEFAULT: only the
-# 1.21.11 corpus (one version, ~18 MB raw — the compressed blob is ~3 MB). The
-# web client auto-detects the server's version and needs data for that exact
-# version, so widen the range ONLY if you connect to other servers, e.g.:
-#   MIN_MC_VERSION=1.21 MAX_MC_VERSION=1.21.11 → all 1.21.x (inclusive range)
-#   MIN_MC_VERSION= MAX_MC_VERSION=             → full corpus (every version)
-# Note: equal min/max values mean EXACTLY that version (verified against the
-# real minecraft-data version list).
-MIN_MC_VERSION="${MIN_MC_VERSION:-1.21.11}"
-MAX_MC_VERSION="${MAX_MC_VERSION:-1.21.11}"
+# (scripts/makeOptimizedMcData.mjs). The patch script above already makes the
+# prep load only the current 1.21.x generation (1.21 → latest, ~10 versions)
+# by default — no env vars needed. These exports are belt-and-braces (they
+# apply even if the source patch fails to land) and let you override the
+# range, e.g.:
+#   MIN_MC_VERSION=1.21.11 MAX_MC_VERSION=1.21.11 → exactly 1.21.11 (only if
+#                                                    ALL your servers are that
+#                                                    exact version!)
+#   MIN_MC_VERSION= MAX_MC_VERSION=               → full corpus (every version)
+# A range narrower than the 1.21.x generation breaks connecting to servers
+# outside it — the client silently falls back to the base version's protocol
+# data when a version is absent from the blob (restoreData never throws).
+# Equal min/max values mean EXACTLY that version (verified against the real
+# minecraft-data version list).
+MIN_MC_VERSION="${MIN_MC_VERSION:-1.21}"
+MAX_MC_VERSION="${MAX_MC_VERSION:-}"
 
 command -v git >/dev/null 2>&1 || { echo "✗ git is required to build the web client" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "✗ node is required to build the web client" >&2; exit 1; }
