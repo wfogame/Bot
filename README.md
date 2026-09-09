@@ -182,6 +182,62 @@ TUI_GUI=false
 WEB_GUI=true
 ```
 
+## Slow broadcasts and bot selection
+
+These settings apply to `bot.js`, not `bot-rtp.js`. Restart the process after
+editing `.env` and refresh browser tabs after upgrading.
+
+### `/all-slow <command or message>`
+
+Like `/all`, but dispatches to the first bot immediately and then one bot per
+delay interval (15 seconds by default). For example:
+
+```text
+/all-slow /status
+/all-slow /crates purple
+/all-slow hello
+```
+
+- `ALL_SLOW_DELAY_MS` is in milliseconds. It must be an integer from 1 through
+  2147483647; missing, blank, zero, negative, fractional, or invalid values
+  fall back to 15000 rather than being clamped to a rapid timer by Node.
+- The roster is captured when the command starts. Bots added later are not
+  included. Removed bots are skipped; raw chat skips bots that are not spawned
+  at dispatch time. Local commands retain their own offline handling.
+- Arguments to local commands are preserved for both `/all` and `/all-slow`.
+- The delay spaces command *starts*, not completion of asynchronous routines.
+  Long-running routines may overlap and retain their existing per-bot guards.
+- Only one slow broadcast may be active at a time. A second request is rejected
+  with a warning; `/exit` cancels pending dispatches. Normal `/all` stays immediate.
+- The scheduler holds only one pending timeout, rather than one timeout per bot.
+
+### Random initial connection order
+
+`RANDOMIZE_BOT_ORDER` defaults to `true`. A Fisher-Yates shuffle creates a copy
+of `BOT_NAMES` at startup; the configured list itself is not mutated. Existing
+`CONNECT_DELAY_MS` and `CONNECT_DELAY_RANDOM_MS` spacing still applies.
+
+Set `RANDOMIZE_BOT_ORDER=false` to connect in the configured order. `0`, `no`,
+and `off` also disable shuffling (case-insensitive). Reconnect ordering is not
+changed. Bot list numbers follow creation order, so use `/list` before numeric
+`/switch` commands or use an exact name for a stable target.
+
+### `/switch <name or number>` in the WebGUI
+
+Switching selects and highlights the bot, updates its log subscription/history,
+and targets following commands to that bot. Selection belongs to the requesting
+browser tab; it does not change another tab or the TUI's active bot.
+
+Both WebSocket and HTTP fallback send the selected bot with each command.
+`/api/command` returns JSON `{ "accepted": true, "selectedId": null }`; a
+successful switch returns the selected bot name instead of `null`. The form
+fallback preserves selection through a `?view=` redirect. Invalid switch
+targets produce a warning rather than being sent to the game server. Commands
+aimed at a removed bot are not silently redirected to another bot.
+
+An ambiguous HTTP failure is no longer automatically replayed on reconnect:
+check logs before retrying to avoid accidentally executing a command twice.
+
 ## `bot.js` Configuration
 
 ### Connection and startup
@@ -198,6 +254,7 @@ WEB_GUI=true
 | `MAX_RECONNECT` | `17` | Maximum normal reconnect attempts |
 | `SERVER_COMMAND` | empty | Command sent after spawn instead of compass navigation |
 | `CLICK_COMPASS` | empty | Set to enable compass activation after spawn |
+| `RANDOMIZE_BOT_ORDER` | `true` | Shuffle the initial connection order (Fisher-Yates); `false`/`0`/`no`/`off` keep the configured order |
 
 ### GUI and crate automation
 
@@ -256,9 +313,18 @@ Bots not listed in any `PROXY_GROUP_<N>_BOTS` fall back to the global `PROXY_HOS
 | `WEB_TERMINAL_ENABLED` | `false` | Allow the browser terminal |
 | `WEB_TERMINAL_LOG` | `true` | Include web server trace messages |
 | `WS_BROADCAST_INTERVAL_MS` | `100` | WebSocket log batching interval |
-| `LOG_MAX_LINES` | `5000` | Stored lines per bot/system channel |
+| `LOG_MAX_LINES` | `1500` | Stored lines per bot/system channel (dashboard renders the last 400; lower = less memory) |
 | `WINDOW_DEBUG` | `false` | Include complete inventory slot dumps |
 | `CONFIG_PACKET_LOG_LIMIT` | `120` | Configuration packet log limit; `0` means unlimited |
+
+Resource-fix notes:
+
+- Filtered browser logs remain bounded even if none of the incoming lines match.
+- The all-channel history sort considers only the newest 400 entries per channel.
+- WebSocket log batches are not allocated or scheduled without connected viewers.
+- Stale HTTP poll responses do not overwrite the newly selected channel's logs.
+- Clients that fall too far behind (over 1 MB of buffered WebSocket output) are
+  skipped until they catch up, so a slow dashboard tab can never OOM the process.
 
 ### Minecraft web client (`/play` tab)
 
@@ -276,13 +342,18 @@ bridge, works with **offline-mode (cracked) servers** — any username, no
 account needed — and supports server versions 1.8 through 1.21.5
 (first-class 1.21.4). No server-side plugins required.
 
-**Building the client.** The Docker image builds it automatically from
-`zardoy/minecraft-web-client` (set `BUILD_WEB_CLIENT=0` as a `--build-arg` to
-skip that stage). Without Docker, build it once:
+**Building the client.** Both the Docker image and local builds use the same
+script — `scripts/build-web-client.sh` — so they can never drift apart. The
+Docker image builds it automatically (set `BUILD_WEB_CLIENT=0` as a
+`--build-arg` to skip that stage) and the script is also copied into the
+image, so you can rebuild the client inside a running container and it takes
+effect immediately:
 
 ```bash
 npm run web-client:build      # clones upstream + pnpm build → web-client/dist
 npm run web-client:serve      # optional standalone: serve it on :8090 by itself
+# inside a container (script ships in the image):
+docker exec <container> npm run web-client:build
 ```
 
 If the build is missing, `/play` shows a "build not found" page with these
@@ -294,7 +365,7 @@ instructions instead of embedding anything remote.
 | `MC_WEB_CLIENT_URL` | *(empty)* | Override client page URL (e.g. `https://client.example.com`); empty = serve the local build |
 | `MC_WEB_CLIENT_PORT` | `8090` | Local port serving the client build (bound only while `/play` is open; freed when you leave) |
 | `MC_WEB_CLIENT_PORT_MAX_ATTEMPTS` | `10` | Fallback ports tried if 8090 is taken |
-| `MC_WEB_CLIENT_DIR` | `web-client/dist` | Directory of the client build |
+| `MC_WEB_CLIENT_DIR` | `web-client/dist` | Directory of the client build (the Docker image bakes it there too, so no override is needed in containers) |
 | `MC_WEB_CLIENT_HOST_PORT` | *(empty)* | Host-side client port when Docker maps it (set by `run-docker.sh`) |
 | `MC_WEB_SERVER` | *(empty)* | Server address prefilled in the connect screen, e.g. `play.example.com:25565` |
 | `MC_WEB_VERSION` | `1.21.4` | Protocol version prefilled in the client |
@@ -353,6 +424,14 @@ Jobs are also managed from the terminal with `/cron` (list), `/cron add
 <id>` (run fires immediately, even for a disabled job). Terminal-added jobs
 last until the process exits; `.env` jobs reload on restart.
 
+The schedule may be quoted (`/cron add "0 4 * * *" /crates-all`) or bare
+(`/cron add 0 4 * * * /crates-all`, `/cron add @every 60 /status`); the rest
+of the line is the command, so chat messages with spaces work too. When both
+day-of-month and day-of-week are restricted, cron fires when either matches
+(standard OR semantics). A job that is still running when its next trigger
+arrives is skipped (no overlapping runs), and dispatcher errors are logged to
+the system channel.
+
 ## Commands
 
 Commands typed in the browser or TUI apply to the selected bot unless noted.
@@ -386,12 +465,127 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/crates-loop [n] [color]` | Repeat crate collection |
 | `/crates-all [n] [color]` | Run shardshop, crates, and dump across bots |
 | `/crates-solo [bot] [color]` | Run that sequence for one bot |
+| `/drop [count]` | Drop the held stack (or `count` items from it) |
+| `/pickup [all]` | Pathfind to the nearest dropped item and collect it (`all` = sweep the area) |
+| `/gui <server command>` | Open a server GUI and manage it manually (no auto-click/auto-warp) |
+| `/take <slot\|name\|all>` | Shift-click an item out of the open GUI into the inventory |
+| `/take-gui` / `/dump-gui` | Move all items GUI→inventory, or inventory→GUI |
+| `/view first\|third` | Switch the 3D viewer camera (first-person vs orbit) |
+| `/pos` | Show the active bot's position, facing, and dimension |
+| `/gui-tui` | Toggle the clickable ASCII GUI overlay for the open window |
 | `/exit` | Disconnect all bots and exit |
 
 Valid crate colors include `white`, `orange`, `magenta`, `light_blue`,
 `yellow`, `lime`, `pink`, `gray`, `light_gray`, `cyan`, `purple`, `blue`,
 `brown`, `green`, `red`, and `black`. A color may be written as a bare name or
 as a full block name such as `purple_shulker_box`.
+
+## `/find <name>` — search the whole fleet
+
+`/find` scans every bot's inventory **and** any open window and lists matching
+items, matching against the display name, the anvil custom name, and the
+registry/alternative name (`netherite_sword`), case-insensitively. Offline bots
+are reported as skipped. Example output:
+
+```text
+❯ /find sword
+[A] — 1 matching stack(s)
+  3x Sword (netherite_sword) — inv slot 12
+✓ Found 3 matching item(s) across 3 bot(s).
+```
+
+## Manual interact (items and server-command GUIs)
+
+- `/drop [count]` — drop the whole held stack, or `count` items from it.
+- `/pickup [all]` — pathfind to the nearest dropped item entity and wait until
+  it is collected (`all` sweeps everything within `MANUAL_PICKUP_RANGE`, default
+  16 blocks, capped at `MANUAL_PICKUP_MAX_ITEMS`). Item collection is passive in
+  Minecraft, so the bot walks onto the item and waits for it to vanish.
+- `/gui <server command>` — send a server command (e.g. `/gui /shardshop`) and
+  treat the window it opens as a **manual window session**: the automatic
+  slot-scan/click and the delayed AFK warp are suppressed, and `/window` /
+  `/window-click` / `/move` / `/window-close` take over. The session stays
+  manual for as long as the window is open — even when the server closes and
+  re-opens the GUI on click (which shop GUIs do) the auto-click and fatal-crate
+  search stay off, and this holds whether or not `/gui-tui` was toggled. The
+  session ends on `/window-close`, `/manual-stop`, or the auto-close below.
+- `/chat /<command>` — the same suppression is armed for `/`-prefixed server
+  commands sent through `/chat` (e.g. `/chat /shardshop`). Plain `/chat`
+  messages are unaffected, and the suppression expires after 5 seconds if no
+  window opens. Crate/shardshop routines clear it defensively at startup so a
+  stale arm can never swallow a routine's window.
+- `/take <slot|name|all>` — take a specific item out of the open GUI into the
+  bot's inventory: by raw slot (`/take 12`), by name match (`/take netherite`
+  matches the display, custom, or registry name), or `all`. Uses shift-clicks.
+- `/take-gui` — shift-click every item out of the open GUI into the inventory.
+- `/dump-gui` — shift-click the whole bot's inventory into the open GUI window
+  (the reverse of `/take-gui`). All three refuse to run while a crate/shardshop
+  routine is active, and abort safely if the window closes mid-way.
+- `/view first|third` — switch the 3D viewer camera. `first` shows the bot's
+  own view (what the bot sees, with the camera following its head); `third`
+  returns to the free orbit camera. The switch restarts the viewer server on
+  the same port — re-open the 🌍 viewer tab if it was already open.
+- `/pos` — show the active bot's location: X/Y/Z, facing yaw/pitch in degrees,
+  and dimension.
+- **Item names** — Minecraft items carry two names: the registry/base name
+  (e.g. `netherite_chestplate` / "Netherite Chestplate") and an optional custom
+  name set through an anvil or similar (e.g. a chestplate renamed "Fatal
+  Chestplate"). The dashboard GUI TUI, the `/window` listing, and `/inv` all
+  show the custom name as the primary name with the alternative name (the
+  registry key, e.g. `netherite_chestplate`) underneath, so renamed items are
+  identifiable and nothing silently keeps its base name.
+- **Auto-close** — if a manual GUI session is still open after
+  `MANUAL_GUI_TIMEOUT_MS` (default 20 minutes), the window is closed
+  automatically and automatic GUI handling (slot-scan/click, fatal-crate
+  search, AFK warp) is restored.
+- `/gui-tui` — with a window open, toggles the dashboard's ASCII GUI overlay
+  (a clickable slot grid that shrinks the log view). Left-click a slot for a
+  left click, right-click for a right click; `✕ close` closes the window and
+  `hide` dismisses the panel. Each slot shows both the display name and the
+  internal (alternative) name. The panel refreshes automatically: server slot
+  updates push live, clicks sent from the panel update the window, and if the
+  server closes/reopens the GUI on click the session is re-tracked so the
+  panel keeps following it.
+
+## `/overview` rank detection
+
+`/overview` detects each bot's rank with a single `/fix` probe (no `/rank`):
+
+- An access-denied reply (`You do not have access to the command`,
+  `no permission`) means the bot is a **Member**.
+- A `you are on cool down` reply (case-insensitive) means the probe itself was
+  rate-limited, so the rank shows **N/A**.
+- Any other reply — including generic errors like
+  `Error: This item cannot be repaired` — means the bot passed the `/fix` rank
+  gate, so the rank is **Regent**.
+
+`RANK_COOLDOWN_MS` (default 4500ms — 3× the server's `/fix` cooldown) is
+waited *before* `/fix` fires, because the balance queries that precede it send
+several commands back-to-back and would otherwise trip the server cooldown
+(the old code only spaced `/fix` → `/rank`, so `/fix` still got rate-limited
+and showed N/A). Override the command and spacing with `RANK_FIX_COMMAND` and
+`RANK_COOLDOWN_MS`.
+
+## Chat activity watchdog
+
+If no player chat has been seen for a while, the bot runs a server command
+(default `/server lifesteal`) to nudge itself back onto the right server.
+
+- Every `CHAT_WATCHDOG_CHECK_MS` (default 60s) each spawned bot checks how long
+  it has been since the last player chat message; if that exceeds
+  `CHAT_WATCHDOG_TIMEOUT_MS` (default 10 minutes) it sends
+  `CHAT_WATCHDOG_COMMAND` (default: `/server lifesteal`, falling back to
+  `SERVER_COMMAND`) and resets its timer.
+- Player chat is detected as `<name>: message` after stripping § color codes
+  and non-ASCII characters — the server can prefix usernames with odd unicode,
+  so the detector normalizes the line first. Messages from the fleet's own
+  bots (names that match a bot key) do not count.
+- Turn it off with `CHAT_WATCHDOG_ENABLED=0`; tune the cadence with
+  `CHAT_WATCHDOG_TIMEOUT_MS` and `CHAT_WATCHDOG_CHECK_MS`.
+
+Note: short server replies that look like `<word>: value` (e.g. `Shards: 123`)
+can also reset the timer; the watchdog is meant for servers where the chat is
+otherwise completely silent.
 
 ## Reconnect Behavior
 
@@ -432,6 +626,20 @@ For a free hosted deployment, configure [UptimeRobot](https://uptimerobot.com/)
 to request the bot's `/health` endpoint. Set the monitor interval to **12
 minutes**, not 5 minutes. The endpoint returns `ok` and does not require a
 dashboard login.
+
+## Tests
+
+```sh
+npm test
+node --check bot.js
+```
+
+Tests use Node's built-in runner with mocked Minecraft/network dependencies —
+they never connect to a live game server or require credentials. They cover
+delay validation, ordering, timing, cancellation, errors, local arguments,
+browser-tab isolation, HTTP/form routing, stale targets, immediate `/all`
+behavior, cron scheduling, `/find` matching, and the patched mineflayer
+dig-time calculation.
 
 ## Troubleshooting
 

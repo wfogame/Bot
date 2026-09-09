@@ -10,18 +10,18 @@
 ARG BUILD_WEB_CLIENT=1
 
 # ── Web client stage: build zardoy/minecraft-web-client from source ───────────
+# Reuses scripts/build-web-client.sh — the SAME script local builds use — so the
+# Docker and local builds can never drift apart (this script builds into
+# web-client/dist, which is exactly where the app serves from).
 FROM node:22-bookworm-slim AS webclient
 ARG BUILD_WEB_CLIENT
+WORKDIR /build
+COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
 RUN if [ "$BUILD_WEB_CLIENT" = "1" ]; then \
   apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* && \
   corepack enable && \
-  git clone --depth 1 --branch next https://github.com/zardoy/minecraft-web-client.git /client && \
-  cd /client && \
-  node ./scripts/dockerPrepare.mjs && \
-  pnpm i && \
-  pnpm run build && \
-  printf '{"allowAutoConnect":false}\n' > dist/config.json; \
-  else mkdir -p /client/dist; fi
+  sh ./scripts/build-web-client.sh; \
+  else mkdir -p web-client/dist; fi
 
 # ── App stage ─────────────────────────────────────────────────────────────────
 FROM node:22-bookworm-slim
@@ -49,7 +49,12 @@ COPY monitoring.js ./monitoring.js
 COPY bot-manual.js ./bot-manual.js
 COPY cron.js ./cron.js
 COPY web-client.js ./web-client.js
-COPY --from=webclient /client/dist /srv/web-client
+# Build script ships in the image so `npm run web-client:build` also works
+# inside a running container (docker exec …) to rebuild the client in place.
+COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
+# Baked client build lands in web-client/dist — the app's default serve dir —
+# so no env override is needed and in-container rebuilds overwrite the same path.
+COPY --from=webclient /build/web-client/dist ./web-client/dist
 COPY ${APP_FILE} ./index.js
 
 # Tor config: local SOCKS5 on 127.0.0.1:9050, drops privileges to debian-tor.
