@@ -370,7 +370,7 @@ module.exports = function createManualControls (deps) {
     // re-track the fresh instance so the dashboard TUI keeps following it, and
     // keep the automatic scan/click suppressed for the whole session. Never
     // claim a window while a crate/shardshop routine is running.
-    const inRoutine = entry.inCrateRoutine || entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning
+    const inRoutine = entry.inCrateRoutine || entry.inDumpRoutine || entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning
     if (entry.manualSession && !inRoutine) {
       trackManualWindow(entry, window)
       i(id, `Window "${windowTitle(window)}" re-opened (${window.slots.length} slots) — still manual.`)

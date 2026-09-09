@@ -8,7 +8,7 @@
     "test": "node --test test/*.test.js",
     "web-client:build": "sh ./scripts/build-web-client.sh",
     "web-client:serve": "node web-client.js",
-    "postinstall": "npx patch-package mineflayer || echo 'mineflayer patch already included or not applicable'"
+    "postinstall": "npx patch-package || echo 'mineflayer patch already included or not applicable'"
   },
   "keywords": [],
   "author": "",

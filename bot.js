@@ -1826,6 +1826,7 @@ lastDisconnectReason: null, // stores raw error text for transfer-crash classifi
 crateRoutineRunning: false, // prevents concurrent /crates runs
 crateLoopRunning: false, // prevents concurrent /crates-loop runs
 inCrateRoutine: false, // suppresses windowOpen handler during /crates
+inDumpRoutine: false, // suppresses windowOpen handler during /dump (chests must not be auto-clicked/warped)
 shardshopLoopRunning: false, // prevents concurrent /shardshop-loop runs
 lastActivity: Date.now(), // updated on every inbound packet — used by the proxy stall watchdog
 forceKilled: false, // set by the watchdog so scheduleReconnect logs it distinctly
@@ -2087,8 +2088,11 @@ try {
 // and the delayed AFK warp when manual mode is on or /window-open opened it.
 if (manual.onWindowOpen(id, window)) return
 
-// Skip the GUI/Fatal Crate handler when a /crates routine opened this window
-if (bots[id]?.inCrateRoutine) return
+// Skip the GUI/Fatal Crate handler when a /crates or /dump routine opened this
+// window. /dump opens chests to deposit items — the GUI item search, slot
+// auto-click, and delayed AFK warp must never run on them (it would grab
+// items out of the chest and warp away mid-dump).
+if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine) return
 
 const title = window.title?.toString ? window.title.toString() : String(window.title || '')
 
@@ -2404,6 +2408,12 @@ const COMMANDS = {
 * @param {object} bot - The mineflayer bot instance
 */
 async function tpaAndDump(bot, id) {
+// Suppress the generic windowOpen handler (GUI item search, slot auto-click,
+// and the delayed AFK warp) while dumping — /dump opens chests only to
+// deposit into them, and none of that automation may run on them.
+if (bots[id]) bots[id].inDumpRoutine = true
+try {
+
 const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
 const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
 
@@ -2477,6 +2487,10 @@ if (chestContainer) {
 try { await chestContainer.close() } catch (_) {}
 }
 }
+}
+
+} finally {
+if (bots[id]) bots[id].inDumpRoutine = false
 }
 }
 const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/shardshop-loop', '/closeBot']

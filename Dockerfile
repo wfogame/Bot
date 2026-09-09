@@ -17,6 +17,9 @@ FROM node:22-bookworm-slim AS webclient
 ARG BUILD_WEB_CLIENT
 WORKDIR /build
 COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
+# The build script runs scripts/patch-web-client-enchants.js (dig fix for
+# 1.20.5+ servers) — ship it alongside so the image build can apply it.
+COPY scripts/patch-web-client-enchants.js ./scripts/patch-web-client-enchants.js
 RUN if [ "$BUILD_WEB_CLIENT" = "1" ]; then \
   apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* && \
   corepack enable && \
@@ -40,7 +43,7 @@ WORKDIR /app
 
 # Dependencies in their own layer so app edits don't trigger reinstalls.
 # patches* is a glob — copied only if present, BEFORE npm install so the
-# postinstall (npx patch-package mineflayer) can apply them at build time.
+# postinstall (npx patch-package) can apply them at build time.
 COPY package*.json patches* ./
 RUN npm install --omit=dev --no-audit --no-fund
 
@@ -50,9 +53,11 @@ COPY monitoring.js ./monitoring.js
 COPY bot-manual.js ./bot-manual.js
 COPY cron.js ./cron.js
 COPY web-client.js ./web-client.js
-# Build script ships in the image so `npm run web-client:build` also works
-# inside a running container (docker exec …) to rebuild the client in place.
+# Build script (and its dig-fix patch script) ship in the image so
+# `npm run web-client:build` also works inside a running container
+# (docker exec …) to rebuild the client in place.
 COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
+COPY scripts/patch-web-client-enchants.js ./scripts/patch-web-client-enchants.js
 # Baked client build lands in web-client/dist — the app's default serve dir —
 # so no env override is needed and in-container rebuilds overwrite the same path.
 COPY --from=webclient /build/web-client/dist ./web-client/dist

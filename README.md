@@ -342,6 +342,12 @@ bridge, works with **offline-mode (cracked) servers** — any username, no
 account needed — and supports server versions 1.8 through 1.21.5
 (first-class 1.21.4). No server-side plugins required.
 
+The client is pinned to the **latest upstream release tag** (`v2.3.0`,
+verified against the GitHub releases page — the upstream `next` branch is the
+project's live dev branch, "usually newer, but might be less stable", and its
+moving head used to make Docker images non-reproducible). Rebuilds check the
+tag back out, so a stale or drifting dev-branch build can never sneak in.
+
 **Building the client.** Both the Docker image and local builds use the same
 script — `scripts/build-web-client.sh` — so they can never drift apart. The
 Docker image builds it automatically (set `BUILD_WEB_CLIENT=0` as a
@@ -350,11 +356,22 @@ image, so you can rebuild the client inside a running container and it takes
 effect immediately:
 
 ```bash
-npm run web-client:build      # clones upstream + pnpm build → web-client/dist
+npm run web-client:build      # checkout upstream v2.3.0 + pnpm build → web-client/dist
 npm run web-client:serve      # optional standalone: serve it on :8090 by itself
 # inside a container (script ships in the image):
 docker exec <container> npm run web-client:build
 ```
+
+**Block breaking on 1.20.5+ servers is fixed at build time.** The browser
+client bundles prismarine-item, whose `enchants` getter returns the raw
+1.20.5+ component object (`{ enchantments: [...] }`) instead of a flat array
+and throws on versions it doesn't recognize. That crashed mineflayer's
+digTime with "(enchantments ?? []) is not iterable" — so holding an enchanted
+tool meant the dig packet was never sent and blocks could never be broken.
+`scripts/patch-web-client-enchants.js` (run by the build script after
+`pnpm i`, covered by `test/web-client-enchants.test.js`) normalizes the
+getter to the classic `[{ name, lvl }]` array so digging and the inventory
+UI work again.
 
 If the build is missing, `/play` shows a "build not found" page with these
 instructions instead of embedding anything remote.
@@ -368,6 +385,7 @@ instructions instead of embedding anything remote.
 | `MC_WEB_CLIENT_DIR` | `web-client/dist` | Directory of the client build (the Docker image bakes it there too, so no override is needed in containers) |
 | `MC_WEB_CLIENT_HOST_PORT` | *(empty)* | Host-side client port when Docker maps it (set by `run-docker.sh`) |
 | `MC_WEB_SERVER` | *(empty)* | Server address prefilled in the connect screen, e.g. `play.example.com:25565` |
+| `MC_WEB_CLIENT_TAG` | `v2.3.0` | Upstream release tag the build script checks out (override if a newer release is wanted) |
 | `MC_WEB_VERSION` | `1.21.4` | Protocol version prefilled in the client |
 | `MC_WEB_USERNAME` | *(empty)* | Offline-mode username prefilled in the client |
 | `MC_WEB_PROXY` | *(empty)* | Your self-hosted mwc-proxy URL (see below) |
