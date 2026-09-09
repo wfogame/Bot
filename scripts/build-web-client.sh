@@ -39,8 +39,10 @@ MC_WEB_CLIENT_TAG="${MC_WEB_CLIENT_TAG:-v2.3.0}"
 # 1.21.11 corpus (one version, ~18 MB raw — the compressed blob is ~3 MB). The
 # web client auto-detects the server's version and needs data for that exact
 # version, so widen the range ONLY if you connect to other servers, e.g.:
-#   MIN_MC_VERSION=1.21 MAX_MC_VERSION=1.21   → all 1.21.x
-#   MIN_MC_VERSION= MAX_MC_VERSION=           → full corpus (every version)
+#   MIN_MC_VERSION=1.21 MAX_MC_VERSION=1.21.11 → all 1.21.x (inclusive range)
+#   MIN_MC_VERSION= MAX_MC_VERSION=             → full corpus (every version)
+# Note: equal min/max values mean EXACTLY that version (verified against the
+# real minecraft-data version list).
 MIN_MC_VERSION="${MIN_MC_VERSION:-1.21.11}"
 MAX_MC_VERSION="${MAX_MC_VERSION:-1.21.11}"
 
