@@ -266,7 +266,12 @@ The dashboard's **PLAY** button opens a browser-based Minecraft client
 ([zardoy/minecraft-web-client](https://github.com/zardoy/minecraft-web-client))
 embedded on `/play` — **fully self-hosted**: the client is built from source
 and served by this app on its own local port (`web-client.js`); nothing is
-loaded from a third-party hosted client. It connects through a WebSocket → TCP
+loaded from a third-party hosted client. The client server is **started lazily**
+on the first `/play` request and **stopped completely when you leave `/play`**
+(page-exit beacon plus a heartbeat watchdog), so on small hosts it only exists
+in memory while you are actually playing. Assets are gzipped with **streaming
+compression — nothing is cached in memory** (the multi-MB bundle never sits in
+RAM). It connects through a WebSocket → TCP
 bridge, works with **offline-mode (cracked) servers** — any username, no
 account needed — and supports server versions 1.8 through 1.21.5
 (first-class 1.21.4). No server-side plugins required.
@@ -287,7 +292,7 @@ instructions instead of embedding anything remote.
 | --- | --- | --- |
 | `MC_WEB_ENABLED` | `true` | Show the PLAY button and `/play` route |
 | `MC_WEB_CLIENT_URL` | *(empty)* | Override client page URL (e.g. `https://client.example.com`); empty = serve the local build |
-| `MC_WEB_CLIENT_PORT` | `8090` | Local port serving the client build |
+| `MC_WEB_CLIENT_PORT` | `8090` | Local port serving the client build (bound only while `/play` is open; freed when you leave) |
 | `MC_WEB_CLIENT_PORT_MAX_ATTEMPTS` | `10` | Fallback ports tried if 8090 is taken |
 | `MC_WEB_CLIENT_DIR` | `web-client/dist` | Directory of the client build |
 | `MC_WEB_CLIENT_HOST_PORT` | *(empty)* | Host-side client port when Docker maps it (set by `run-docker.sh`) |

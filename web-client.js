@@ -13,6 +13,10 @@
 const http = require('http')
 const fs = require('fs')
 const path = require('path')
+const zlib = require('zlib')
+
+// Text asset types worth gzipping — the client's main JS bundle is multi-MB.
+const COMPRESSIBLE = { '.html': true, '.js': true, '.mjs': true, '.css': true, '.json': true, '.map': true, '.svg': true, '.txt': true, '.wasm': true }
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -53,6 +57,9 @@ async function startWebClient({ dir, port = 8090, maxAttempts = 10, bind = '0.0.
     return { started: false, port: null, reason, server: null, dir: distDir }
   }
 
+  // Track open connections so stopWebClient() can tear the server down
+  // completely and free its memory (small-host friendly).
+  const sockets = new Set()
   const server = http.createServer((req, res) => {
     try {
       let p
@@ -65,11 +72,22 @@ async function startWebClient({ dir, port = 8090, maxAttempts = 10, bind = '0.0.
       }
       if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) file = indexPath
       const ext = path.extname(file).toLowerCase()
-      res.writeHead(200, {
+      const headers = {
         'Content-Type': MIME[ext] || 'application/octet-stream',
         'Cache-Control': 'no-cache',
         'X-Content-Type-Options': 'nosniff'
-      })
+      }
+      // Serve gzip for text assets when the browser accepts it. Compression is
+      // streamed — nothing is buffered or cached in memory, so serving the
+      // multi-MB client bundle costs only a tiny rolling buffer.
+      if (COMPRESSIBLE[ext] && /\bgzip\b/.test(req.headers['accept-encoding'] || '')) {
+        headers['Content-Encoding'] = 'gzip'
+        headers['Vary'] = 'Accept-Encoding'
+        res.writeHead(200, headers)
+        fs.createReadStream(file).pipe(zlib.createGzip({ level: 6 })).pipe(res)
+        return
+      }
+      res.writeHead(200, headers)
       fs.createReadStream(file).pipe(res)
     } catch (err) {
       try { res.writeHead(500); res.end('internal error') } catch (_) {}
@@ -77,12 +95,14 @@ async function startWebClient({ dir, port = 8090, maxAttempts = 10, bind = '0.0.
     }
   })
 
+  server.on('connection', s => { sockets.add(s); s.on('close', () => sockets.delete(s)) })
+
   const attempts = Math.max(1, maxAttempts)
   for (let i = 0; i < attempts; i++) {
     try {
       const actualPort = await listen(server, port + i, bind)
       log(`web client serving ${distDir} on ${bind}:${actualPort}`)
-      return { started: true, port: actualPort, reason: '', server, dir: distDir }
+      return { started: true, port: actualPort, reason: '', server, dir: distDir, _sockets: sockets }
     } catch (e) {
       if (e && (e.code === 'EADDRINUSE' || e.code === 'EACCES')) continue
       const reason = e ? e.message || String(e) : 'listen failed'
@@ -105,4 +125,13 @@ if (require.main === module) {
   })
 }
 
-module.exports = { startWebClient }
+// Fully stops the client server: closes the listener AND destroys lingering
+// connections so the process actually releases the memory, not just the port.
+function stopWebClient(handle, log = () => {}) {
+  if (!handle || !handle.server) return
+  if (handle._sockets) for (const s of handle._sockets) { try { s.destroy() } catch (_) {} }
+  try { handle.server.close() } catch (_) {}
+  log('web client server stopped')
+}
+
+module.exports = { startWebClient, stopWebClient }

@@ -1292,31 +1292,51 @@ try { pageGz = zlib.gzipSync(pageBuf, { level: 6 }) } catch (_) {}
 function playPageHtml(base) {
 const clientUrl = webClientUrl({ base: base || MC_WEB_CLIENT_URL, ip: MC_WEB_SERVER, version: MC_WEB_VERSION, username: MC_WEB_USERNAME, proxy: MC_WEB_PROXY })
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Minecraft — AFK Console</title>\n<style>\nhtml,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace;display:flex;flex-direction:column}\n.bar{display:flex;align-items:center;gap:12px;padding:8px 14px;background:linear-gradient(180deg,#101a24,#0d141c);border-bottom:1px solid #1d2836;flex-wrap:wrap}\n.bar b{color:#2dd4bf;letter-spacing:.5px}\n.bar a{color:#c7d2dc;text-decoration:none;border:1px solid #1d2836;border-radius:6px;padding:3px 10px;font-size:12px}\n.bar a:hover{border-color:#2dd4bf;color:#e8f0f6}\n.bar .hint{margin-left:auto;color:#5b6b7a;font-size:11px}\niframe{flex:1;border:0;width:100%;min-height:0}\n</style></head><body>\n<div class="bar"><b>⛏ Minecraft Web Client</b><a href="/">← dashboard</a><span class="hint">offline-mode (cracked) servers supported — set MC_WEB_* in .env to prefill</span></div>\n<iframe src="${esc(clientUrl)}" title="Minecraft Web Client" allow="fullscreen; pointer-lock; clipboard-write; gamepad; autoplay"></iframe>\n</body></html>`
+return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Minecraft — AFK Console</title>\n<style>\nhtml,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace;display:flex;flex-direction:column}\n.bar{display:flex;align-items:center;gap:12px;padding:8px 14px;background:linear-gradient(180deg,#101a24,#0d141c);border-bottom:1px solid #1d2836;flex-wrap:wrap}\n.bar b{color:#2dd4bf;letter-spacing:.5px}\n.bar a{color:#c7d2dc;text-decoration:none;border:1px solid #1d2836;border-radius:6px;padding:3px 10px;font-size:12px}\n.bar a:hover{border-color:#2dd4bf;color:#e8f0f6}\n.bar .hint{margin-left:auto;color:#5b6b7a;font-size:11px}\niframe{flex:1;border:0;width:100%;min-height:0}\n</style></head><body>\n<div class="bar"><b>⛏ Minecraft Web Client</b><a href="/">← dashboard</a><span class="hint">offline-mode (cracked) servers supported — set MC_WEB_* in .env to prefill</span></div>\n<iframe src="${esc(clientUrl)}" title="Minecraft Web Client" allow="fullscreen; pointer-lock; clipboard-write; gamepad; autoplay"></iframe>\n<script>\n(function () {\n  var ping = function () { try { fetch('/play-ping', { cache: 'no-store' }) } catch (e) {} }\n  ping()\n  setInterval(ping, 5000)\n  window.addEventListener('pagehide', function () {\n    try { navigator.sendBeacon('/play-stop') } catch (e) {\n      try { fetch('/play-stop', { method: 'POST', keepalive: true }) } catch (e2) {}\n    }\n  })\n})()\n</script>\n</body></html>`
 }
 
 // Local web client server: serves the self-hosted build (never a remote site).
+// Started lazily on the first /play request — no extra port is bound and no
+// client assets are loaded unless someone actually opens the PLAY tab. It is
+// also stopped completely when the PLAY tab is left (pagehide beacon) or goes
+// silent (heartbeat watchdog), so its memory is fully released on small hosts.
 let webClientHandle = { started: false, port: null, reason: "", server: null, dir: MC_WEB_CLIENT_DIR }
-let webClientReady = Promise.resolve(webClientHandle)
-if (MC_WEB_ENABLED) {
+let webClientReady = null
+let webClientLastPing = 0
+let webClientWatchdog = null
+function stopWebClient(reason) {
+if (webClientWatchdog) { clearInterval(webClientWatchdog); webClientWatchdog = null }
+const h = webClientHandle
+if (h && h.started && h.server) {
+try { require('./web-client').stopWebClient(h) } catch (_) {}
+logFor(SYSTEM_ID, `{yellow-fg}\u23f9 Minecraft web client stopped (${reason || 'no heartbeat'}){/yellow-fg}`)
+}
+webClientHandle = { started: false, port: null, reason: "", server: null, dir: MC_WEB_CLIENT_DIR }
+webClientReady = null
+webClientLastPing = 0
+}
+function ensureWebClient() {
+if (!webClientReady) {
+webClientReady = (async () => {
 try {
 const wc = require('./web-client')
-webClientReady = wc.startWebClient({ dir: MC_WEB_CLIENT_DIR, port: MC_WEB_CLIENT_PORT, maxAttempts: MC_WEB_CLIENT_PORT_MAX_ATTEMPTS, log: m => logFor(SYSTEM_ID, `{gray-fg}[web-client] ${sanitize(m)}{/gray-fg}`) })
-.then(h => {
+const h = await wc.startWebClient({ dir: MC_WEB_CLIENT_DIR, port: MC_WEB_CLIENT_PORT, maxAttempts: MC_WEB_CLIENT_PORT_MAX_ATTEMPTS, log: m => logFor(SYSTEM_ID, `{gray-fg}[web-client] ${sanitize(m)}{/gray-fg}`) })
 webClientHandle = h
-if (h.started) logFor(SYSTEM_ID, `{green-fg}\u2713 Minecraft web client serving on :${h.port}{/green-fg}`)
-else logFor(SYSTEM_ID, `{yellow-fg}\u26a0 ${sanitize(h.reason)}{/yellow-fg}`)
-return h
-})
-.catch(err => {
-webClientHandle = { started: false, port: null, reason: err.message || String(err), server: null, dir: MC_WEB_CLIENT_DIR }
-logFor(SYSTEM_ID, `{yellow-fg}\u26a0 web client server error: ${sanitize(err.message || String(err))}{/yellow-fg}`)
-return webClientHandle
-})
+if (h.started) {
+webClientLastPing = Date.now()
+logFor(SYSTEM_ID, `{green-fg}\u2713 Minecraft web client serving on :${h.port}{/green-fg}`)
+if (!webClientWatchdog) webClientWatchdog = setInterval(() => {
+if (webClientHandle.started && webClientLastPing && Date.now() - webClientLastPing > 45_000) stopWebClient()
+}, 10_000)
+} else logFor(SYSTEM_ID, `{yellow-fg}\u26a0 ${sanitize(h.reason)}{/yellow-fg}`)
 } catch (err) {
 webClientHandle = { started: false, port: null, reason: err.message || String(err), server: null, dir: MC_WEB_CLIENT_DIR }
 logFor(SYSTEM_ID, `{yellow-fg}\u26a0 web client server error: ${sanitize(err.message || String(err))}{/yellow-fg}`)
 }
+return webClientHandle
+})()
+}
+return webClientReady
 }
 
 // Where the /play iframe points: explicit override, or the local client server.
@@ -1485,9 +1505,18 @@ res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'C
 res.end(appJsBuf)
 return
 }
+if (p === '/play-ping' && (req.method === 'GET' || req.method === 'POST')) {
+webClientLastPing = Date.now()
+res.writeHead(204); res.end(); return
+}
+if (p === '/play-stop' && req.method === 'POST') {
+stopWebClient('page closed')
+res.writeHead(204); res.end(); return
+}
 if (p === '/play' && req.method === 'GET') {
 if (!MC_WEB_ENABLED) { res.writeHead(404); res.end('not found'); return }
-await webClientReady
+webClientLastPing = Date.now()
+await ensureWebClient()
 if (!webClientHandle.started && !MC_WEB_CLIENT_URL) {
 res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
 res.end(clientNotBuiltHtml())
@@ -1705,8 +1734,9 @@ try { process.stdout.write(`[web] listening on ${WEB_BIND}:${port} — open port
 })
 }
 listenFallback(WEB_PORT, WEB_PORT_MAX_ATTEMPTS)
-handle.webClient = webClientHandle
-handle.webClientReady = webClientReady
+// Live views of the lazy web-client state (started on first /play request).
+Object.defineProperty(handle, 'webClient', { get: () => webClientHandle, configurable: true })
+Object.defineProperty(handle, 'webClientReady', { get: () => webClientReady, configurable: true })
 return handle
 }
 

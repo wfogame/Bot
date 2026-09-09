@@ -335,11 +335,40 @@ test('/play serves the self-hosted minecraft web client with prefills', async ()
     assert.match(res.body, /<iframe/)
     assert.match(res.body, /http:\/\/localhost:[0-9]+\/\?ip=play\.example\.com%3A25565&amp;version=1\.21\.4&amp;username=Steve&amp;proxy=wss%3A%2F%2Fmc\.example\.com/)
     assert.doesNotMatch(res.body, /mcraft\.fun/)
+    // Page heartbeats while open and beacons a stop on exit.
+    assert.match(res.body, /play-ping/)
+    assert.match(res.body, /sendBeacon\('\/play-stop'\)/)
     const h = await r.run('webHandle.webClientReady')
     assert.equal(h.started, true)
     const dash = await r.request('/', '', cookie, 'GET')
     assert.match(dash.body.toString(), /id="playbtn"/)
     h.server.close()
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('/play-stop fully stops the client server and /play restarts it on the same port', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcweb-'))
+  fs.writeFileSync(path.join(dir, 'index.html'), '<html>fake client</html>')
+  try {
+    const r = runtime({ MC_WEB_CLIENT_DIR: dir })
+    const cookie = await r.login()
+    await r.request('/play', '', cookie, 'GET')
+    const h1 = await r.run('webHandle.webClientReady')
+    assert.equal(h1.started, true)
+    const port1 = h1.port
+    const res = await r.request('/play-stop', '', cookie, 'POST')
+    assert.equal(res.status, 204)
+    const after = await r.run('webHandle.webClientReady')
+    assert.equal(after, null)
+    assert.equal((await r.run('webHandle.webClient')).started, false)
+    // Port is freed → the next /play binds the same port again.
+    await r.request('/play', '', cookie, 'GET')
+    const h3 = await r.run('webHandle.webClientReady')
+    assert.equal(h3.started, true)
+    assert.equal(h3.port, port1)
+    h3.server.close()
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
