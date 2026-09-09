@@ -15,6 +15,13 @@ ARG BUILD_WEB_CLIENT=1
 # web-client/dist, which is exactly where the app serves from).
 FROM node:22-bookworm-slim AS webclient
 ARG BUILD_WEB_CLIENT
+# Version-range clipping for the web client's build-time minecraft-data prep
+# (see scripts/build-web-client.sh). The default is 1.21.11 ONLY (set inside
+# the script) so the build never loads every supported MC version into memory
+# at once — widen with --build-arg MIN_MC_VERSION / MAX_MC_VERSION only if
+# the client must connect to other server versions.
+ARG MIN_MC_VERSION
+ARG MAX_MC_VERSION
 WORKDIR /build
 COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
 # The build script runs scripts/patch-web-client-enchants.js (dig fix for
@@ -23,7 +30,7 @@ COPY scripts/patch-web-client-enchants.js ./scripts/patch-web-client-enchants.js
 RUN if [ "$BUILD_WEB_CLIENT" = "1" ]; then \
   apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* && \
   corepack enable && \
-  bash ./scripts/build-web-client.sh && \
+  MIN_MC_VERSION="$MIN_MC_VERSION" MAX_MC_VERSION="$MAX_MC_VERSION" bash ./scripts/build-web-client.sh && \
   test -f web-client/dist/index.html || { echo "✗ web-client build did not produce web-client/dist/index.html — see the build log above for the real error (git clone / pnpm install / pnpm run build)." >&2; exit 1; }; \
   else mkdir -p web-client/dist; fi
 

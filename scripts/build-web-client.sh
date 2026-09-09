@@ -31,6 +31,19 @@ DIST_DIR="$BUILD_DIR/dist"
 # reproducible and immune to future dev-branch regressions.
 MC_WEB_CLIENT_TAG="${MC_WEB_CLIENT_TAG:-v2.3.0}"
 
+# Version-range clipping for the build-time minecraft-data prep
+# (scripts/makeOptimizedMcData.mjs). That step loads the ENTIRE data corpus for
+# every supported MC version (1.8 → 1.21.11, ~18 MB raw each) into memory at
+# once, then diffs + gzips it — the single biggest memory peak of the whole
+# build (can exceed 2 GB; a 4 GB machine will swap/OOM). DEFAULT: only the
+# 1.21.11 corpus (one version, ~18 MB raw — the compressed blob is ~3 MB). The
+# web client auto-detects the server's version and needs data for that exact
+# version, so widen the range ONLY if you connect to other servers, e.g.:
+#   MIN_MC_VERSION=1.21 MAX_MC_VERSION=1.21   → all 1.21.x
+#   MIN_MC_VERSION= MAX_MC_VERSION=           → full corpus (every version)
+MIN_MC_VERSION="${MIN_MC_VERSION:-1.21.11}"
+MAX_MC_VERSION="${MAX_MC_VERSION:-1.21.11}"
+
 command -v git >/dev/null 2>&1 || { echo "✗ git is required to build the web client" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "✗ node is required to build the web client" >&2; exit 1; }
 
@@ -59,6 +72,9 @@ pnpm i
 # Fix block breaking on 1.20.5+ servers BEFORE building (see header comment).
 echo "▸ applying prismarine-item enchants fix (digging on 1.20.5+ servers)…"
 node "$PROJECT_ROOT/scripts/patch-web-client-enchants.js" "$SRC_DIR"
+
+echo "▸ minecraft-data corpus: ${MIN_MC_VERSION:-all} → ${MAX_MC_VERSION:-all}"
+export MIN_MC_VERSION MAX_MC_VERSION
 
 echo "▸ building (pnpm run build)…"
 pnpm run build
