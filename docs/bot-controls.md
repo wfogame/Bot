@@ -211,6 +211,22 @@ on every restart. A job that is still running when its next trigger arrives is
 skipped (no overlapping runs), and dispatcher errors are logged to the system
 channel.
 
+## Browser Minecraft client (PLAY tab)
+
+The WebGUI sidebar's **PLAY** button opens `/play`, an embedded browser
+Minecraft client (zardoy/minecraft-web-client) served **fully self-hosted**
+from this app on its own local port (`web-client.js`, default 8090) — no
+third-party hosted client is embedded. The client build lives in
+`web-client/dist`; build it with `npm run web-client:build` or let the Docker
+image bake it in (the `/play` page explains this if the build is missing). It
+connects through a WebSocket → TCP proxy, works with offline-mode (cracked)
+servers at 1.8–1.21.5, and needs no server plugins. Prefill the connect screen
+with `MC_WEB_SERVER`, `MC_WEB_VERSION`, `MC_WEB_USERNAME`, and point
+`MC_WEB_PROXY` at a self-hosted mwc-proxy for private servers
+(`./run-docker.sh proxy`; use `wss://` when the dashboard is served over
+https). See the README's "Minecraft web client" section for the full env table
+and proxy setup.
+
 ## Tests
 
 ```sh

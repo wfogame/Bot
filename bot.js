@@ -59,6 +59,35 @@ const WEB_SESSION_HOURS = parseFloat(process.env.WEB_SESSION_HOURS || '12')
 const WEB_LOGIN_MAX_FAILS = parseInt(process.env.WEB_LOGIN_MAX_FAILS || '10', 10)
 const WEB_TERMINAL_LOG = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_LOG ?? 'true')
 const WEB_TERMINAL_ENABLED = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_ENABLED || 'false')
+
+// ── Minecraft web client (/play tab): self-hosted zardoy/minecraft-web-client ──
+// The client build (web-client/dist — see scripts/build-web-client.sh or the
+// Dockerfile) is served locally by web-client.js on its own port and embedded
+// in /play. The browser client talks WebSocket to a proxy (mwc-proxy — self-host
+// with ./run-docker.sh proxy or `npx minecraft-web-proxy`) that bridges to the
+// Minecraft server over TCP. MC_WEB_SERVER/…/MC_WEB_PROXY only prefill the
+// connect screen; everything can be edited in the client itself.
+const MC_WEB_ENABLED = /^(1|true|yes|on)$/i.test(process.env.MC_WEB_ENABLED ?? 'true')
+const MC_WEB_CLIENT_URL = process.env.MC_WEB_CLIENT_URL || '' // override for the client page (e.g. https://client.example.com); empty = serve the local build
+const MC_WEB_CLIENT_PORT = parseInt(process.env.MC_WEB_CLIENT_PORT || '8090', 10) // local port serving the client build
+const MC_WEB_CLIENT_PORT_MAX_ATTEMPTS = parseInt(process.env.MC_WEB_CLIENT_PORT_MAX_ATTEMPTS || '10', 10)
+const MC_WEB_CLIENT_DIR = process.env.MC_WEB_CLIENT_DIR || require('path').join(__dirname, 'web-client', 'dist')
+const MC_WEB_CLIENT_HOST_PORT = process.env.MC_WEB_CLIENT_HOST_PORT || '' // host-side client port when docker maps it (set by run-docker.sh)
+const MC_WEB_SERVER = process.env.MC_WEB_SERVER || '' // e.g. play.example.com:25565 (prefilled server address)
+const MC_WEB_VERSION = process.env.MC_WEB_VERSION || '1.21.4' // protocol version the client uses
+const MC_WEB_USERNAME = process.env.MC_WEB_USERNAME || '' // offline-mode username prefilled in the client
+const MC_WEB_PROXY = process.env.MC_WEB_PROXY || '' // self-hosted mwc-proxy, e.g. wss://mc.example.com (https page → wss required)
+
+// Build the client URL with connect-screen prefills. Pure so tests can call it.
+function webClientUrl({ base = 'http://localhost/', ip = '', version = '', username = '', proxy = '' } = {}) {
+const u = new URL(base)
+const q = u.searchParams
+if (ip) q.set('ip', ip)
+if (version) q.set('version', version)
+if (username) q.set('username', username)
+if (proxy) q.set('proxy', proxy)
+return u.toString()
+}
 const SSH_CONFIG = sshConfig()
 const SSH_ENABLED = SSH_CONFIG.enabled
 const WS_BROADCAST_INTERVAL_MS = parseInt(process.env.WS_BROADCAST_INTERVAL_MS || '100', 10)
@@ -860,7 +889,7 @@ button.tb:hover{color:var(--txt);border-color:var(--acc)}
 </style></head><body>
 <div id="app">
 <header><div class="logo">⛏ AFK<b>CONSOLE</b></div><div id="chips"></div><div id="wsstate" class="wsstate down">offline</div><button id="logout">sign out</button></header>
-<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button></div><div id="botlist"></div></aside>
+<aside><div class="views"><div class="vchip on" data-view="all">ALL</div><div class="vchip" data-view="system">SYSTEM</div><button class="vchip" id="terminalbtn" type="button">TERMINAL</button><!--PLAYBTN--></div><div id="botlist"></div></aside>
 <main>
 <div id="loghead"><span id="channame">ALL CHANNELS</span><span id="newchip"></span>
 <input id="search" placeholder="filter logs…"><button class="tb" id="topbtn" type="button" title="scroll to top">↑ top</button><button class="tb" id="bottombtn" type="button" title="scroll to newest">↓ bottom</button><button class="tb" id="followbtn" type="button">⏸ pause</button>
@@ -1189,6 +1218,7 @@ el('cmdbar').addEventListener('submit',function(e){e.preventDefault();var v=cinp
 el('topbtn').onclick=function(){follow=false;scrollOnNextLog=false;el('followbtn').textContent='▶ follow';el('logwrap').scrollTop=0}
 el('bottombtn').onclick=function(){setFollow(true)}
 el('terminalbtn').onclick=openTerminal
+var pb=el('playbtn');if(pb)pb.onclick=function(){window.open('/play','_blank','noopener')}
 el('terminalclose').onclick=closeTerminal
 window.addEventListener('resize',function(){
 if(!terminalOpen||!ws||ws.readyState!==1)return
@@ -1252,11 +1282,62 @@ const handle = { clients, port: null, url: null }
 // source co-located with the dashboard markup.
 const appJsMatch = PAGE_HTML.match(/<script>([\s\S]*?)<\/script>/)
 const appJsBuf = Buffer.from(appJsMatch ? appJsMatch[1] : '', 'utf8')
-const pageHtml = PAGE_HTML.replace(/<script>[\s\S]*?<\/script>/, '<script src="/app.js"></script>')
+const pageHtml = PAGE_HTML
+.replace('<!--PLAYBTN-->', MC_WEB_ENABLED ? '<button class="vchip" id="playbtn" type="button" title="Play the server in your browser (zardoy minecraft-web-client)">PLAY</button>' : '')
+.replace(/<script>[\s\S]*?<\/script>/, '<script src="/app.js"></script>')
 const pageBuf = Buffer.from(pageHtml, 'utf8')
 let pageGz = null
 try { pageGz = zlib.gzipSync(pageBuf, { level: 6 }) } catch (_) {}
 
+function playPageHtml(base) {
+const clientUrl = webClientUrl({ base: base || MC_WEB_CLIENT_URL, ip: MC_WEB_SERVER, version: MC_WEB_VERSION, username: MC_WEB_USERNAME, proxy: MC_WEB_PROXY })
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>Minecraft — AFK Console</title>\n<style>\nhtml,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.4 ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace;display:flex;flex-direction:column}\n.bar{display:flex;align-items:center;gap:12px;padding:8px 14px;background:linear-gradient(180deg,#101a24,#0d141c);border-bottom:1px solid #1d2836;flex-wrap:wrap}\n.bar b{color:#2dd4bf;letter-spacing:.5px}\n.bar a{color:#c7d2dc;text-decoration:none;border:1px solid #1d2836;border-radius:6px;padding:3px 10px;font-size:12px}\n.bar a:hover{border-color:#2dd4bf;color:#e8f0f6}\n.bar .hint{margin-left:auto;color:#5b6b7a;font-size:11px}\niframe{flex:1;border:0;width:100%;min-height:0}\n</style></head><body>\n<div class="bar"><b>⛏ Minecraft Web Client</b><a href="/">← dashboard</a><span class="hint">offline-mode (cracked) servers supported — set MC_WEB_* in .env to prefill</span></div>\n<iframe src="${esc(clientUrl)}" title="Minecraft Web Client" allow="fullscreen; pointer-lock; clipboard-write; gamepad; autoplay"></iframe>\n</body></html>`
+}
+
+// Local web client server: serves the self-hosted build (never a remote site).
+let webClientHandle = { started: false, port: null, reason: "", server: null, dir: MC_WEB_CLIENT_DIR }
+let webClientReady = Promise.resolve(webClientHandle)
+if (MC_WEB_ENABLED) {
+try {
+const wc = require('./web-client')
+webClientReady = wc.startWebClient({ dir: MC_WEB_CLIENT_DIR, port: MC_WEB_CLIENT_PORT, maxAttempts: MC_WEB_CLIENT_PORT_MAX_ATTEMPTS, log: m => logFor(SYSTEM_ID, `{gray-fg}[web-client] ${sanitize(m)}{/gray-fg}`) })
+.then(h => {
+webClientHandle = h
+if (h.started) logFor(SYSTEM_ID, `{green-fg}\u2713 Minecraft web client serving on :${h.port}{/green-fg}`)
+else logFor(SYSTEM_ID, `{yellow-fg}\u26a0 ${sanitize(h.reason)}{/yellow-fg}`)
+return h
+})
+.catch(err => {
+webClientHandle = { started: false, port: null, reason: err.message || String(err), server: null, dir: MC_WEB_CLIENT_DIR }
+logFor(SYSTEM_ID, `{yellow-fg}\u26a0 web client server error: ${sanitize(err.message || String(err))}{/yellow-fg}`)
+return webClientHandle
+})
+} catch (err) {
+webClientHandle = { started: false, port: null, reason: err.message || String(err), server: null, dir: MC_WEB_CLIENT_DIR }
+logFor(SYSTEM_ID, `{yellow-fg}\u26a0 web client server error: ${sanitize(err.message || String(err))}{/yellow-fg}`)
+}
+}
+
+// Where the /play iframe points: explicit override, or the local client server.
+function clientBaseFor(req) {
+if (MC_WEB_CLIENT_URL) return MC_WEB_CLIENT_URL
+const host = String((req && req.headers && req.headers.host) || '').split(':')[0] || 'localhost'
+const port = MC_WEB_CLIENT_HOST_PORT || String(webClientHandle.port || MC_WEB_CLIENT_PORT)
+return `http://${host}:${port}/`
+}
+
+function clientNotBuiltHtml() {
+const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Minecraft \u2014 AFK Console</title>
+<style>html,body{height:100%;margin:0;background:#0a0e13;color:#c7d2dc;font:13px/1.4 ui-monospace,Consolas,monospace;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px}
+code{background:#131b25;border:1px solid #1d2836;border-radius:6px;padding:2px 8px;color:#67e8f9}
+a{color:#2dd4bf}</style></head><body>
+<div><b style="color:#2dd4bf">\u26cf Minecraft Web Client</b> \u2014 build not found</div>
+<div style="color:#5b6b7a;max-width:660px;text-align:center;line-height:1.6">The self-hosted client build is missing from <code>${esc(webClientHandle.dir)}</code>. Build it once with <code>npm run web-client:build</code> (clones zardoy/minecraft-web-client and runs its production build \u2014 takes a few minutes), or rebuild the Docker image, which bakes it in.</div>
+<a href="/">\u2190 back to dashboard</a>
+</body></html>`
+}
 function newSession() {
 const token = crypto.randomBytes(24).toString('base64url')
 sessions.set(token, Date.now() + SESSION_MS)
@@ -1402,6 +1483,19 @@ if (p === '/app.js' && req.method === 'GET') {
 webTrace(`serving dashboard script (${appJsBuf.length} bytes)`)
 res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store' })
 res.end(appJsBuf)
+return
+}
+if (p === '/play' && req.method === 'GET') {
+if (!MC_WEB_ENABLED) { res.writeHead(404); res.end('not found'); return }
+await webClientReady
+if (!webClientHandle.started && !MC_WEB_CLIENT_URL) {
+res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(clientNotBuiltHtml())
+return
+}
+webTrace('serving minecraft web client page')
+res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+res.end(playPageHtml(clientBaseFor(req)))
 return
 }
 res.writeHead(404); res.end('not found')
@@ -1611,6 +1705,8 @@ try { process.stdout.write(`[web] listening on ${WEB_BIND}:${port} — open port
 })
 }
 listenFallback(WEB_PORT, WEB_PORT_MAX_ATTEMPTS)
+handle.webClient = webClientHandle
+handle.webClientReady = webClientReady
 return handle
 }
 

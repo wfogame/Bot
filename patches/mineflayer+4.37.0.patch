@@ -1,3 +1,63 @@
+diff --git a/node_modules/mineflayer/lib/plugins/digging.js b/node_modules/mineflayer/lib/plugins/digging.js
+index 5ae5552..a7737ca 100644
+--- a/node_modules/mineflayer/lib/plugins/digging.js
++++ b/node_modules/mineflayer/lib/plugins/digging.js
+@@ -233,14 +233,14 @@ function inject (bot) {
+     const currentlyHeldItem = bot.heldItem
+     if (currentlyHeldItem) {
+       type = currentlyHeldItem.type
+-      enchantments = currentlyHeldItem.enchants
++      enchantments = getEnchantments(currentlyHeldItem)
+     }
+ 
+     // Append helmet enchantments (because Aqua Affinity actually affects dig speed)
+     const headEquipmentSlot = bot.getEquipmentDestSlot('head')
+     const headEquippedItem = bot.inventory.slots[headEquipmentSlot]
+     if (headEquippedItem) {
+-      const helmetEnchantments = headEquippedItem.enchants
++      const helmetEnchantments = getEnchantments(headEquippedItem)
+       enchantments = enchantments.concat(helmetEnchantments)
+     }
+ 
+@@ -255,6 +255,38 @@ function inject (bot) {
+     )
+   }
+ 
++  // item.enchants returns different shapes per protocol version: a plain
++  // [{ name, lvl }] array on pre-1.20.5, but the raw 1.20.5+ component
++  // object ({ enchantments: [{ id, level }] }) — or it throws on versions it
++  // does not understand. Normalize to [{ name, lvl }] and never throw,
++  // otherwise every dig crashes with "enchantments.concat is not a function".
++  function getEnchantments (item) {
++    let enchants
++    try {
++      enchants = item.enchants
++    } catch {
++      return []
++    }
++    return normalizeEnchants(enchants)
++  }
++
++  function normalizeEnchants (enchants) {
++    if (Array.isArray(enchants)) return enchants
++    if (!enchants || typeof enchants !== 'object') return []
++    let list = enchants.enchantments ?? enchants.stored_enchantments ?? enchants
++    if (list && list.type === 'list' && Array.isArray(list.value?.value)) list = list.value.value
++    if (!Array.isArray(list)) return []
++    return list.map((entry) => {
++      if (!entry || typeof entry !== 'object') return null
++      let name = entry.name
++      if (name == null && entry.id != null) {
++        const id = entry.id
++        name = typeof id === 'number' ? bot.registry.enchantments[id]?.name : String(id).replace(/^minecraft:/, '')
++      }
++      return { name: name ?? null, lvl: entry.lvl ?? entry.level ?? 1 }
++    }).filter(Boolean)
++  }
++
+   bot._getBlockAtEyeLevel = () => bot.entity.position && bot.blockAt(bot.entity.position.offset(0, bot.entity.eyeHeight, 0))
+   bot.dig = dig
+   bot.stopDigging = noop
 diff --git a/node_modules/mineflayer/lib/plugins/resource_pack.js b/node_modules/mineflayer/lib/plugins/resource_pack.js
 index fc70ce3..1678010 100644
 --- a/node_modules/mineflayer/lib/plugins/resource_pack.js

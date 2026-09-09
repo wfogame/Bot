@@ -6,6 +6,8 @@
   "scripts": {
     "start": "node bot.js",
     "test": "node --test test/*.test.js",
+    "web-client:build": "sh ./scripts/build-web-client.sh",
+    "web-client:serve": "node web-client.js",
     "postinstall": "npx patch-package mineflayer || echo 'mineflayer patch already included or not applicable'"
   },
   "keywords": [],
@@ -20,6 +22,7 @@
     "mineflayer": "github:plainprince/mineflayer#fix-velocity-configuration-phase",
     "mineflayer-armor-manager": "^2.0.1",
     "mineflayer-pathfinder": "^2.4.5",
+    "mwc-proxy": "^0.0.4",
     "neo-blessed": "^0.2.0",
     "patch-package": "^8.0.1",
     "prismarine-chunk": "^1.41.0",

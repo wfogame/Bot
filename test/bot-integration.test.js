@@ -2,6 +2,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const vm = require('node:vm')
 const { EventEmitter } = require('node:events')
@@ -44,6 +45,7 @@ function runtime(env = {}) {
       if (name === 'mineflayer-pathfinder') return { goals: {} }
       if (name === 'socks') return {}
       if (name === './cron') return require('../cron')
+      if (name === './web-client') return require('../web-client')
       return require(name)
     }
   })
@@ -298,4 +300,69 @@ test('/all reuses the shared dispatcher (local args preserved, chat broadcast)',
   assert.equal(r.run('chats.length'), 0)
   r.run(`handleCommand('/all hello')`)
   assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['B', 'hello'], ['C', 'hello']])
+})
+
+test('webClientUrl builds connect-screen prefills for the /play tab', () => {
+  const r = runtime()
+  assert.equal(r.run('MC_WEB_ENABLED'), true)
+  assert.equal(r.run('MC_WEB_CLIENT_URL'), '')
+  assert.equal(r.run('MC_WEB_CLIENT_PORT'), 8090)
+  assert.equal(r.run('MC_WEB_VERSION'), '1.21.4')
+  assert.equal(
+    r.run(`webClientUrl({ base: 'http://localhost:8090/', ip: 'play.example.com:25565', version: '1.21.4', username: 'Steve', proxy: 'wss://mc.example.com' })`),
+    'http://localhost:8090/?ip=play.example.com%3A25565&version=1.21.4&username=Steve&proxy=wss%3A%2F%2Fmc.example.com'
+  )
+  assert.equal(r.run(`webClientUrl({ ip: 'a.b:1' })`), 'http://localhost/?ip=a.b%3A1')
+  assert.equal(r.run(`webClientUrl({})`), 'http://localhost/')
+  assert.equal(r.run(`webClientUrl({ base: 'https://client.example.com/app/', username: 'X' })`), 'https://client.example.com/app/?username=X')
+})
+
+test('/play requires auth', async () => {
+  const r = runtime()
+  const res = await r.request('/play', '', '', 'GET')
+  assert.equal(res.status, 303)
+  assert.equal(res.headers.Location, '/login')
+})
+
+test('/play serves the self-hosted minecraft web client with prefills', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mcweb-'))
+  fs.writeFileSync(path.join(dir, 'index.html'), '<html>fake client</html>')
+  try {
+    const r = runtime({ MC_WEB_SERVER: 'play.example.com:25565', MC_WEB_VERSION: '1.21.4', MC_WEB_USERNAME: 'Steve', MC_WEB_PROXY: 'wss://mc.example.com', MC_WEB_CLIENT_DIR: dir })
+    const cookie = await r.login()
+    const res = await r.request('/play', '', cookie, 'GET')
+    assert.equal(res.status, 200)
+    assert.match(res.body, /<iframe/)
+    assert.match(res.body, /http:\/\/localhost:[0-9]+\/\?ip=play\.example\.com%3A25565&amp;version=1\.21\.4&amp;username=Steve&amp;proxy=wss%3A%2F%2Fmc\.example\.com/)
+    assert.doesNotMatch(res.body, /mcraft\.fun/)
+    const h = await r.run('webHandle.webClientReady')
+    assert.equal(h.started, true)
+    const dash = await r.request('/', '', cookie, 'GET')
+    assert.match(dash.body.toString(), /id="playbtn"/)
+    h.server.close()
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('/play shows the build-not-found page when the client build is missing', async () => {
+  const r = runtime()
+  const cookie = await r.login()
+  const res = await r.request('/play', '', cookie, 'GET')
+  assert.equal(res.status, 200)
+  assert.match(res.body, /build not found/)
+  assert.match(res.body, /npm run web-client:build/)
+  assert.doesNotMatch(res.body, /<iframe/)
+  assert.doesNotMatch(res.body, /mcraft\.fun/)
+  const h = await r.run('webHandle.webClientReady')
+  assert.equal(h.started, false)
+})
+
+test('/play and the PLAY button are disabled when MC_WEB_ENABLED=false', async () => {
+  const r = runtime({ MC_WEB_ENABLED: 'false' })
+  const cookie = await r.login()
+  const res = await r.request('/play', '', cookie, 'GET')
+  assert.equal(res.status, 404)
+  const dash = await r.request('/', '', cookie, 'GET')
+  assert.doesNotMatch(dash.body.toString(), /id="playbtn"/)
 })

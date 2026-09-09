@@ -5,6 +5,7 @@
 #   ./run-docker.sh stop          stop & remove all managed containers
 #   ./run-docker.sh status        list managed containers
 #   ./run-docker.sh logs [n]      follow logs (default: instance 1)
+#   ./run-docker.sh proxy         run the Minecraft web-client proxy (mwc-proxy)
 #
 # Host port allocation: first free port starting at WEB_PORT_HOST (default 80),
 # so instance 1 usually lands on :80, instance 2 on :81, etc. — skipping
@@ -23,6 +24,10 @@
 #      viewer. Each instance gets the next free block of 10 (container ports
 #      MANUAL_VIEWER_PORT..+9), so the dashboard's viewer button works from the
 #      host even with several containers running.
+#   MC_WEB_CLIENT_HOST_PORT=8090  first candidate host port for the self-hosted
+#      Minecraft web client (dashboard /play tab). Each instance maps its
+#      container MC_WEB_CLIENT_PORT onto the next free host port, and
+#      MC_WEB_CLIENT_HOST_PORT is injected so /play builds the right URL.
 set -euo pipefail
 
 IMAGE="${IMAGE:-afk-console}"
@@ -32,6 +37,8 @@ PORT_BASE="${WEB_PORT_HOST:-80}"
 PORT_SPAN="${WEB_PORT_HOST_MAX:-40}"
 VIEWER_HOST_BASE="${MANUAL_VIEWER_HOST_PORT:-3000}"
 vnext="$VIEWER_HOST_BASE"
+CLIENT_HOST_BASE="${MC_WEB_CLIENT_HOST_PORT:-8090}"
+cnext="$CLIENT_HOST_BASE"
 DOCKER_RUN_FLAGS="${DOCKER_RUN_FLAGS:-}"
 DOCKER_BUILD_FLAGS="${DOCKER_BUILD_FLAGS:-}"
 PERSIST_TOR="${PERSIST_TOR:-0}"
@@ -57,7 +64,7 @@ case "$cmd" in
   up) ;;
   stop)
     found=0
-    for c in $(docker ps -a --format '{{.Names}}' | grep -E "^${PREFIX}-[0-9]+$" || true); do
+    for c in $(docker ps -a --format '{{.Names}}' | grep -E "^${PREFIX}-(proxy|[0-9]+)$" || true); do
       docker rm -f "$c" >/dev/null && say "removed $c"; found=1
     done
     [ "$found" -eq 0 ] && say "no managed containers found"
@@ -70,8 +77,40 @@ case "$cmd" in
   logs)
     exec docker logs -f "${PREFIX}-${2:-1}"
     ;;
+  proxy)
+    # Minecraft web client proxy — WebSocket→TCP bridge for the dashboard's /play
+    # tab (zardoy/minecraft-web-client). Browsers speak WebSocket; the proxy
+    # relays to any Java server over plain TCP, so your server needs no plugins
+    # and works with offline-mode (cracked) servers. Point MC_WEB_PROXY at it:
+    #   ws://localhost:8080        when testing locally (page served over http)
+    #   wss://your-proxy.example   when the dashboard is served over https
+    # Optional env: MWC_PORT (container+host default 8080), MWC_HOST_PORT,
+    #   MWC_ALLOW_ORIGIN (default *), MWC_ACCESS_CODE, MWC_MAX_CONNECTIONS_PER_IP,
+    #   MWC_SIGNAL_URL / MWC_SIGNAL_DESCRIPTION / MWC_SIGNAL_DOMAIN (mcraft.fun listing),
+    #   MWC_RUN_FLAGS (extra docker run flags).
+    MWC_PORT="${MWC_PORT:-8080}"
+    MWC_HOST_PORT="${MWC_HOST_PORT:-$MWC_PORT}"
+    MWC_ALLOW_ORIGIN="${MWC_ALLOW_ORIGIN:-*}"
+    MWC_MAX_CONNECTIONS_PER_IP="${MWC_MAX_CONNECTIONS_PER_IP:-5}"
+    docker pull ghcr.io/zardoy/mwc-proxy >/dev/null 2>&1 || true
+    docker rm -f "${PREFIX}-proxy" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    docker run -d --name "${PREFIX}-proxy" --restart unless-stopped \
+      -e PORT="${MWC_PORT}" \
+      -e ALLOW_ORIGIN="${MWC_ALLOW_ORIGIN}" \
+      -e MAX_CONNECTIONS_PER_IP="${MWC_MAX_CONNECTIONS_PER_IP}" \
+      ${MWC_ACCESS_CODE:+-e ACCESS_CODE="${MWC_ACCESS_CODE}"} \
+      ${MWC_SIGNAL_URL:+-e SIGNAL_SERVER_URL="${MWC_SIGNAL_URL}"} \
+      ${MWC_SIGNAL_DESCRIPTION:+-e SIGNAL_DESCRIPTION="${MWC_SIGNAL_DESCRIPTION}"} \
+      ${MWC_SIGNAL_DOMAIN:+-e SIGNAL_DOMAIN="${MWC_SIGNAL_DOMAIN}"} \
+      ${MWC_RUN_FLAGS:-} \
+      -p "${MWC_HOST_PORT}:${MWC_PORT}" \
+      ghcr.io/zardoy/mwc-proxy
+    say "✓ mwc-proxy running as ${PREFIX}-proxy → ws://localhost:${MWC_HOST_PORT} (set MC_WEB_PROXY=ws://localhost:${MWC_HOST_PORT} in your .env.dockerN, then re-run ./run-docker.sh)"
+    exit 0
+    ;;
   *)
-    err "usage: $0 [up|stop|status|logs [n]]"
+    err "usage: $0 [up|stop|status|logs [n|proxy]|proxy]"
     exit 1
     ;;
 esac
@@ -103,6 +142,13 @@ LOGIN_PASSWORD=123456
 # Optional cron jobs: CRON_JOB_<N>=<schedule>|<command> (5-field cron or "@every <secs>")
 # CRON_JOB_1=0 4 * * *|/crates-all
 # CRON_JOB_2=@every 60|/status
+# Minecraft web client (/play tab): the client is self-hosted — baked into the
+# image and served on MC_WEB_CLIENT_PORT (8090, host-mapped per instance).
+# Prefill the connect screen:
+# MC_WEB_SERVER=play.example.com:25565
+# MC_WEB_VERSION=1.21.4
+# MC_WEB_USERNAME=PlayerName
+# MC_WEB_PROXY=ws://localhost:8080   # ./run-docker.sh proxy; wss://… if https
 # Tor is the default outbound proxy inside Docker (127.0.0.1:9050).
 # Set PROXY_HOST= (empty) to connect directly instead.
 # WEB_PASSWORD=change-me    # unset = random password printed in `docker logs`
@@ -145,6 +191,21 @@ for f in $ordered; do
     vcand=$((vcand + 10))
   done
 
+  # Self-hosted Minecraft web client: map this instance's container client port
+  # (MC_WEB_CLIENT_PORT, default 8090) onto the next free host port, and inject
+  # MC_WEB_CLIENT_HOST_PORT so /play builds the URL for the browser.
+  mcport=$(grep -E '^ *MC_WEB_CLIENT_PORT *=' "$f" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -dc '0-9' || true)
+  mcport="${mcport:-8090}"
+  client_pflags=""
+  mcand="$cnext"
+  while ! port_free "$mcand" && [ "$mcand" -lt "$((CLIENT_HOST_BASE + PORT_SPAN))" ]; do
+    mcand=$((mcand + 1))
+  done
+  if port_free "$mcand"; then
+    client_pflags="-p ${mcand}:${mcport} -e MC_WEB_CLIENT_HOST_PORT=${mcand}"
+    cnext=$((mcand + 1))
+  fi
+
   bn=$(grep -E '^ *BOT_NAMES *=' "$f" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d ' ,' || true)
   [ -n "$bn" ] || say "  ⚠ ${f}: BOT_NAMES is empty — ${PREFIX}-${n} will exit until you fill it in"
 
@@ -177,6 +238,7 @@ for f in $ordered; do
       --env-file "$f" \
       -p "${next}:${cport}" \
       $viewer_pflags \
+      $client_pflags \
       $vol_flags $extra_host_flags $DOCKER_RUN_FLAGS \
       "${IMAGE}:latest" 2>&1) && { hport="$next"; break; }
     # start failed — only retry if the port was snatched in the race window
@@ -193,6 +255,9 @@ for f in $ordered; do
   else
     say "  ✓ ${PREFIX}-${n}  ←  ${f}  →  http://localhost:${hport}  (container port ${cport})"
     say "  ⚠ ${f}: no free 10-port block for the manual 3D viewer from host port ${VIEWER_HOST_BASE} — set MANUAL_VIEWER_HOST_PORT to start elsewhere, or use the viewer without host mapping"
+  fi
+  if [ -n "$client_pflags" ]; then
+    say "     Minecraft web client (PLAY tab): http://localhost:${mcand} (container port ${mcport})"
   fi
   next=$((hport + 1))
 done
