@@ -20,7 +20,7 @@ COPY scripts/build-web-client.sh ./scripts/build-web-client.sh
 RUN if [ "$BUILD_WEB_CLIENT" = "1" ]; then \
   apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/* && \
   corepack enable && \
-  sh ./scripts/build-web-client.sh; \
+  bash ./scripts/build-web-client.sh; \
   else mkdir -p web-client/dist; fi
 
 # ── App stage ─────────────────────────────────────────────────────────────────
