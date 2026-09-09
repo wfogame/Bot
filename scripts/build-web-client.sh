@@ -7,6 +7,7 @@
 # Usage:  npm run web-client:build        (or:  sh ./scripts/build-web-client.sh)
 set -euo pipefail
 cd "$(dirname "$0")/.."
+PROJECT_ROOT="$(pwd)"
 
 BUILD_DIR="web-client"
 SRC_DIR="$BUILD_DIR/src"
@@ -41,6 +42,11 @@ pnpm run build
 # The dashboard never uses auto-connect; make the intent explicit.
 printf '{"allowAutoConnect":false}\n' > dist/config.json
 
-mkdir -p "../$DIST_DIR"
-cp -r dist/. "../$DIST_DIR/"
-echo "✓ web client built → $BUILD_DIR/dist (serve with: npm run web-client:serve)"
+# Use the absolute project root captured above rather than a relative "../"
+# count — SRC_DIR is two levels below PROJECT_ROOT (web-client/src) while
+# DIST_DIR is only one level below it (web-client/dist), so a plain "../"
+# from inside SRC_DIR previously landed one directory too deep
+# (web-client/web-client/dist instead of web-client/dist).
+mkdir -p "$PROJECT_ROOT/$DIST_DIR"
+cp -r dist/. "$PROJECT_ROOT/$DIST_DIR/"
+echo "✓ web client built → $DIST_DIR (serve with: npm run web-client:serve)"
