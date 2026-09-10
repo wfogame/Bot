@@ -2,7 +2,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
-const { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData } = require(path.join(__dirname, '..', 'scripts', 'patch-web-client-enchants.js'))
+const { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport } = require(path.join(__dirname, '..', 'scripts', 'patch-web-client-enchants.js'))
 
 // The browser client bundles prismarine-item 1.18.0, whose `enchants` getter
 // returns the raw 1.20.5+ component object ({ enchantments: [{ id, level }] })
@@ -138,6 +138,38 @@ test('patchMakeOptimizedMcData fails loudly if the upstream layout changes', () 
 module.exports = () => {}
 `
   assert.throws(() => patchMakeOptimizedMcData(unknown), /no longer contains the expected version-clipping anchor/)
+})
+
+// ── Third patch: src/index.ts — Velocity /server transfers ────────────────
+// The stock web client has no handling for the 1.20.5+ clientbound Transfer
+// packet, so Velocity /server transfers never complete and the server kicks
+// the session with "Internal Exception: io.netty...". The patch reconnects to
+// the transfer destination through the same proxy using the client's own
+// reconnectOptions/reload mechanism.
+const TRANSFER_SAMPLE = `  bot._client.on('state', playStateSwitch)
+
+  bot.on('end', (endReason) => {
+`
+
+test('patchTransferSupport inserts the transfer-reconnect handler', () => {
+  const { changed, content } = patchTransferSupport(TRANSFER_SAMPLE)
+  assert.equal(changed, true)
+  assert.match(content, /bot\._client\.on\('transfer' as any/)
+  assert.match(content, /Server requested transfer to/)
+  assert.match(content, /reconnectOptions/)
+  assert.match(content, /location\.reload\(\)/)
+  assert.ok(content.includes("bot.on('end', (endReason) => {"), 'the end handler anchor stays intact')
+})
+
+test('patchTransferSupport is idempotent', () => {
+  const once = patchTransferSupport(TRANSFER_SAMPLE)
+  assert.equal(once.changed, true)
+  const twice = patchTransferSupport(once.content)
+  assert.equal(twice.changed, false)
+})
+
+test('patchTransferSupport fails loudly if the upstream layout changes', () => {
+  assert.throws(() => patchTransferSupport('const somethingElse = 1\n'), /no longer contains the expected transfer anchor/)
 })
 
 // Simulate the filter math the patched prep uses: the defaults must keep the

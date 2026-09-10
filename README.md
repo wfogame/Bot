@@ -414,6 +414,13 @@ the client silently falls back to the base version's protocol data. To cover
 older servers, widen the range, e.g. `MIN_MC_VERSION=1.8
 MAX_MC_VERSION=1.21.11 npm run web-client:build`.
 
+**Velocity `/server` transfers work.** The stock client ignores the 1.20.5+
+Transfer packet, so on Velocity networks a `/server lifesteal`-style command
+never completes and the server kicks the session with "Internal Exception:
+io.netty...". The same patch script adds a transfer handler that reconnects
+to the destination through the same proxy (reusing the client's own
+reconnect mechanism), so server switches work like on a vanilla client.
+
 If the build is missing, `/play` shows a "build not found" page with these
 instructions instead of embedding anything remote.
 

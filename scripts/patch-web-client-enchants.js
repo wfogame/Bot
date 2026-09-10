@@ -26,7 +26,15 @@
 //    override the range. Patching the source (not just exporting env vars)
 //    means even a manual `pnpm run build` inside web-client/src is clipped.
 //
-// Both patches are no-ops (idempotent) if already applied, and fail loudly if
+// 3. src/index.ts (Velocity /server transfers): the stock client has NO
+//    handling for the 1.20.5+ clientbound Transfer packet, so Velocity
+//    /server commands never complete and the server kicks the session with
+//    "Internal Exception: io.netty..." (the web client simply ignores the
+//    transfer and never reconnects). The patch listens for the transfer
+//    packet and reconnects to the destination through the same proxy using
+//    the client's own reconnectOptions mechanism.
+//
+// All patches are no-ops (idempotent) if already applied, and fail loudly if
 // the upstream file layout changes so they can be re-baselined.
 //
 // Usage: node scripts/patch-web-client-enchants.js [web-client/src-dir]
@@ -174,6 +182,57 @@ function patchMakeOptimizedMcData (content) {
   return { changed: true, content: content.replace(CLIP_ANCHOR, CLIP_NEW) }
 }
 
+// ── Third patch: src/index.ts — Velocity /server transfers ─────────────────
+// Upstream has no handling for the 1.20.5+ clientbound Transfer packet, so
+// Velocity /server transfers never complete and the server kicks the session
+// with "Internal Exception: io.netty...". Listen for the transfer packet and
+// reconnect to the destination through the same proxy (Velocity routes via
+// the routing-token hostname in the re-login handshake), reusing the client's
+// own reconnectOptions/reload mechanism.
+const TRANSFER_ANCHOR = `  bot._client.on('state', playStateSwitch)
+
+  bot.on('end', (endReason) => {`
+
+const TRANSFER_HANDLER = `  bot._client.on('state', playStateSwitch)
+
+  // Velocity /server transfers: the server sends the 1.20.5+ Transfer packet
+  // and vanilla clients reconnect to the destination. The stock client ignores
+  // it, so the transfer never completes and the server kicks the session with
+  // "Internal Exception: io.netty...". Reconnect to the destination through
+  // the same proxy — for Velocity networks the destination hostname carries
+  // the routing token and the re-login handshake routes to the target server.
+  bot._client.on('transfer' as any, (packet: any) => {
+    console.log('Server requested transfer to', packet.host, packet.port)
+    if (!packet || typeof packet.host !== 'string' || !packet.host) {
+      console.warn('Ignoring transfer packet with no destination', packet)
+      return
+    }
+    const prev = (globalThis as any).lastConnectOptions?.value
+    let base = prev
+    if (!base) {
+      try { base = JSON.parse(localStorage.getItem('lastConnectOptions') || 'null') } catch (_) { base = null }
+    }
+    const value = { ...(base || {}), server: \`\${packet.host}\${packet.port ? ':' + packet.port : ''}\`, ignoreQs: true }
+    sessionStorage.setItem('reconnectOptions', JSON.stringify({ value, timestamp: Date.now() }))
+    location.reload()
+  })
+
+  bot.on('end', (endReason) => {`
+
+function patchTransferSupport (content) {
+  if (content.includes("bot._client.on('transfer' as any")) {
+    return { changed: false, content }
+  }
+  if (!content.includes(TRANSFER_ANCHOR)) {
+    throw new Error('web-client src/index.ts no longer contains the expected transfer anchor — update scripts/patch-web-client-enchants.js')
+  }
+  const out = content.replace(TRANSFER_ANCHOR, TRANSFER_HANDLER)
+  if (out === content) {
+    throw new Error('patchTransferSupport: anchor matched but replacement was a no-op')
+  }
+  return { changed: true, content: out }
+}
+
 // Locate the installed prismarine-item under the web client source dir
 // (pnpm: usually a root symlink; falls back to a .pnpm store scan).
 function findPrismarineItem (srcDir) {
@@ -248,8 +307,31 @@ function main (argv) {
   } else {
     console.log('✓ scripts/makeOptimizedMcData.mjs already patched')
   }
+
+  // Third patch: src/index.ts — Velocity /server transfers. Also idempotent,
+  // so rebuilds just re-confirm it.
+  const indexTs = path.join(srcDir, 'src', 'index.ts')
+  let indexContent
+  try {
+    indexContent = fs.readFileSync(indexTs, 'utf8')
+  } catch (err) {
+    console.error(`✗ could not read ${indexTs}: ${err.message}`)
+    process.exit(1)
+  }
+  const txRes = patchTransferSupport(indexContent)
+  if (txRes.changed) {
+    try {
+      fs.writeFileSync(indexTs, txRes.content)
+    } catch (err) {
+      console.error(`✗ could not write ${indexTs}: ${err.message}`)
+      process.exit(1)
+    }
+    console.log('✓ patched src/index.ts — Velocity /server transfers now reconnect to the destination')
+  } else {
+    console.log('✓ src/index.ts already patched (transfer support)')
+  }
 }
 
 if (require.main === module) main(process.argv)
 
-module.exports = { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, findPrismarineItem }
+module.exports = { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport, findPrismarineItem }
