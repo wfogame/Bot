@@ -54,7 +54,16 @@ async function handleResourcePackProxy (req, res, log) {
       res.end('bad resource pack url')
       return
     }
-    const upstream = await fetch(target, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (resource-pack-proxy)' } })
+    // Ask for identity (uncompressed) encoding. Node's fetch decompresses
+    // gzip/br/deflate bodies automatically while the response's
+    // content-length still describes the COMPRESSED size — forwarding that
+    // header would make browsers truncate the pack at the compressed byte
+    // count, which the client reports as a corrupted zip ("can't find end of
+    // file"). Requesting identity keeps length and body consistent.
+    const upstream = await fetch(target, {
+      redirect: 'follow',
+      headers: { 'User-Agent': 'Mozilla/5.0 (resource-pack-proxy)', 'Accept-Encoding': 'identity' }
+    })
     if (!upstream.ok || !upstream.body) {
       res.writeHead(upstream.status || 502, { 'Content-Type': 'text/plain; charset=utf-8' })
       res.end('upstream error: ' + (upstream.status || 'unknown'))
@@ -65,8 +74,13 @@ async function handleResourcePackProxy (req, res, log) {
       'Cache-Control': 'no-cache',
       'Access-Control-Allow-Origin': '*'
     }
+    // Only forward content-length when the body really is uncompressed. If the
+    // upstream ignored Accept-Encoding and compressed the response, Node has
+    // already inflated it, so the advertised length would truncate the pack —
+    // in that case stream chunked (no Content-Length) instead.
+    const encoding = upstream.headers.get('content-encoding')
     const length = upstream.headers.get('content-length')
-    if (length) headers['Content-Length'] = length
+    if (length && (!encoding || encoding === 'identity')) headers['Content-Length'] = length
     res.writeHead(200, headers)
     // Stream — never buffer the whole pack in memory.
     Readable.fromWeb(upstream.body).pipe(res)
@@ -182,4 +196,4 @@ function stopWebClient(handle, log = () => {}) {
   log('web client server stopped')
 }
 
-module.exports = { startWebClient, stopWebClient }
+module.exports = { startWebClient, stopWebClient, handleResourcePackProxy }
