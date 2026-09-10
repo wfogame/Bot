@@ -9,7 +9,7 @@
 # rebuild. Override the tag with MC_WEB_CLIENT_TAG if you ever need a
 # different upstream version.
 #
-# Before building, scripts/patch-web-client-enchants.js applies two source
+# Before building, scripts/patch-web-client-enchants.js applies these source
 # patches to the upstream client:
 # 1. prismarine-item's `enchants` getter (on 1.20.5+ servers it returns the raw
 #    component object instead of an array and throws on unknown versions, which
@@ -23,7 +23,16 @@
 #    measured). Going stricter than 1.21.x would break connecting to other
 #    server versions. Patching the source means even a manual `pnpm run build`
 #    inside web-client/src is clipped.
-# Both are covered by test/web-client-enchants.test.js.
+# 3. src/index.ts — Velocity /server transfers (the 1.20.5+ Transfer packet):
+#    reconnect to the transfer destination through the same proxy.
+# 4. src/resourcePack.ts — resource pack downloads fall back to the same-origin
+#    /resource-pack-proxy served by web-client.js when the direct browser fetch
+#    fails (GitHub redirects carry no CORS headers).
+# 5. src/mineflayer/mc-protocol.ts — mid-session reconfigure fix (mirrors
+#    bot.js): pause physics while the server holds the client in the
+#    'configuration' state (/server switches) so Velocity doesn't kick with
+#    "Internal Exception: io.netty...".
+# All are covered by test/web-client-enchants.test.js.
 #
 # Usage:
 #   npm run web-client:build                  (all phases; local rebuilds)

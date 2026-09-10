@@ -2,7 +2,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
-const { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport, patchResourcePackCors } = require(path.join(__dirname, '..', 'scripts', 'patch-web-client-enchants.js'))
+const { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport, patchResourcePackCors, patchReconfigureFix } = require(path.join(__dirname, '..', 'scripts', 'patch-web-client-enchants.js'))
 
 // The browser client bundles prismarine-item 1.18.0, whose `enchants` getter
 // returns the raw 1.20.5+ component object ({ enchantments: [{ id, level }] })
@@ -210,6 +210,40 @@ test('patchResourcePackCors is idempotent', () => {
 
 test('patchResourcePackCors fails loudly if the upstream layout changes', () => {
   assert.throws(() => patchResourcePackCors('const somethingElse = 1\n'), /no longer contains the expected fetch anchor/)
+})
+
+// ── Fifth patch: src/mineflayer/mc-protocol.ts — mid-session reconfigure ──
+// Velocity / 1.21+ backends push the client back into the 'configuration'
+// state mid-session (/server switches). mineflayer keeps writing play-phase
+// movement packets, which the backend answers with
+// "Internal Exception: io.netty... An internal error occurred during your
+// connection." bot.js carries the same fix for the Node bots: pause physics
+// while in configuration and drop play-only packets.
+const RECONFIGURE_SAMPLE = `let lastPacketTime = 0
+customEvents.on('mineflayerBotCreated', () => {
+  // todo move more code here
+`
+
+test('patchReconfigureFix pauses physics and blocks play-only writes during configuration', () => {
+  const { changed, content } = patchReconfigureFix(RECONFIGURE_SAMPLE)
+  assert.equal(changed, true)
+  assert.match(content, /physicsEnabled = newState === 'play'/, 'physics is gated on the protocol state')
+  assert.match(content, /protocolClient\.on\('state'/, 'listens for protocol state transitions')
+  assert.match(content, /playOnlyPackets\.has\(name\)/, 'drops play-only packets while in configuration')
+  assert.match(content, /'position', 'position_look'/, 'movement packets are the ones that trigger the kick')
+  assert.ok(content.includes('// todo move more code here'), 'the original handler body stays intact')
+})
+
+test('patchReconfigureFix is idempotent', () => {
+  const once = patchReconfigureFix(RECONFIGURE_SAMPLE)
+  assert.equal(once.changed, true)
+  const twice = patchReconfigureFix(once.content)
+  assert.equal(twice.changed, false)
+  assert.equal(twice.content, once.content)
+})
+
+test('patchReconfigureFix fails loudly if the upstream layout changes', () => {
+  assert.throws(() => patchReconfigureFix('const somethingElse = 1\n'), /no longer contains the expected mineflayerBotCreated anchor/)
 })
 
 // Simulate the filter math the patched prep uses: the defaults must keep the

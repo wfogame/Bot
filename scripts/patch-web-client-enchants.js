@@ -42,6 +42,17 @@
 //    web-client.js (Node fetch has no CORS and follows redirects), which
 //    streams the pack back.
 //
+// 5. src/mineflayer/mc-protocol.ts (mid-session reconfigure): Velocity and
+//    1.21+ backends push the client BACK into the 'configuration' state
+//    mid-session (/server <name> switches, auth-plugin reconfiguration,
+//    resource-pack reloads). mineflayer keeps writing play-phase movement
+//    packets regardless of that state, which the backend rejects as a
+//    protocol violation and kicks the session with "Internal Exception:
+//    io.netty... An internal error occurred during your connection." — the
+//    exact kick the client died with on /server. bot.js carries the same fix
+//    for the Node bots. The patch pauses physics while in configuration and
+//    drops play-only packets that still try to slip out.
+//
 // All patches are no-ops (idempotent) if already applied, and fail loudly if
 // the upstream file layout changes so they can be re-baselined.
 //
@@ -241,6 +252,56 @@ function patchTransferSupport (content) {
   return { changed: true, content: out }
 }
 
+// ── Fifth patch: src/mineflayer/mc-protocol.ts — mid-session reconfigure fix ─
+// Mirror of bot.js's RECONFIGURE FIX. Velocity (and 1.21+ backends generally)
+// re-enter the 'configuration' state mid-session for /server switches, auth
+// reconfiguration and pack reloads. mineflayer's physics tick keeps writing
+// play-phase movement packets ('position'/'position_look') in that state, and
+// the backend answers with "An internal error occurred during your
+// connection." / "Internal Exception: io.netty...". Pause physics while the
+// client is in configuration and drop any play-only packet as a second line
+// of defence.
+const RECONFIGURE_ANCHOR = `let lastPacketTime = 0
+customEvents.on('mineflayerBotCreated', () => {`
+
+const RECONFIGURE_HANDLER = `let lastPacketTime = 0
+customEvents.on('mineflayerBotCreated', () => {
+  // ── Mid-session reconfigure fix (mirrors bot.js) ──────────────────────────
+  // Velocity / 1.21+ backends push the client BACK into the 'configuration'
+  // state mid-session (/server <name> switches, auth-plugin reconfiguration,
+  // resource-pack reloads). mineflayer's physics tick keeps writing play-phase
+  // movement packets regardless of that state, which the backend rejects as a
+  // protocol violation and kicks the session with
+  // "Internal Exception: io.netty... An internal error occurred during your
+  // connection." Pause physics while in configuration and drop any play-only
+  // packet that still tries to slip out.
+  {
+    const protocolClient = bot._client as any
+    protocolClient.on('state', (newState: string) => {
+      ;(bot as any).physicsEnabled = newState === 'play'
+    })
+    const playOnlyPackets = new Set(['position', 'position_look', 'look', 'vehicle_move', 'entity_action', 'abilities'])
+    const origWrite = protocolClient.write.bind(protocolClient)
+    protocolClient.write = (name: string, params: any) => {
+      if (protocolClient.state === 'configuration' && playOnlyPackets.has(name)) return
+      return origWrite(name, params)
+    }
+  }`
+
+function patchReconfigureFix (content) {
+  if (content.includes('Mid-session reconfigure fix')) {
+    return { changed: false, content }
+  }
+  if (!content.includes(RECONFIGURE_ANCHOR)) {
+    throw new Error('web-client src/mineflayer/mc-protocol.ts no longer contains the expected mineflayerBotCreated anchor — update scripts/patch-web-client-enchants.js')
+  }
+  const out = content.replace(RECONFIGURE_ANCHOR, RECONFIGURE_HANDLER)
+  if (out === content) {
+    throw new Error('patchReconfigureFix: anchor matched but replacement was a no-op')
+  }
+  return { changed: true, content: out }
+}
+
 // ── Fourth patch: src/resourcePack.ts — resource pack download CORS fallback ─
 // The client downloads server packs with a plain fetch(url). GitHub URLs
 // (github.com/.../raw/...) respond with a 302 whose redirect carries no
@@ -414,8 +475,32 @@ function main (argv) {
   } else {
     console.log('✓ src/resourcePack.ts already patched (resource pack proxy fallback)')
   }
+
+  // Fifth patch: src/mineflayer/mc-protocol.ts — survive Velocity's
+  // mid-session config-state switch (/server) instead of getting the
+  // "Internal Exception: io.netty..." kick. Also idempotent.
+  const mcProtocolTs = path.join(srcDir, 'src', 'mineflayer', 'mc-protocol.ts')
+  let mcProtocolContent
+  try {
+    mcProtocolContent = fs.readFileSync(mcProtocolTs, 'utf8')
+  } catch (err) {
+    console.error(`✗ could not read ${mcProtocolTs}: ${err.message}`)
+    process.exit(1)
+  }
+  const reconfigRes = patchReconfigureFix(mcProtocolContent)
+  if (reconfigRes.changed) {
+    try {
+      fs.writeFileSync(mcProtocolTs, reconfigRes.content)
+    } catch (err) {
+      console.error(`✗ could not write ${mcProtocolTs}: ${err.message}`)
+      process.exit(1)
+    }
+    console.log('✓ patched src/mineflayer/mc-protocol.ts — physics pauses during mid-session configuration (/server transfers no longer kick with an internal error)')
+  } else {
+    console.log('✓ src/mineflayer/mc-protocol.ts already patched (mid-session reconfigure fix)')
+  }
 }
 
 if (require.main === module) main(process.argv)
 
-module.exports = { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport, patchResourcePackCors, findPrismarineItem }
+module.exports = { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport, patchResourcePackCors, patchReconfigureFix, findPrismarineItem }
