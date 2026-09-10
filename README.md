@@ -364,6 +364,23 @@ npm run web-client:serve      # optional standalone: serve it on :8090 by itself
 docker exec <container> npm run web-client:build
 ```
 
+**Docker disk usage is kept small.** The Dockerfile runs the build in two
+cacheable phases — `prepare` (clone upstream + `pnpm install`, cached as its
+own layer) and `build` (apply patches + build + copy `dist`) — and then
+deletes the client's `node_modules`/`.git`/`generated` inside the stage, so
+the ~2 GB dependency tree never lingers in the builder cache. Without the
+split, every script tweak forced a full re-download of ~1,600 packages on top
+of the previous failed layers, which filled small Docker VMs with
+`ENOSPC: no space left on device` (the client's install alone needs ~2.5 GB
+of working space). If a build still dies with ENOSPC, reclaim the builder
+cache once:
+
+```bash
+docker system df                # see what is holding space
+# docker builder prune -af      # drop cached webclient-stage layers
+# docker image prune -a         # drop old images if no longer needed
+```
+
 **Block breaking on 1.20.5+ servers is fixed at build time.** The browser
 client bundles prismarine-item, whose `enchants` getter returns the raw
 1.20.5+ component object (`{ enchantments: [...] }`) instead of a flat array

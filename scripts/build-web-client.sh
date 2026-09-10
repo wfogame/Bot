@@ -25,10 +25,19 @@
 #    inside web-client/src is clipped.
 # Both are covered by test/web-client-enchants.test.js.
 #
-# Usage:  npm run web-client:build        (or:  sh ./scripts/build-web-client.sh)
+# Usage:
+#   npm run web-client:build                  (all phases; local rebuilds)
+#   bash ./scripts/build-web-client.sh prepare  (Docker phase 1: clone + deps)
+#   bash ./scripts/build-web-client.sh build    (Docker phase 2: patch + build)
+# The Dockerfile splits the two phases into separate RUN steps so the heavy
+# pnpm install layer is cached independently — script/patch tweaks then only
+# re-run the cheap build phase instead of re-downloading ~1,600 packages
+# (which fills small Docker VMs: "ENOSPC: no space left on device").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PROJECT_ROOT="$(pwd)"
+
+PHASE="${1:-all}" # all | prepare | build
 
 BUILD_DIR="web-client"
 SRC_DIR="$BUILD_DIR/src"
@@ -62,47 +71,61 @@ command -v node >/dev/null 2>&1 || { echo "✗ node is required to build the web
 
 mkdir -p "$BUILD_DIR"
 
-if [ ! -d "$SRC_DIR/.git" ]; then
-  echo "▸ cloning zardoy/minecraft-web-client (${MC_WEB_CLIENT_TAG})…"
-  git clone --depth 1 --branch "$MC_WEB_CLIENT_TAG" https://github.com/zardoy/minecraft-web-client.git "$SRC_DIR"
-else
-  echo "▸ checking out ${MC_WEB_CLIENT_TAG}…"
-  git -C "$SRC_DIR" fetch --depth 1 origin tag "$MC_WEB_CLIENT_TAG" --force 2>/dev/null \
-    || git -C "$SRC_DIR" fetch --tags --force origin
-  git -C "$SRC_DIR" checkout --force "$MC_WEB_CLIENT_TAG"
+# ── Phase 1 (prepare): fetch the upstream source + install dependencies ─────
+if [ "$PHASE" = "all" ] || [ "$PHASE" = "prepare" ]; then
+  if [ ! -d "$SRC_DIR/.git" ]; then
+    echo "▸ cloning zardoy/minecraft-web-client (${MC_WEB_CLIENT_TAG})…"
+    git clone --depth 1 --single-branch --branch "$MC_WEB_CLIENT_TAG" https://github.com/zardoy/minecraft-web-client.git "$SRC_DIR"
+  else
+    echo "▸ checking out ${MC_WEB_CLIENT_TAG}…"
+    git -C "$SRC_DIR" fetch --depth 1 origin tag "$MC_WEB_CLIENT_TAG" --force 2>/dev/null \
+      || git -C "$SRC_DIR" fetch --tags --force origin
+    git -C "$SRC_DIR" checkout --force "$MC_WEB_CLIENT_TAG"
+  fi
+
+  cd "$PROJECT_ROOT/$SRC_DIR"
+
+  # pnpm is pinned via packageManager + corepack (needs corepack on PATH).
+  corepack enable 2>/dev/null || npm install -g corepack 2>/dev/null || true
+  command -v pnpm >/dev/null 2>&1 || npm install -g pnpm@10.32.1
+
+  echo "▸ preparing + installing dependencies…"
+  node ./scripts/dockerPrepare.mjs
+  pnpm i
+
+  echo "✓ prepare phase done — upstream source + dependencies ready"
+  if [ "$PHASE" = "prepare" ]; then
+    exit 0
+  fi
 fi
 
-cd "$SRC_DIR"
+# ── Phase 2 (build): patch + build + copy dist ──────────────────────────────
+if [ "$PHASE" = "all" ] || [ "$PHASE" = "build" ]; then
+  cd "$PROJECT_ROOT/$SRC_DIR"
 
-# pnpm is pinned via packageManager + corepack (needs corepack on PATH).
-corepack enable 2>/dev/null || npm install -g corepack 2>/dev/null || true
-command -v pnpm >/dev/null 2>&1 || npm install -g pnpm@10.32.1
+  # Fix block breaking + cap mc-data prep memory BEFORE building (see header
+  # comment). Pass the ABSOLUTE src dir: this script has already cd'd into
+  # $SRC_DIR, so a relative "$SRC_DIR" would resolve one level too deep and
+  # the makeOptimizedMcData.mjs patch would fail with ENOENT (seen in Docker
+  # builds).
+  echo "▸ applying prismarine-item enchants fix (digging on 1.20.5+ servers)…"
+  node "$PROJECT_ROOT/scripts/patch-web-client-enchants.js" "$PROJECT_ROOT/$SRC_DIR"
 
-echo "▸ preparing + installing dependencies…"
-node ./scripts/dockerPrepare.mjs
-pnpm i
+  echo "▸ minecraft-data corpus: ${MIN_MC_VERSION:-full} → ${MAX_MC_VERSION:-latest}"
+  export MIN_MC_VERSION MAX_MC_VERSION
 
-# Fix block breaking + cap mc-data prep memory BEFORE building (see header
-# comment). Pass the ABSOLUTE src dir: this script has already cd'd into
-# $SRC_DIR, so a relative "$SRC_DIR" would resolve one level too deep and the
-# makeOptimizedMcData.mjs patch would fail with ENOENT (seen in Docker builds).
-echo "▸ applying prismarine-item enchants fix (digging on 1.20.5+ servers)…"
-node "$PROJECT_ROOT/scripts/patch-web-client-enchants.js" "$PROJECT_ROOT/$SRC_DIR"
+  echo "▸ building (pnpm run build)…"
+  pnpm run build
 
-echo "▸ minecraft-data corpus: ${MIN_MC_VERSION:-full} → ${MAX_MC_VERSION:-latest}"
-export MIN_MC_VERSION MAX_MC_VERSION
+  # The dashboard never uses auto-connect; make the intent explicit.
+  printf '{"allowAutoConnect":false}\n' > dist/config.json
 
-echo "▸ building (pnpm run build)…"
-pnpm run build
-
-# The dashboard never uses auto-connect; make the intent explicit.
-printf '{"allowAutoConnect":false}\n' > dist/config.json
-
-# Use the absolute project root captured above rather than a relative "../"
-# count — SRC_DIR is two levels below PROJECT_ROOT (web-client/src) while
-# DIST_DIR is only one level below it (web-client/dist), so a plain "../"
-# from inside SRC_DIR previously landed one directory too deep
-# (web-client/web-client/dist instead of web-client/dist).
-mkdir -p "$PROJECT_ROOT/$DIST_DIR"
-cp -r dist/. "$PROJECT_ROOT/$DIST_DIR/"
-echo "✓ web client built (${MC_WEB_CLIENT_TAG}) → $DIST_DIR (serve with: npm run web-client:serve)"
+  # Use the absolute project root captured above rather than a relative "../"
+  # count — SRC_DIR is two levels below PROJECT_ROOT (web-client/src) while
+  # DIST_DIR is only one level below it (web-client/dist), so a plain "../"
+  # from inside SRC_DIR previously landed one directory too deep
+  # (web-client/web-client/dist instead of web-client/dist).
+  mkdir -p "$PROJECT_ROOT/$DIST_DIR"
+  cp -r dist/. "$PROJECT_ROOT/$DIST_DIR/"
+  echo "✓ web client built (${MC_WEB_CLIENT_TAG}) → $DIST_DIR (serve with: npm run web-client:serve)"
+fi
