@@ -2,6 +2,7 @@ require('dotenv').config()                        // npm install dotenv
 const net          = require('net')
 const fs           = require('fs')
 const path         = require('path')
+const { resolveBotVersion } = require('./lib/version-remap')
 const mineflayer   = require('mineflayer')
 const blessed      = require('neo-blessed')
 const armorManager = require('mineflayer-armor-manager')
@@ -11,7 +12,7 @@ try { ({ SocksClient } = require('socks')) } catch (_) { /* npm install socks */
 // ── .env config (with sane defaults) ──────────────────────────────────────────
 const HOST             = process.env.HOST             || 'play.fatalmc.org'
 const PORT             = parseInt(process.env.PORT    || '25565', 10)
-const VERSION          = process.env.VERSION          || '1.21.1'
+const VERSION          = resolveBotVersion(process.env.VERSION || '1.21.1')
 const LOGIN_PASSWORD   = process.env.LOGIN_PASSWORD   || '123456'
 
 // Custom env variable for RTP bot names, with fallback defaults
@@ -646,6 +647,12 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
   let connected = false
   let manualDisconnect = false
   let lastRawError = null // ── Fixed: Localised error scope per bot ──
+
+  const requestedVersion = version
+  version = resolveBotVersion(version)
+  if (version !== requestedVersion) {
+    logFor(id, `{yellow-fg}⚠ VERSION ${requestedVersion} -> ${version} (minecraft-data ships no 1.21.2/768 data; 1.21.3 is the same wire protocol with the 1.21.2 item registry){/yellow-fg}`)
+  }
 
   clearReconnectTimer(id)
 

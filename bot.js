@@ -10,6 +10,7 @@ const crypto = require('crypto')
 const zlib = require('zlib')
 const { exec } = require('child_process')
 const { createTerminal, sshConfig } = require('./expose-terminal')
+const { resolveBotVersion } = require('./lib/version-remap')
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -19,7 +20,7 @@ try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY
 // ── .env config (original) ──────────────────────────────────────────────────
 const HOST = process.env.HOST || 'play.fatalmc.org'
 const PORT = parseInt(process.env.PORT || '25565', 10)
-const VERSION = process.env.VERSION || '1.21.2'
+const VERSION = resolveBotVersion(process.env.VERSION || '1.21.2')
 const LOGIN_PASSWORD = process.env.LOGIN_PASSWORD || '123456'
 const BOT_NAMES = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
 const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
@@ -1783,6 +1784,11 @@ function createBotInstance(username, host = HOST, port = PORT, version = VERSION
 const id = username
 let connected = false
 let manualDisconnect = false
+const requestedVersion = version
+version = resolveBotVersion(version)
+if (version !== requestedVersion) {
+logFor(id, `{yellow-fg}⚠ VERSION ${requestedVersion} -> ${version} (minecraft-data ships no 1.21.2/768 data; 1.21.3 is the same wire protocol with the 1.21.2 item registry){/yellow-fg}`)
+}
 
 // Cancel any pending reconnect from a previous instance (timer lives on bots[id], not in closure)
 clearReconnectTimer(id)

@@ -66,6 +66,14 @@ PORT=25565
 VERSION=1.21.2
 LOGIN_PASSWORD=replace-me
 BOT_NAMES=BotOne,BotTwo
+
+# Note: `VERSION=1.21.2` is automatically mapped to `1.21.3` at runtime.
+# minecraft-data ships no 1.21.2 (protocol 768) dataset, and 1.21.2's item
+# component registry (item_model etc.) differs from 1.21/1.21.1 data — using
+# the 767 data misparses plugin GUI items (e.g. the /ah auction window,
+# "Invalid tag: 111 > 20") and crashes the bot. 1.21.2 and 1.21.3 share the
+# same wire protocol, so 1.21.3 data parses 1.21.2 servers correctly.
+# Override with `VERSION_1_21_2_MAP` if your server needs a different target.
 ```
 
 Never commit `.env`, passwords, proxy credentials, or Discord webhook URLs.
@@ -246,7 +254,8 @@ check logs before retrying to avoid accidentally executing a command twice.
 | --- | --- | --- |
 | `HOST` | `play.fatalmc.org` | Minecraft server host |
 | `PORT` | `25565` | Minecraft server port |
-| `VERSION` | `1.21.2` | Minecraft protocol version |
+| `VERSION` | `1.21.2` | Minecraft protocol version. `1.21.2` is auto-mapped to `1.21.3` (see setup note: same wire protocol, correct item registry — fixes the /ah "Invalid tag" crash) |
+| `VERSION_1_21_2_MAP` | `1.21.3` | Override target for the `1.21.2` remap (e.g. `1.21.4` if a server rejects 1.21.3, or `1.21` to restore the old silent downgrade) |
 | `LOGIN_PASSWORD` | `123456` | Password sent to register/login prompts |
 | `BOT_NAMES` | required | Comma-separated bot usernames |
 | `CONNECT_DELAY_MS` | `39500` | Delay between initial bot connections |
