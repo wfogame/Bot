@@ -421,6 +421,14 @@ io.netty...". The same patch script adds a transfer handler that reconnects
 to the destination through the same proxy (reusing the client's own
 reconnect mechanism), so server switches work like on a vanilla client.
 
+**Server resource packs download through GitHub URLs.** GitHub redirects
+(`github.com/.../raw/...`) carry no CORS headers, so a browser `fetch` of a
+pack hosted on GitHub dies with "Failed to fetch" (the vanilla client is
+unaffected — only browsers enforce CORS). The client patch falls back to a
+same-origin `/resource-pack-proxy` endpoint on the web-client server
+(`web-client.js`), which fetches server-side (no CORS, redirects followed)
+and streams the pack back.
+
 If the build is missing, `/play` shows a "build not found" page with these
 instructions instead of embedding anything remote.
 

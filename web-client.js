@@ -14,6 +14,7 @@ const http = require('http')
 const fs = require('fs')
 const path = require('path')
 const zlib = require('zlib')
+const { Readable } = require('stream')
 
 // Text asset types worth gzipping — the client's main JS bundle is multi-MB.
 const COMPRESSIBLE = { '.html': true, '.js': true, '.mjs': true, '.css': true, '.json': true, '.map': true, '.svg': true, '.txt': true, '.wasm': true }
@@ -34,6 +35,45 @@ const MIME = {
   '.ttf': 'font/ttf',
   '.wasm': 'application/wasm',
   '.txt': 'text/plain; charset=utf-8'
+}
+
+// ── Resource pack proxy ───────────────────────────────────────────────────────
+// Fetches a resource pack URL server-side and streams it to the browser.
+// Used by the web client when the direct browser fetch fails (GitHub
+// redirects lack CORS headers, so browsers refuse to follow them).
+// Only http(s) targets are allowed; loopback hosts are blocked so the
+// endpoint can't be used to probe the local machine.
+async function handleResourcePackProxy (req, res, log) {
+  try {
+    const q = new URL(req.url, 'http://localhost')
+    const target = q.searchParams.get('url')
+    const host = target ? new URL(target).hostname.toLowerCase() : ''
+    const loopback = host === 'localhost' || host === '::1' || host === '0.0.0.0' || /^127\./.test(host)
+    if (!target || !/^https?:\/\//i.test(target) || loopback) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end('bad resource pack url')
+      return
+    }
+    const upstream = await fetch(target, { redirect: 'follow', headers: { 'User-Agent': 'Mozilla/5.0 (resource-pack-proxy)' } })
+    if (!upstream.ok || !upstream.body) {
+      res.writeHead(upstream.status || 502, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end('upstream error: ' + (upstream.status || 'unknown'))
+      return
+    }
+    const headers = {
+      'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream',
+      'Cache-Control': 'no-cache',
+      'Access-Control-Allow-Origin': '*'
+    }
+    const length = upstream.headers.get('content-length')
+    if (length) headers['Content-Length'] = length
+    res.writeHead(200, headers)
+    // Stream — never buffer the whole pack in memory.
+    Readable.fromWeb(upstream.body).pipe(res)
+  } catch (err) {
+    try { res.writeHead(502); res.end('proxy error') } catch (_) {}
+    log(`resource-pack proxy error: ${err && err.message ? err.message : String(err)}`)
+  }
 }
 
 // Resolves with the real bound port once the server is listening; rejects on
@@ -64,6 +104,14 @@ async function startWebClient({ dir, port = 8090, maxAttempts = 10, bind = '0.0.
     try {
       let p
       try { p = decodeURIComponent((req.url || '/').split('?')[0]) } catch (_) { p = '/' }
+      // Same-origin proxy for server resource packs. Browsers refuse to follow
+      // GitHub's CORS-less redirects (github.com → codeload/raw), so the web
+      // client's resource-pack fetch falls back to this endpoint, which
+      // fetches server-side (Node has no CORS) and streams the pack back.
+      if (p === '/resource-pack-proxy') {
+        handleResourcePackProxy(req, res, log)
+        return
+      }
       if (p === '/') p = '/index.html'
       // Resolve inside distDir only (block ../ traversal).
       let file = path.resolve(distDir, '.' + p)

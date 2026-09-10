@@ -2,7 +2,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const path = require('node:path')
-const { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport } = require(path.join(__dirname, '..', 'scripts', 'patch-web-client-enchants.js'))
+const { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport, patchResourcePackCors } = require(path.join(__dirname, '..', 'scripts', 'patch-web-client-enchants.js'))
 
 // The browser client bundles prismarine-item 1.18.0, whose `enchants` getter
 // returns the raw 1.20.5+ component object ({ enchantments: [{ id, level }] })
@@ -170,6 +170,46 @@ test('patchTransferSupport is idempotent', () => {
 
 test('patchTransferSupport fails loudly if the upstream layout changes', () => {
   assert.throws(() => patchTransferSupport('const somethingElse = 1\n'), /no longer contains the expected transfer anchor/)
+})
+
+// ── Fourth patch: src/resourcePack.ts — resource pack download CORS fallback ─
+// The client downloads server packs with a plain fetch(url). GitHub URLs
+// redirect (github.com → codeload/raw) without CORS headers, so browsers
+// refuse to follow and the fetch dies with "Failed to fetch". The patch falls
+// back to the same-origin /resource-pack-proxy endpoint served by
+// web-client.js.
+const PACK_SAMPLE = `    const response = await fetch(url).catch((err) => {
+      console.error(err)
+      if (err.message === 'Failed to fetch') {
+        err.message = \`Check internet connection and ensure server on \${url} support CORS which is not required for the vanilla client, but is required for the web client.\`
+      }
+      progressReporter.error('Failed to download resource pack: ' + err.message)
+    })
+    console.timeEnd('downloadServerResourcePack')
+    if (!response) return
+`
+
+test('patchResourcePackCors falls back to the same-origin proxy on fetch failure', () => {
+  const { changed, content } = patchResourcePackCors(PACK_SAMPLE)
+  assert.equal(changed, true)
+  assert.match(content, /\/resource-pack-proxy\?url=/)
+  assert.match(content, /let response = await fetch\(url\)/, 'response becomes let so the fallback can reassign it')
+  assert.match(content, /if \(!response \|\| !response\.ok\)/, 'fallback also covers non-OK responses')
+  assert.match(content, /location\.origin/, 'proxy URL is same-origin')
+  assert.match(content, /err\.message === 'Failed to fetch'/, 'the CORS explanation is kept for the final failure')
+  assert.ok(content.includes("if (!response) return"), 'guard after the fallback stays intact')
+})
+
+test('patchResourcePackCors is idempotent', () => {
+  const once = patchResourcePackCors(PACK_SAMPLE)
+  assert.equal(once.changed, true)
+  const twice = patchResourcePackCors(once.content)
+  assert.equal(twice.changed, false)
+  assert.equal(twice.content, once.content)
+})
+
+test('patchResourcePackCors fails loudly if the upstream layout changes', () => {
+  assert.throws(() => patchResourcePackCors('const somethingElse = 1\n'), /no longer contains the expected fetch anchor/)
 })
 
 // Simulate the filter math the patched prep uses: the defaults must keep the

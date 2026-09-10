@@ -1,8 +1,8 @@
 'use strict'
 // ── Fix block breaking + build memory in the self-hosted Minecraft web client ──
 // This script runs inside scripts/build-web-client.sh right after `pnpm i` and
-// before `pnpm run build`, and applies two source patches to the upstream
-// client (zardoy/minecraft-web-client, pinned to the latest release tag):
+// before `pnpm run build`, and applies source patches to the upstream client
+// (zardoy/minecraft-web-client, pinned to the latest release tag):
 //
 // 1. prismarine-item (block breaking): the `enchants` getter returns the RAW
 //    1.20.5+ component object ({ enchantments: [{ id, level }] }) instead of a
@@ -33,6 +33,14 @@
 //    transfer and never reconnects). The patch listens for the transfer
 //    packet and reconnects to the destination through the same proxy using
 //    the client's own reconnectOptions mechanism.
+//
+// 4. src/resourcePack.ts (server resource pack downloads): the client
+//    downloads packs with a plain fetch(url). GitHub URLs redirect
+//    (github.com → codeload/raw) without CORS headers, which browsers refuse
+//    to follow, so the download fails with "Failed to fetch". The patch falls
+//    back to the same-origin /resource-pack-proxy endpoint served by
+//    web-client.js (Node fetch has no CORS and follows redirects), which
+//    streams the pack back.
 //
 // All patches are no-ops (idempotent) if already applied, and fail loudly if
 // the upstream file layout changes so they can be re-baselined.
@@ -233,6 +241,58 @@ function patchTransferSupport (content) {
   return { changed: true, content: out }
 }
 
+// ── Fourth patch: src/resourcePack.ts — resource pack download CORS fallback ─
+// The client downloads server packs with a plain fetch(url). GitHub URLs
+// (github.com/.../raw/...) respond with a 302 whose redirect carries no
+// Access-Control-Allow-Origin, so browsers refuse to follow it and the fetch
+// dies with "Failed to fetch" (raw.githubusercontent.com works because it
+// sends ACAO: *). The patch falls back to the same-origin /resource-pack-
+// proxy endpoint served by web-client.js, which fetches server-side (no
+// CORS, redirects followed) and streams the pack back.
+const PACK_ANCHOR = `    const response = await fetch(url).catch((err) => {
+      console.error(err)
+      if (err.message === 'Failed to fetch') {
+        err.message = \`Check internet connection and ensure server on \${url} support CORS which is not required for the vanilla client, but is required for the web client.\`
+      }
+      progressReporter.error('Failed to download resource pack: ' + err.message)
+    })
+    console.timeEnd('downloadServerResourcePack')
+    if (!response) return`
+
+const PACK_HANDLER = `    let response = await fetch(url).catch((err) => {
+      console.error(err)
+      return null
+    })
+    // GitHub URLs redirect without CORS headers (browsers refuse to follow),
+    // so fall back to the same-origin proxy served by web-client.js, which
+    // fetches server-side (no CORS) and streams the pack back.
+    if (!response || !response.ok) {
+      console.log('Direct resource pack fetch failed, falling back to same-origin proxy')
+      response = await fetch(\`\${location.origin}/resource-pack-proxy?url=\${encodeURIComponent(url)}\`).catch((err) => {
+        console.error(err)
+        if (err.message === 'Failed to fetch') {
+          err.message = \`Check internet connection and ensure server on \${url} support CORS which is not required for the vanilla client, but is required for the web client.\`
+        }
+        progressReporter.error('Failed to download resource pack: ' + err.message)
+      })
+    }
+    console.timeEnd('downloadServerResourcePack')
+    if (!response) return`
+
+function patchResourcePackCors (content) {
+  if (content.includes('/resource-pack-proxy?url=')) {
+    return { changed: false, content }
+  }
+  if (!content.includes(PACK_ANCHOR)) {
+    throw new Error('web-client src/resourcePack.ts no longer contains the expected fetch anchor — update scripts/patch-web-client-enchants.js')
+  }
+  const out = content.replace(PACK_ANCHOR, PACK_HANDLER)
+  if (out === content) {
+    throw new Error('patchResourcePackCors: anchor matched but replacement was a no-op')
+  }
+  return { changed: true, content: out }
+}
+
 // Locate the installed prismarine-item under the web client source dir
 // (pnpm: usually a root symlink; falls back to a .pnpm store scan).
 function findPrismarineItem (srcDir) {
@@ -330,8 +390,32 @@ function main (argv) {
   } else {
     console.log('✓ src/index.ts already patched (transfer support)')
   }
+
+  // Fourth patch: src/resourcePack.ts — resource pack downloads fall back to
+  // the same-origin proxy when the direct browser fetch fails (GitHub
+  // redirects lack CORS headers). Also idempotent.
+  const packTs = path.join(srcDir, 'src', 'resourcePack.ts')
+  let packContent
+  try {
+    packContent = fs.readFileSync(packTs, 'utf8')
+  } catch (err) {
+    console.error(`✗ could not read ${packTs}: ${err.message}`)
+    process.exit(1)
+  }
+  const packRes = patchResourcePackCors(packContent)
+  if (packRes.changed) {
+    try {
+      fs.writeFileSync(packTs, packRes.content)
+    } catch (err) {
+      console.error(`✗ could not write ${packTs}: ${err.message}`)
+      process.exit(1)
+    }
+    console.log('✓ patched src/resourcePack.ts — resource pack downloads fall back to the same-origin proxy when direct fetch fails (GitHub redirects)')
+  } else {
+    console.log('✓ src/resourcePack.ts already patched (resource pack proxy fallback)')
+  }
 }
 
 if (require.main === module) main(process.argv)
 
-module.exports = { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport, findPrismarineItem }
+module.exports = { mapEnchants, normalizeEnchants, patchItemsJs, patchMakeOptimizedMcData, patchTransferSupport, patchResourcePackCors, findPrismarineItem }
