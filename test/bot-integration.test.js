@@ -46,7 +46,6 @@ function runtime(env = {}) {
       if (name === 'socks') return {}
       if (name === './cron') return require('../cron')
       if (name === './web-client') return require('../web-client')
-      if (name === './lib/version-remap') return require('../lib/version-remap')
       return require(name)
     }
   })

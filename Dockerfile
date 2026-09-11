@@ -73,9 +73,6 @@ COPY monitoring.js ./monitoring.js
 COPY bot-manual.js ./bot-manual.js
 COPY cron.js ./cron.js
 COPY web-client.js ./web-client.js
-# Shared libs (lib/version-remap.js — MC version normalization for 1.21.2
-# → 1.21.3; required by both bot.js and bot-rtp.js).
-COPY lib/ ./lib/
 # Build script (and its dig-fix patch script) ship in the image so
 # `npm run web-client:build` also works inside a running container
 # (docker exec …) to rebuild the client in place.
