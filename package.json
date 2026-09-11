@@ -8,6 +8,7 @@
     "test": "node --test test/*.test.js",
     "web-client:build": "sh ./scripts/build-web-client.sh",
     "web-client:serve": "node web-client.js",
+    "pull-and-disconnect": "node scripts/pull-and-stagger-disconnect.js",
     "postinstall": "npx patch-package || echo 'mineflayer patch already included or not applicable'"
   },
   "keywords": [],

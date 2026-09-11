@@ -111,6 +111,38 @@ Do not use a plain `.env.docker`; only `.env.dockerN` files are discovered.
 Docker env files must contain `KEY=VALUE` lines or comments beginning with
 `#`.
 
+### Pull and staggered disconnect
+
+For maintenance, `scripts/pull-and-stagger-disconnect.js` pulls the repository
+with `git pull --ff-only`, snapshots the bots currently online through the
+existing authenticated dashboard API, then sends each bot's existing
+`/disconnect` command at randomized times across a bounded window. It uses one
+pending timer and one request at a time, so a large fleet does not disconnect
+in a burst. It never starts unless the pull succeeds.
+
+```bash
+# Requires WEB_PASSWORD in .env (or ENV_FILE=/path/to/env)
+npm run pull-and-disconnect
+
+# Preview the randomized roster/timing without pulling or disconnecting
+node scripts/pull-and-stagger-disconnect.js --dry-run
+```
+
+Defaults are 4–12 minutes total, approximately 8 minutes, with at least one
+second between commands. Tune the window without changing code:
+
+```dotenv
+DISCONNECT_MIN_WINDOW_MS=240000
+DISCONNECT_MAX_WINDOW_MS=720000
+DISCONNECT_MIN_GAP_MS=1000
+CONTROL_HOST=127.0.0.1
+# CONTROL_PORT defaults to WEB_PORT; WEB_PORT_MAX_ATTEMPTS is respected
+```
+
+The script requires a fixed `WEB_PASSWORD`; when the app generates a random
+password because `WEB_PASSWORD` is unset, use the printed password explicitly
+instead of running unattended maintenance.
+
 ### SSH terminal
 
 The browser TERMINAL tab is disabled unless both `SSH=true` and
