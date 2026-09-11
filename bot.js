@@ -2344,7 +2344,7 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 const COMMANDS = {
 '/all <cmd>': 'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
 '/all-slow <cmd>': `Like /all, but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS)`,
-'/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, and balance',
+'/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
@@ -3109,6 +3109,24 @@ async function queryRank (id) {
   return bot.entity ? 'Regent' : null
 }
 
+// -- Inventory slot usage ---------------------------------------------------
+// Player storage = 27 main inventory slots (9-35) + 9 hotbar slots (36-44)
+// = 36 slots. Armor (5-8), offhand (45), the crafting grid (1-4) and the
+// craft result (0) are deliberately NOT counted, so "N free" only ever
+// refers to real storage.
+const INVENTORY_STORAGE_SLOTS = 36
+function inventorySlotUsage (bot) {
+  const slots = bot?.inventory?.slots
+  if (!slots || typeof slots.length !== 'number') {
+    return { used: null, total: INVENTORY_STORAGE_SLOTS, free: null }
+  }
+  let used = 0
+  for (let slot = 9; slot <= 44; slot++) {
+    if (slots[slot]) used++
+  }
+  return { used, total: INVENTORY_STORAGE_SLOTS, free: INVENTORY_STORAGE_SLOTS - used }
+}
+
 // ── Command router (real tail + context routing prologue for the web GUI) ────
 function handleCommand(raw, ctx) {
 const trimmed = String(raw ?? '').trim()
@@ -3324,7 +3342,9 @@ const sh = shards !== null ? shards.toLocaleString() : 'N/A'
 const co = coins !== null ? coins.toLocaleString() : 'N/A'
 const mo = money !== null ? `$${money.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : 'N/A'
 const rk = rank || 'N/A'
-log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Rank: ${rk} | Shards: ${sh} | Coins: ${co} | Balance: ${mo}`)
+const inv = inventorySlotUsage(b.bot)
+const invTxt = inv.used === null ? '?' : `${inv.used}/${inv.total} used, ${inv.free} free`
+log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {green-fg}Online{/green-fg} | HP: ${hp} | Food: ${food} | Ping: ${ping}ms | Rank: ${rk} | Shards: ${sh} | Coins: ${co} | Balance: ${mo} | Inv: ${invTxt}`)
 } else {
 log(`[${idx + 1}] {cyan-fg}${name}{/cyan-fg} : {gray-fg}Offline / Connecting…{/gray-fg}`)
 }
