@@ -121,6 +121,20 @@ const CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box'
 const CRATE_SCAN_RADIUS = parseInt(process.env.CRATE_SCAN_RADIUS || '20', 10)
 const CRATE_REACH = parseFloat(process.env.CRATE_REACH || '3.5')
 
+// ── /spawners config ───────────────────────────────────────────────────────
+// The bot never moves for this: it scans for spawner blocks already inside its
+// reach, right-clicks each one, clicks SPAWNER_SLOT_FIRST (13) in the GUI that
+// opens, waits, clicks SPAWNER_SLOT_SECOND (53), then moves on to the next
+// spawner until every reachable spawner has been handled.
+const SPAWNER_BLOCK = process.env.SPAWNER_BLOCK || 'spawner'
+const SPAWNER_REACH = parseFloat(process.env.SPAWNER_REACH || '4.5')
+const SPAWNER_MAX_COUNT = parseInt(process.env.SPAWNER_MAX_COUNT || '64', 10)
+const SPAWNER_SLOT_FIRST = parseInt(process.env.SPAWNER_SLOT_FIRST || '13', 10)
+const SPAWNER_SLOT_SECOND = parseInt(process.env.SPAWNER_SLOT_SECOND || '53', 10)
+const SPAWNER_WINDOW_WAIT_MS = parseInt(process.env.SPAWNER_WINDOW_WAIT_MS || '3000', 10)
+const SPAWNER_SLOT_DELAY_MS = parseInt(process.env.SPAWNER_SLOT_DELAY_MS || '1500', 10)
+const SPAWNER_NEXT_DELAY_MS = parseInt(process.env.SPAWNER_NEXT_DELAY_MS || '1500', 10)
+
 // ── Crate color customization ──────────────────────────────────────────────
 const SHULKER_COLORS = [
 'white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink',
@@ -1826,6 +1840,7 @@ crateRoutineRunning: false, // prevents concurrent /crates runs
 crateLoopRunning: false, // prevents concurrent /crates-loop runs
 inCrateRoutine: false, // suppresses windowOpen handler during /crates
 inDumpRoutine: false, // suppresses windowOpen handler during /dump (chests must not be auto-clicked/warped)
+inSpawnerRoutine: false, // suppresses windowOpen handler during /spawners (slots 13/53 are clicked by the routine)
 shardshopLoopRunning: false, // prevents concurrent /shardshop-loop runs
 lastActivity: Date.now(), // updated on every inbound packet — used by the proxy stall watchdog
 forceKilled: false, // set by the watchdog so scheduleReconnect logs it distinctly
@@ -2091,7 +2106,7 @@ if (manual.onWindowOpen(id, window)) return
 // window. /dump opens chests to deposit items — the GUI item search, slot
 // auto-click, and delayed AFK warp must never run on them (it would grab
 // items out of the chest and warp away mid-dump).
-if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine) return
+if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine || bots[id]?.inSpawnerRoutine) return
 
 const title = window.title?.toString ? window.title.toString() : String(window.title || '')
 
@@ -2351,6 +2366,7 @@ const COMMANDS = {
 '/shardshop-loop': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap`,
 '/crates-all [n] [color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
 '/crates-solo [bot] [color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots',
+'/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
 '/list': 'Compact one-line-per-bot status list (online / offline / last kick)',
 '/chat <msg>': 'Send a chat message from the active bot (avoids triggering local commands); /-prefixed server commands open their GUI without auto-clicking',
 '/disconnect': 'Disconnect the active bot (stops auto-reconnect). Alias: /dc',
@@ -2492,7 +2508,7 @@ try { await chestContainer.close() } catch (_) {}
 if (bots[id]) bots[id].inDumpRoutine = false
 }
 }
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/shardshop-loop', '/closeBot']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/shardshop-loop', '/closeBot']
 
 function runLocalCommandForBot(id, cmd) {
 const entry = bots[id]
@@ -2595,6 +2611,12 @@ return true
 case '/crates-loop': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 runCrateLoop(id) // fire-and-forget, logs its own progress
+return true
+}
+
+case '/spawners': {
+if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+runSpawnerRoutine(id) // fire-and-forget async routine, logs its own progress
 return true
 }
 
@@ -2814,6 +2836,140 @@ return true
 if (bots[id]) {
 bots[id].crateRoutineRunning = false
 bots[id].inCrateRoutine = false
+}
+}
+}
+
+// ── /spawners: click every spawner already within reach (no movement) ──────
+// Resolves with the window the bot just opened, or null if none appeared in time.
+function waitForWindowOpen (bot, timeoutMs = SPAWNER_WINDOW_WAIT_MS) {
+return new Promise((resolve) => {
+if (bot.currentWindow) { resolve(bot.currentWindow); return }
+let settled = false
+const finish = (win) => {
+if (settled) return
+settled = true
+clearTimeout(timer)
+bot.removeListener('windowOpen', onOpen)
+resolve(win)
+}
+const onOpen = (win) => finish(win)
+const timer = setTimeout(() => finish(null), timeoutMs)
+bot.on('windowOpen', onOpen)
+})
+}
+
+// Right-click one spawner, then click slot 13 → wait → slot 53 in its GUI.
+async function clickSpawnerOnce (bot, id, position) {
+const block = bot.blockAt(position)
+if (!block || block.name !== SPAWNER_BLOCK) {
+logFor(id, `{yellow-fg}⚠ Block at ${position.x}, ${position.y}, ${position.z} is no longer a ${SPAWNER_BLOCK.replace(/_/g, ' ')} — skipping.{/yellow-fg}`)
+return false
+}
+
+try {
+await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true)
+await bot.activateBlock(block)
+} catch (err) {
+logFor(id, `{red-fg}✗ Right-click failed at ${position.x}, ${position.y}, ${position.z}: ${sanitize(err.message || String(err))}{/red-fg}`)
+return false
+}
+
+const window = await waitForWindowOpen(bot)
+if (!window) {
+logFor(id, `{yellow-fg}⚠ No GUI opened for the spawner at ${position.x}, ${position.y}, ${position.z} — skipping.{/yellow-fg}`)
+return false
+}
+
+const clickSlot = async (slot) => {
+if (!bot.currentWindow) { logFor(id, `{yellow-fg}⚠ Window closed before slot ${slot} could be clicked.{/yellow-fg}`); return false }
+if (slot >= bot.currentWindow.slots.length) {
+logFor(id, `{yellow-fg}⚠ Slot ${slot} is out of bounds — the window only has ${bot.currentWindow.slots.length} slots.{/yellow-fg}`)
+return false
+}
+try {
+await bot.clickWindow(slot, 0, 0)
+logFor(id, `{cyan-fg}› Clicked slot ${slot}.{/cyan-fg}`)
+return true
+} catch (err) {
+logFor(id, `{red-fg}✗ Click on slot ${slot} failed: ${sanitize(err.message || String(err))}{/red-fg}`)
+return false
+}
+}
+
+let ok = await clickSlot(SPAWNER_SLOT_FIRST)
+if (ok) {
+await new Promise(r => setTimeout(r, SPAWNER_SLOT_DELAY_MS))
+if (!bot.entity) return false
+ok = await clickSlot(SPAWNER_SLOT_SECOND)
+}
+
+// Always leave the GUI closed so the next spawner opens a fresh window.
+if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch (_) {} }
+return ok
+}
+
+async function runSpawnerRoutine (id) {
+const entry = bots[id]
+if (!entry) return false
+if (entry.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /spawners.{/yellow-fg}`); return false }
+if (!entry.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return false }
+if (entry.spawnerRoutineRunning) { logFor(id, `{yellow-fg}⚠ /spawners is already running for ${id}.{/yellow-fg}`); return false }
+
+// A GUI session armed by /chat or /gui must not swallow this routine's windows
+if (entry.suppressNextWindowClick) entry.suppressNextWindowClick = false
+if (entry.suppressWindowTimer) { clearTimeout(entry.suppressWindowTimer); entry.suppressWindowTimer = null }
+if (entry.manualWindow) entry.manualWindow = null
+if (entry.manualSession) entry.manualSession = false
+if (entry.guiSessionTimer) { clearTimeout(entry.guiSessionTimer); entry.guiSessionTimer = null }
+
+entry.spawnerRoutineRunning = true
+entry.inSpawnerRoutine = true
+const { bot } = entry
+
+try {
+if (bot.currentWindow) { try { bot.closeWindow(bot.currentWindow) } catch (_) {} }
+
+const spawnerId = bot.registry?.blocksByName?.[SPAWNER_BLOCK]?.id
+if (spawnerId === undefined) {
+logFor(id, `{red-fg}✗ Unknown block "${SPAWNER_BLOCK}" for this version — set SPAWNER_BLOCK in .env.{/red-fg}`)
+return false
+}
+
+// No walking: only spawners already inside the bot's reach are considered.
+const positions = bot.findBlocks({
+matching: spawnerId,
+maxDistance: SPAWNER_REACH,
+count: SPAWNER_MAX_COUNT
+})
+
+if (!positions.length) {
+logFor(id, `{yellow-fg}⚠ No ${SPAWNER_BLOCK.replace(/_/g, ' ')} within ${SPAWNER_REACH} blocks — nothing to click.{/yellow-fg}`)
+return false
+}
+
+positions.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b))
+logFor(id, `{cyan-fg}› Found ${positions.length} spawner(s) in reach — clicking slot ${SPAWNER_SLOT_FIRST} then ${SPAWNER_SLOT_SECOND} on each…{/cyan-fg}`)
+
+let done = 0
+for (let idx = 0; idx < positions.length; idx++) {
+if (!bot.entity) { logFor(id, `{red-fg}✗ ${id} despawned during /spawners — stopping.{/red-fg}`); break }
+const pos = positions[idx]
+logFor(id, `{cyan-fg}› Spawner ${idx + 1}/${positions.length} at ${pos.x}, ${pos.y}, ${pos.z}…{/cyan-fg}`)
+const ok = await clickSpawnerOnce(bot, id, pos)
+if (ok) done++
+if (idx < positions.length - 1) await new Promise(r => setTimeout(r, SPAWNER_NEXT_DELAY_MS))
+}
+
+logFor(id, `{green-fg}✓ /spawners finished — ${done}/${positions.length} spawner(s) fully clicked.{/green-fg}`)
+return done > 0
+} catch (err) {
+logFor(id, `{red-fg}✗ /spawners failed: ${sanitize(err.message || String(err))}{/red-fg}`)
+return false
+} finally {
+if (bots[id]) {
+bots[id].spawnerRoutineRunning = false
+bots[id].inSpawnerRoutine = false
 }
 }
 }
