@@ -1,0 +1,98 @@
+--- a/bot.js
++++ b/bot.js
+@@ -2413,7 +2413,17 @@
+ '/take-gui': 'Shift-click every item out of the open GUI into the inventory',
+ '/dump-gui': 'Shift-click the whole inventory into the open GUI window',
+ 'anything else': 'Sent directly as a chat message/command from the active bot',
+-'/dump': 'dump gear to chest'
++'/dump': 'dump gear to chest',
++'/dump-spawners': 'Same as /dump, but only transfers SPAWNERS into the chests (everything else stays in the inventory)'
++}
++
++// True when an item is a spawner (mob/monster spawner). Matches the registry
++// name first, then falls back to display/custom names so renamed server
++// spawners like "§bZombie Spawner" are still recognised.
++function isSpawnerItem (item) {
++if (!item) return false
++const names = [item.name, item.displayName, itemCustomName(item)].filter(Boolean)
++return names.some(n => /spawner/i.test(String(n)))
+ }
+ 
+ /**
+@@ -2421,14 +2431,29 @@
+ * within a configured radius and dumps the bot's inventory into them.
+ *
+ * @param {object} bot - The mineflayer bot instance
++* @param {string} id - The bot id (used for logging)
++* @param {object} [options]
++* @param {boolean} [options.spawnersOnly] - When true (/dump-spawners), only
++*   spawner items are deposited; every other item stays in the inventory.
+ */
+-async function tpaAndDump(bot, id) {
++async function tpaAndDump(bot, id, options = {}) {
++const spawnersOnly = Boolean(options.spawnersOnly)
++const label = spawnersOnly ? '/dump-spawners' : '/dump'
+ // Suppress the generic windowOpen handler (GUI item search, slot auto-click,
+ // and the delayed AFK warp) while dumping — /dump opens chests only to
+ // deposit into them, and none of that automation may run on them.
+ if (bots[id]) bots[id].inDumpRoutine = true
+ try {
+ 
++if (spawnersOnly) {
++const spawnerCount = bot.inventory.items().filter(isSpawnerItem).reduce((sum, it) => sum + (it.count || 1), 0)
++logFor(id, `{cyan-fg}› ${label}: transferring SPAWNERS only — ${spawnerCount} in inventory.{/cyan-fg}`)
++if (spawnerCount === 0) {
++logFor(id, `{yellow-fg}⚠ ${label}: no spawners in the inventory — nothing to transfer.{/yellow-fg}`)
++return
++}
++}
++
+ const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
+ const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
+ 
+@@ -2470,7 +2495,7 @@
+ })
+ 
+ if (chestBlocks.length === 0) {
+-logFor(id, `{yellow-fg}⚠ No chests found within ${scanRadius} blocks.{/yellow-fg}`)
++logFor(id, `{yellow-fg}⚠ ${label}: No chests found within ${scanRadius} blocks.{/yellow-fg}`)
+ return
+ }
+ 
+@@ -2479,8 +2504,13 @@
+ })
+ 
+ for (const chestPos of chestBlocks) {
+-const itemsToDump = bot.inventory.items()
+-if (itemsToDump.length === 0) return
++const itemsToDump = spawnersOnly
++? bot.inventory.items().filter(isSpawnerItem)
++: bot.inventory.items()
++if (itemsToDump.length === 0) {
++if (spawnersOnly) logFor(id, `{green-fg}✓ ${label}: no spawners left in the inventory — done.{/green-fg}`)
++return
++}
+ 
+ const chestBlock = bot.blockAt(chestPos)
+ let chestContainer
+@@ -2508,7 +2538,7 @@
+ if (bots[id]) bots[id].inDumpRoutine = false
+ }
+ }
+-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/shardshop-loop', '/closeBot']
++const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/shardshop-loop', '/closeBot']
+ 
+ function runLocalCommandForBot(id, cmd) {
+ const entry = bots[id]
+@@ -2551,6 +2581,11 @@
+ tpaAndDump(bot, id)
+ return true
+ }
++case '/dump-spawners': {
++if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
++tpaAndDump(bot, id, { spawnersOnly: true })
++return true
++}
+ case '/players': {
+ if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+ const players = Object.keys(bot.players)
