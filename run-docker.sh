@@ -59,12 +59,38 @@ block_free() {
   return 0
 }
 
+# Gracefully disconnects all bots in a running container slowly (10-20s random delay per bot)
+slow_disconnect_container() {
+  local cname="$1"
+  local running
+  running=$(docker ps -q -f "name=^/${cname}$" -f "status=running" 2>/dev/null || true)
+  if [ -n "$running" ]; then
+    say "▸ disconnecting bots in ${cname} slowly in random order (10–20s per bot)…"
+    docker exec "$cname" node -e "
+      const port = process.env.WEB_PORT || 80;
+      fetch('http://127.0.0.1:' + port + '/api/internal/disconnect-slow', { method: 'POST' })
+        .then(r => r.json())
+        .then(d => {
+          if (d.disconnected) console.log('✓ gracefully disconnected ' + d.disconnected + ' bot(s) from ${cname}');
+          process.exit(0);
+        })
+        .catch(err => {
+          console.error('⚠ slow disconnect notice: ' + err.message);
+          process.exit(0);
+        });
+    " 2>/dev/null || true
+  fi
+}
+
 cmd="${1:-up}"
 case "$cmd" in
   up) ;;
   stop)
     found=0
     for c in $(docker ps -a --format '{{.Names}}' | grep -E "^${PREFIX}-(proxy|[0-9]+)$" || true); do
+      if [ "$c" != "${PREFIX}-proxy" ]; then
+        slow_disconnect_container "$c"
+      fi
       docker rm -f "$c" >/dev/null && say "removed $c"; found=1
     done
     [ "$found" -eq 0 ] && say "no managed containers found"
@@ -208,6 +234,9 @@ for f in $ordered; do
 
   bn=$(grep -E '^ *BOT_NAMES *=' "$f" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d ' ,' || true)
   [ -n "$bn" ] || say "  ⚠ ${f}: BOT_NAMES is empty — ${PREFIX}-${n} will exit until you fill it in"
+
+  # disconnect bots slowly in random order (10-20s per bot) before replacing container
+  slow_disconnect_container "${PREFIX}-${n}"
 
   # free this instance's old container (and its host port) before probing
   docker rm -f "${PREFIX}-${n}" >/dev/null 2>&1 || true

@@ -38,8 +38,19 @@ function parseField (field, min, max, name) {
   return values
 }
 
+function stripQuotes (str) {
+  let s = String(str || '').trim()
+  while ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    if (s.length < 2) break
+    s = s.slice(1, -1).trim()
+  }
+  if (s.startsWith('"') || s.startsWith("'")) s = s.slice(1).trim()
+  if (s.endsWith('"') || s.endsWith("'")) s = s.slice(0, -1).trim()
+  return s
+}
+
 function parseSchedule (schedule) {
-  const s = String(schedule || '').trim()
+  const s = stripQuotes(schedule)
   if (!s) throw new Error('Schedule is empty')
   if (/^@every\b/i.test(s)) {
     const secs = Number(s.split(/\s+/)[1])
@@ -153,15 +164,16 @@ class CronManager {
   loadFromEnv (env = process.env, prefix = 'CRON_JOB_') {
     let loaded = 0
     for (let i = 1; i < 1000; i++) {
-      const raw = env[prefix + i]
-      if (raw === undefined || raw === null) continue
-      const sep = String(raw).indexOf('|')
+      const val = env[prefix + i]
+      if (val === undefined || val === null) continue
+      const raw = String(val).trim()
+      const sep = raw.indexOf('|')
       if (sep < 0) {
         this.log(`{red-fg}✗ ${prefix}${i} ignored — missing "|" separator, expected "<schedule>|<command>"{/red-fg}`)
         continue
       }
-      const schedule = String(raw).slice(0, sep).trim()
-      const command = String(raw).slice(sep + 1).trim()
+      const schedule = stripQuotes(raw.slice(0, sep))
+      const command = stripQuotes(raw.slice(sep + 1))
       try {
         this.add(schedule, command)
         loaded++

@@ -450,6 +450,31 @@ return typeof pv.mineflayer === 'function' ? pv.mineflayer : (typeof pv === 'fun
 }
 const manual = createManualControls({ bots, logFor, sanitize, notifyBotsChanged, SYSTEM_ID, WEB_BIND, loadViewerFactory })
 
+// ── Commands known to run locally on a bot rather than sent as raw in-game chat ─
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/shardshop-loop', '/closeBot']
+
+const logSubscribers = new Set()
+function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
+
+function logFor(id, msg) {
+if (id !== SYSTEM_ID && !bots[id]) return
+const line = `${timestamp()} ${msg}`
+const store = id === SYSTEM_ID ? systemLogs : bots[id].logs
+store.push({ text: line, time: Date.now() })
+if (store.length > LOG_MAX_LINES) store.splice(0, store.length - LOG_MAX_LINES)
+if (logSubscribers.size) {
+for (const fn of logSubscribers) { try { fn(id, line) } catch (_) {} }
+}
+}
+function log(msg) { logFor(activeId || SYSTEM_ID, msg) }
+function logSuccess(msg) { log(`{green-fg}✓ ${msg}{/green-fg}`) }
+function logError(msg) { log(`{red-fg}✗ ${msg}{/red-fg}`) }
+function logInfo(msg) { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
+
+// Centralized Discord alerts and host memory/swap monitoring.
+let monitoring
+function logWarn(msg) { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
+
 // ── Scheduled jobs (cron) ────────────────────────────────────────────────────
 // /cron manages jobs at runtime; CRON_JOB_<N>="<schedule>|<command>" in .env
 // loads them at startup. Schedules are 5-field cron ("0 4 * * *") or
@@ -482,33 +507,18 @@ function dispatchCommandToAllBots (msg) {
   return sent
 }
 const cronManager = new CronManager({
-  dispatch: (command) => dispatchCommandToAllBots(command),
+  dispatch: (command) => {
+    const trimmed = String(command || '').trim()
+    // Global commands should run through the main command router rather than per-bot
+    if (trimmed.startsWith('/crates-all') || trimmed.startsWith('/all') || trimmed.startsWith('/overview')) {
+      return handleCommand(trimmed)
+    }
+    return dispatchCommandToAllBots(trimmed)
+  },
   log: (msg) => logFor(SYSTEM_ID, msg)
 })
 const CRON_ENV_LOADED = cronManager.loadFromEnv(process.env)
 cronManager.start()
-
-const logSubscribers = new Set()
-function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
-
-function logFor(id, msg) {
-if (id !== SYSTEM_ID && !bots[id]) return
-const line = `${timestamp()} ${msg}`
-const store = id === SYSTEM_ID ? systemLogs : bots[id].logs
-store.push({ text: line, time: Date.now() })
-if (store.length > LOG_MAX_LINES) store.splice(0, store.length - LOG_MAX_LINES)
-if (logSubscribers.size) {
-for (const fn of logSubscribers) { try { fn(id, line) } catch (_) {} }
-}
-}
-function log(msg) { logFor(activeId || SYSTEM_ID, msg) }
-function logSuccess(msg) { log(`{green-fg}✓ ${msg}{/green-fg}`) }
-function logError(msg) { log(`{red-fg}✗ ${msg}{/red-fg}`) }
-function logInfo(msg) { log(`{cyan-fg}› ${msg}{/cyan-fg}`) }
-
-// Centralized Discord alerts and host memory/swap monitoring.
-let monitoring
-function logWarn(msg) { log(`{yellow-fg}⚠ ${msg}{/yellow-fg}`) }
 
 // 20-minute log pruning (original behavior), timers unref'd so they never hold the process open
 const pruneTimer = setInterval(() => {
@@ -1412,6 +1422,46 @@ req.on('error', () => resolve(null))
 })
 }
 
+/**
+* Gracefully disconnects all active bots one by one in random order,
+* with a random delay between minSec and maxSec (default: 10–20s) between each.
+*
+* @param {number} [minSec=10]
+* @param {number} [maxSec=20]
+* @returns {Promise<{ ok: boolean, disconnected: number }>}
+*/
+async function disconnectAllSlow(minSec = 10, maxSec = 20) {
+  const activeBots = Object.entries(bots).filter(([id, entry]) => entry && (entry.bot?.entity || entry.connected || entry.bot))
+  if (activeBots.length === 0) {
+    logFor(SYSTEM_ID, '{cyan-fg}› [slow-disconnect] No active bots to disconnect.{/cyan-fg}')
+    return { ok: true, disconnected: 0 }
+  }
+
+  const shuffled = shuffledCopy(activeBots)
+  logFor(SYSTEM_ID, `{yellow-fg}⚠ [slow-disconnect] Disconnecting ${shuffled.length} bot(s) slowly in random order (${minSec}–${maxSec}s apart)…{/yellow-fg}`)
+
+  let count = 0
+  for (let i = 0; i < shuffled.length; i++) {
+    const [id, entry] = shuffled[i]
+    logFor(id, `{yellow-fg}⚠ [slow-disconnect] Disconnecting ${id} (${i + 1}/${shuffled.length})…{/yellow-fg}`)
+    try {
+      entry.disconnectManually()
+      count++
+    } catch (err) {
+      logFor(id, `{red-fg}✗ [slow-disconnect] Error disconnecting ${id}: ${sanitize(err.message)}{/red-fg}`)
+    }
+
+    if (i < shuffled.length - 1) {
+      const delayMs = Math.floor(Math.random() * ((maxSec - minSec) * 1000 + 1)) + (minSec * 1000)
+      logFor(SYSTEM_ID, `{cyan-fg}› [slow-disconnect] Waiting ${(delayMs / 1000).toFixed(1)}s before disconnecting next bot…{/cyan-fg}`)
+      await new Promise(r => setTimeout(r, delayMs))
+    }
+  }
+
+  logFor(SYSTEM_ID, `{green-fg}✓ [slow-disconnect] Finished: all ${count} bot(s) disconnected.{/green-fg}`)
+  return { ok: true, disconnected: count }
+}
+
 const server = http.createServer(async (req, res) => {
 try {
 const url = new URL(req.url, 'http://localhost')
@@ -1419,6 +1469,24 @@ const p = url.pathname
 webTrace(`${req.method} ${p} from ${req.socket.remoteAddress || '?'}`)
 if (p === '/health') { res.writeHead(200); res.end('ok'); return }
 if (p === '/favicon.ico') { res.writeHead(204); res.end(); return }
+if (p === '/api/internal/disconnect-slow' && req.method === 'POST') {
+  const ip = req.socket.remoteAddress || ''
+  const isLocal = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip === ''
+  if (!isLocal && !sessionValid(tokenFromReq(req, url))) {
+    res.writeHead(403, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ error: 'forbidden' }))
+    return
+  }
+  webTrace(`triggering slow-disconnect from ${ip}`)
+  disconnectAllSlow().then(result => {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify(result))
+  }).catch(err => {
+    res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
+    res.end(JSON.stringify({ error: err.message }))
+  })
+  return
+}
 
 if (p === '/login' && req.method === 'GET') {
 if (sessionValid(tokenFromReq(req, url))) { res.writeHead(303, { Location: '/' }); res.end(); return }
@@ -2413,7 +2481,60 @@ const COMMANDS = {
 '/take-gui': 'Shift-click every item out of the open GUI into the inventory',
 '/dump-gui': 'Shift-click the whole inventory into the open GUI window',
 'anything else': 'Sent directly as a chat message/command from the active bot',
-'/dump': 'dump gear to chest'
+'/dump': 'dump gear to chest',
+'/dump-spawners': 'Same as /dump, but only transfers SPAWNERS into the chests (everything else stays in the inventory)'
+}
+
+// True when an item is a spawner (mob/monster spawner). Matches the registry
+// name first, then falls back to display/custom names, 1.20.5+ data components,
+// custom lore, and NBT so renamed server spawners like "§bZombie Spawner",
+// "Iron Golem Spawner", etc. are recognized.
+function isSpawnerItem (item) {
+  if (!item) return false
+  // 1. Check registry name and display name (vanilla spawner block or item)
+  if (/spawner/i.test(item.name || '') || /spawner/i.test(item.displayName || '')) return true
+
+  // 2. Check custom anvil/display name
+  const custom = itemCustomName(item)
+  if (custom && /spawner/i.test(custom)) return true
+
+  // 3. Check customLore or lore component
+  try {
+    const lore = item.customLore
+    if (lore) {
+      const loreStr = typeof lore === 'string' ? lore : JSON.stringify(lore)
+      if (/spawner/i.test(loreStr)) return true
+    }
+  } catch (_) {}
+
+  // 4. Check componentMap for 1.20.5+ (item_name, custom_name, lore, block_entity_data)
+  if (item.componentMap && typeof item.componentMap.forEach === 'function') {
+    let matched = false
+    item.componentMap.forEach((comp) => {
+      if (matched) return
+      try {
+        const compStr = JSON.stringify(comp)
+        if (/spawner/i.test(compStr)) matched = true
+      } catch (_) {}
+    })
+    if (matched) return true
+  }
+
+  // 5. Check components array if present
+  if (Array.isArray(item.components)) {
+    try {
+      if (/spawner/i.test(JSON.stringify(item.components))) return true
+    } catch (_) {}
+  }
+
+  // 6. Check legacy NBT if present
+  if (item.nbt) {
+    try {
+      if (/spawner/i.test(JSON.stringify(item.nbt))) return true
+    } catch (_) {}
+  }
+
+  return false
 }
 
 /**
@@ -2421,13 +2542,28 @@ const COMMANDS = {
 * within a configured radius and dumps the bot's inventory into them.
 *
 * @param {object} bot - The mineflayer bot instance
+* @param {string} id - The bot id (used for logging)
+* @param {object} [options]
+* @param {boolean} [options.spawnersOnly] - When true (/dump-spawners), only
+*   spawner items are deposited; every other item stays in the inventory.
 */
-async function tpaAndDump(bot, id) {
+async function tpaAndDump(bot, id, options = {}) {
+const spawnersOnly = Boolean(options.spawnersOnly)
+const label = spawnersOnly ? '/dump-spawners' : '/dump'
 // Suppress the generic windowOpen handler (GUI item search, slot auto-click,
 // and the delayed AFK warp) while dumping — /dump opens chests only to
 // deposit into them, and none of that automation may run on them.
 if (bots[id]) bots[id].inDumpRoutine = true
 try {
+
+if (spawnersOnly) {
+  const spawnerCount = bot.inventory.items().filter(isSpawnerItem).reduce((sum, it) => sum + (it.count || 1), 0)
+  logFor(id, `{cyan-fg}› ${label}: transferring SPAWNERS only — ${spawnerCount} in inventory.{/cyan-fg}`)
+  if (spawnerCount === 0) {
+    logFor(id, `{yellow-fg}⚠ ${label}: no spawners in the inventory — nothing to transfer.{/yellow-fg}`)
+    return
+  }
+}
 
 const tpaTarget = process.env.TPA_TARGET_PLAYER || 'DefaultPlayerName'
 const scanRadius = parseInt(process.env.CHEST_SCAN_RADIUS || '30', 10)
@@ -2470,7 +2606,7 @@ count: 50
 })
 
 if (chestBlocks.length === 0) {
-logFor(id, `{yellow-fg}⚠ No chests found within ${scanRadius} blocks.{/yellow-fg}`)
+logFor(id, `{yellow-fg}⚠ ${label}: No chests found within ${scanRadius} blocks.{/yellow-fg}`)
 return
 }
 
@@ -2479,8 +2615,13 @@ return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b)
 })
 
 for (const chestPos of chestBlocks) {
-const itemsToDump = bot.inventory.items()
-if (itemsToDump.length === 0) return
+const itemsToDump = spawnersOnly
+  ? bot.inventory.items().filter(isSpawnerItem)
+  : bot.inventory.items()
+if (itemsToDump.length === 0) {
+  if (spawnersOnly) logFor(id, `{green-fg}✓ ${label}: no spawners left in the inventory — done.{/green-fg}`)
+  return
+}
 
 const chestBlock = bot.blockAt(chestPos)
 let chestContainer
@@ -2488,12 +2629,37 @@ let chestContainer
 try {
 chestContainer = await bot.openContainer(chestBlock)
 
-for (const item of itemsToDump) {
-try {
-await chestContainer.deposit(item.type, item.metadata, item.count)
-} catch (err) {
-break
-}
+// Slots in chestContainer:
+// [0, chestContainer.inventoryStart - 1] are chest slots.
+// [chestContainer.inventoryStart, chestContainer.inventoryEnd - 1] are bot inventory slots.
+const invStart = chestContainer.inventoryStart
+const invEnd = chestContainer.inventoryEnd
+
+for (let s = invStart; s < invEnd; s++) {
+  const item = chestContainer.slots[s]
+  if (!item) continue
+  if (spawnersOnly && !isSpawnerItem(item)) continue
+
+  const initialCount = item.count
+  try {
+    // Shift-click the item from bot inventory into the chest.
+    // Mode 1, button 0 = shift-click in Minecraft protocol.
+    await bot.clickWindow(s, 0, 1)
+    await new Promise(r => setTimeout(r, 120))
+  } catch (_) {
+    break
+  }
+
+  // Check if item moved into the chest
+  const afterItem = chestContainer.slots[s]
+  if (afterItem && afterItem.count === initialCount) {
+    // Nothing was deposited — chest is full!
+    break
+  }
+  if (afterItem && afterItem.count > 0) {
+    // Only partially deposited — chest is full!
+    break
+  }
 }
 
 await chestContainer.close()
@@ -2504,11 +2670,19 @@ try { await chestContainer.close() } catch (_) {}
 }
 }
 
+const remaining = spawnersOnly
+  ? bot.inventory.items().filter(isSpawnerItem)
+  : bot.inventory.items()
+if (remaining.length === 0) {
+  logFor(id, `{green-fg}✓ ${label}: all ${spawnersOnly ? 'spawners' : 'items'} successfully dumped into chests.{/green-fg}`)
+} else {
+  logFor(id, `{yellow-fg}⚠ ${label}: nearby chests are full — ${remaining.length} stack(s) remaining in inventory.{/yellow-fg}`)
+}
+
 } finally {
 if (bots[id]) bots[id].inDumpRoutine = false
 }
 }
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/shardshop-loop', '/closeBot']
 
 function runLocalCommandForBot(id, cmd) {
 const entry = bots[id]
@@ -2549,6 +2723,11 @@ return true
 case '/dump': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 tpaAndDump(bot, id)
+return true
+}
+case '/dump-spawners': {
+if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
+tpaAndDump(bot, id, { spawnersOnly: true })
 return true
 }
 case '/players': {

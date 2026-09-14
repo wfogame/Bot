@@ -185,3 +185,20 @@ test('dispatch errors are caught and logged', () => {
   assert.equal(errors.some(e => e.includes('boom')), true)
   assert.equal(m.list()[0].running, false)
 })
+
+test('CronManager and parseSchedule strip single and double quotes cleanly', () => {
+  const m = new CronManager({ dispatch: () => 0, log: () => {} })
+  const env = {
+    CRON_JOB_1: '"0 4 * * *|/crates-all"',
+    CRON_JOB_2: "'@every 60|/status'",
+    CRON_JOB_3: '"0 */2 * * *"|"/dump-spawners"'
+  }
+  const loaded = m.loadFromEnv(env)
+  assert.equal(loaded, 3)
+  assert.equal(m.list()[0].schedule, '0 4 * * *')
+  assert.equal(m.list()[0].command, '/crates-all')
+  assert.equal(m.list()[1].schedule, '@every 60')
+  assert.equal(m.list()[1].command, '/status')
+  assert.equal(m.list()[2].schedule, '0 */2 * * *')
+  assert.equal(m.list()[2].command, '/dump-spawners')
+})

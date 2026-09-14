@@ -286,6 +286,23 @@ test('CRON_JOB_<N> env entries load at startup', () => {
   assert.equal(r.run('cronManager.list()[1].schedule'), '0 */2 * * *')
 })
 
+test('CRON_JOB_<N> env entries with quotes or errors load at startup without TDZ crash', () => {
+  const r = runtime({
+    CRON_JOB_1: '"0 4 * * *|/crates-all"',
+    CRON_JOB_2: "'@every 60|/status'",
+    CRON_JOB_3: 'broken schedule|/status'
+  })
+  assert.equal(r.run('cronManager.list().length'), 2)
+  assert.equal(r.run('cronManager.list()[0].schedule'), '0 4 * * *')
+  assert.equal(r.run('cronManager.list()[0].command'), '/crates-all')
+  assert.equal(r.run('cronManager.list()[1].schedule'), '@every 60')
+})
+
+test('/dump-spawners is recognized as a local command', () => {
+  const r = runtime()
+  assert.equal(r.run("LOCAL_COMMANDS.includes('/dump-spawners')"), true)
+})
+
 test('/all reuses the shared dispatcher (local args preserved, chat broadcast)', () => {
   const r = runtime()
   r.run(`
