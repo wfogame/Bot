@@ -1,7 +1,7 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readDelayMs, shuffledCopy, createSlowBroadcast, parseProxyGroups, resolveBotProxy } = require('../bot-controls')
+const { readDelayMs, shuffledCopy, createSlowBroadcast, createSlowBroadcastManager, parseProxyGroups, resolveBotProxy } = require('../bot-controls')
 
 function clock() {
   let time = 0, sequence = 0
@@ -126,4 +126,66 @@ test('resolveBotProxy falls back when unmatched, disabled, or empty', () => {
   assert.equal(resolveBotProxy('Zed', groups, null), null)
   assert.equal(resolveBotProxy('Alice', [], fallback), fallback)
   assert.equal(resolveBotProxy('Alice', undefined, fallback), fallback)
+})
+
+test('multi-task createSlowBroadcastManager: concurrent tasks, independent timers, selective cancellation, and cancelAll', () => {
+  const c = clock()
+  const manager = createSlowBroadcastManager(c)
+  assert.equal(manager.running, false)
+  assert.deepEqual(manager.list(), [])
+
+  const dispatches1 = []
+  const done1 = []
+  const id1 = manager.start(['A', 'B', 'C'], 10, botId => {
+    dispatches1.push([botId, c.time])
+    return true
+  }, { command: 'first', onDone: r => done1.push(r) })
+
+  assert.equal(id1, 1)
+  assert.equal(manager.running, true)
+  assert.deepEqual(dispatches1, [['A', 0]])
+
+  const dispatches2 = []
+  const done2 = []
+  const id2 = manager.start(['X', 'Y'], 25, botId => {
+    dispatches2.push([botId, c.time])
+    return true
+  }, { command: 'second', onDone: r => done2.push(r) })
+
+  assert.equal(id2, 2)
+  assert.deepEqual(dispatches2, [['X', 0]])
+  assert.equal(c.timers.size, 2)
+
+  const list = manager.list()
+  assert.equal(list.length, 2)
+  assert.equal(list[0].id, 1)
+  assert.equal(list[0].command, 'first')
+  assert.equal(list[1].id, 2)
+  assert.equal(list[1].command, 'second')
+
+  // Advance 10ms: task 1 dispatches B
+  c.tick(10)
+  assert.deepEqual(dispatches1, [['A', 0], ['B', 10]])
+  assert.deepEqual(dispatches2, [['X', 0]])
+
+  // Cancel task 1 selectively
+  assert.equal(manager.cancel(id1), true)
+  assert.equal(manager.cancel(999), false)
+  assert.equal(manager.running, true)
+
+  // Advance 15ms more (c.time = 25): task 2 dispatches Y and finishes
+  c.tick(15)
+  assert.deepEqual(dispatches2, [['X', 0], ['Y', 25]])
+  assert.deepEqual(done2, [{ taskId: 2, sent: 2, skipped: 0 }])
+  assert.equal(done1.length, 0) // task 1 was cancelled
+  assert.equal(manager.running, false)
+  assert.equal(c.timers.size, 0)
+
+  // Test cancelAll
+  const id3 = manager.start(['M', 'N'], 50, () => true)
+  const id4 = manager.start(['P', 'Q'], 50, () => true)
+  assert.equal(manager.running, true)
+  assert.equal(manager.cancelAll(), 2)
+  assert.equal(manager.running, false)
+  assert.equal(c.timers.size, 0)
 })

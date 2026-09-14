@@ -36,7 +36,11 @@ function runtime(env = {}) {
       if (name === 'fs') return { readFileSync: () => '', writeFileSync() {} }
       if (name === 'http') return { createServer(fn) { requestHandler = fn; return server } }
       if (name === 'ws') return fakeWs
-      if (name === './bot-controls') return { ...controls, createSlowBroadcast: () => controls.createSlowBroadcast({ setTimer, clearTimer }) }
+      if (name === './bot-controls') return {
+        ...controls,
+        createSlowBroadcast: () => controls.createSlowBroadcast({ setTimer, clearTimer }),
+        createSlowBroadcastManager: () => controls.createSlowBroadcastManager({ setTimer, clearTimer })
+      }
       if (name === './expose-terminal') return { sshConfig: () => ({ enabled: false }) }
       if (name === './monitoring') return { createMonitoring: () => ({ getMemorySnapshot: () => null, onDisconnect() {}, onKick() {}, onProxyStall() {}, onReconnectExhausted() {}, onFatal() {}, onSecurityLockout() {}, inspectServerMessage() {}, onRecovered() {} }) }
       if (name === './bot-manual') return () => ({ routeCommand: () => false, key() {}, onWindowOpen: () => false, onWindowClose() {}, stopManualMode() {}, snapshotFor: () => null })
@@ -411,4 +415,125 @@ test('/play and the PLAY button are disabled when MC_WEB_ENABLED=false', async (
   assert.equal(res.status, 404)
   const dash = await r.request('/', '', cookie, 'GET')
   assert.doesNotMatch(dash.body.toString(), /id="playbtn"/)
+})
+
+test('/shardshop-loop [slot] argument handling', async () => {
+  const r = runtime()
+  // Mock bot entity for bot A so commands can run
+  r.run(`
+    bots.A.bot.entity = { position: { x: 0, y: 0, z: 0 } }
+    bots.A.bot.on = () => {}
+    bots.A.bot.removeListener = () => {}
+  `)
+
+  // Valid slot via handleCommand
+  r.run(`handleCommand('/shardshop-loop 13')`)
+  assert.equal(r.run('bots.A.shardshopSlot'), 13)
+  assert.equal(r.run('bots.A.shardshopLoopRunning'), true)
+
+  // Clean up loop state for next test
+  r.run(`bots.A.shardshopSlot = null; bots.A.shardshopLoopRunning = false`)
+
+  // Invalid slot (out of 0..53 bounds) should warn and not start loop
+  r.run(`handleCommand('/shardshop-loop 99')`)
+  assert.equal(r.run('bots.A.shardshopLoopRunning'), false)
+  assert.equal(r.run('bots.A.shardshopSlot'), null)
+
+  // Invalid non-integer slot
+  r.run(`handleCommand('/shardshop-loop abc')`)
+  assert.equal(r.run('bots.A.shardshopLoopRunning'), false)
+
+  // /all /shardshop-loop <slot> dispatches to all bots with slot preserved
+  r.run(`
+    bots.B.bot.entity = { position: { x: 0, y: 0, z: 0 } }; bots.B.bot.on = () => {}; bots.B.bot.removeListener = () => {}
+    bots.C.bot.entity = { position: { x: 0, y: 0, z: 0 } }; bots.C.bot.on = () => {}; bots.C.bot.removeListener = () => {}
+    handleCommand('/all /shardshop-loop 20')
+  `)
+  assert.equal(r.run('bots.A.shardshopSlot'), 20)
+  assert.equal(r.run('bots.B.shardshopSlot'), 20)
+  assert.equal(r.run('bots.C.shardshopSlot'), 20)
+})
+
+test('multiple concurrent /all-slow tasks and cancellation', () => {
+  const r = runtime({ ALL_SLOW_DELAY_MS: '25' })
+  r.timers.clear()
+
+  // Start two concurrent /all-slow broadcasts
+  r.run(`handleCommand('/all-slow first')`)
+  r.run(`handleCommand('/all-slow second')`)
+
+  assert.equal(r.run('slowBroadcast.running'), true)
+  assert.equal(r.run('slowBroadcast.list().length'), 2)
+  assert.deepEqual(plain(r.context.chats), [['A', 'first'], ['A', 'second']])
+
+  // Cancel task 1 specifically
+  r.run(`handleCommand('/all-slow-cancel 1')`)
+  assert.equal(r.run('slowBroadcast.list().length'), 1)
+  assert.equal(r.run('slowBroadcast.list()[0].id'), 2)
+
+  // Advance timer for remaining task
+  const tick = () => { const t = [...r.timers.keys()][0]; if (t) { r.timers.delete(t); t.fn() } }
+  tick()
+  assert.deepEqual(plain(r.context.chats.slice(2)), [['B', 'second']])
+
+  // Cancel all remaining tasks
+  r.run(`handleCommand('/all-slow-cancel')`)
+  assert.equal(r.run('slowBroadcast.running'), false)
+  assert.equal(r.run('slowBroadcast.list().length'), 0)
+})
+
+test('tpaAndDump waits 2.5s and warps back to AFK even if no chests found', async () => {
+  const r = runtime({ WARP_COMMAND: '/warp afk' })
+  r.timers.clear()
+  r.run(`
+    bots.A.bot.entity = { position: { x: 0, y: 0, z: 0, clone: () => ({ x: 0, y: 0, z: 0, distanceTo: () => 0 }) } }
+    bots.A.bot.on = (ev, fn) => {}
+    bots.A.bot.removeListener = () => {}
+    bots.A.bot.registry = { blocksByName: { chest: { id: 54 }, trapped_chest: { id: 146 } } }
+    bots.A.bot.findBlocks = () => []
+    bots.A.bot.inventory = { items: () => [] }
+    dumpPromise = tpaAndDump(bots.A.bot, 'A')
+  `)
+  // Fire teleport timeout timer (45s), then wait microtask, then fire warp delay timer (2.5s)
+  const advanceTimer = async () => {
+    const t = [...r.timers.keys()][0]
+    if (t) {
+      r.timers.delete(t)
+      t.fn()
+    }
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  await advanceTimer()
+  await advanceTimer()
+  await r.run('dumpPromise')
+  assert.equal(r.run('bots.A.inDumpRoutine'), false)
+  assert.deepEqual(plain(r.context.chats), [
+    ['A', '/tpa DefaultPlayerName'],
+    ['A', '/warp afk']
+  ])
+})
+
+test('handleCommand routes chained commands with &&, ;, sleep, and escaping', async () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`
+    bots.A.bot.entity = { position: { x: 0, y: 0, z: 0 } }
+    bots.A.bot.inventory = { items: () => [] }
+    bots.A.logs = []
+  `)
+
+  // Chained with escaping: /chat hello \&\& world sends literal &&
+  await r.run(`handleCommand('/chat hello \\\\&& world')`)
+  assert.deepEqual(plain(r.context.chats), [
+    ['A', 'hello && world']
+  ])
+
+  // Chained sequential && and ;
+  await r.run(`handleCommand('/chat step1 ; /chat step2 && /chat step3')`)
+  assert.deepEqual(plain(r.context.chats), [
+    ['A', 'hello && world'],
+    ['A', 'step1'],
+    ['A', 'step2'],
+    ['A', 'step3']
+  ])
 })

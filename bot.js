@@ -1,5 +1,15 @@
 require('dotenv').config() // npm install dotenv ws — neo-blessed only if TUI_GUI, socks only for PROXY_HOST
-const { readDelayMs, shuffledCopy, createSlowBroadcast, parseProxyGroups, resolveBotProxy } = require('./bot-controls')
+const {
+  readDelayMs,
+  shuffledCopy,
+  createSlowBroadcast,
+  createSlowBroadcastManager,
+  parseProxyGroups,
+  resolveBotProxy,
+  parseSleepDuration,
+  parseCommandChain,
+  executeCommandChain: executeCommandChainBase
+} = require('./bot-controls')
 const os = require('os')
 const { createMonitoring } = require('./monitoring')
 const net = require('net')
@@ -435,7 +445,8 @@ let tui = null // set by startTUI()
 let webHandle = null // set by startWebGUI()
 let markBotsDirtyFn = null
 let webClearFn = null
-const slowBroadcast = createSlowBroadcast()
+const slowBroadcast = createSlowBroadcastManager()
+const slowBroadcastManager = slowBroadcast
 
 // ── Manual interact mode (prismarine-viewer 3D + hand-driven controls) ───────
 // /manual-interact turns one bot into a slow, hand-driven avatar: browser 3D
@@ -2196,11 +2207,13 @@ i(`Window opened: ${sanitize(title)}\n${sanitize(slotInfo)}`);
 i(`Window opened: ${sanitize(title)} (${window.slots.length} slots)`);
 }
 
-// Slot selection: fixed GUI_SLOT by default, or search-by-item when GUI_ITEM_SEARCH_ENABLED
-let targetSlot = GUI_SLOT; // Default to GUI_SLOT
+// Slot selection: fixed GUI_SLOT by default, custom shardshopSlot when running /shardshop-loop,
+// or search-by-item when GUI_ITEM_SEARCH_ENABLED
+const currentEntry = bots[id]
+let targetSlot = (currentEntry?.shardshopSlot != null) ? currentEntry.shardshopSlot : GUI_SLOT;
 let foundTargetItem = false;
 
-if (GUI_ITEM_SEARCH_ENABLED) {
+if (currentEntry?.shardshopSlot == null && GUI_ITEM_SEARCH_ENABLED) {
 for (let j = 0; j < window.slots.length; j++) {
 const slot = window.slots[j];
 if (!slot) continue;
@@ -2237,7 +2250,9 @@ pushT(async () => {
 if (!bot.currentWindow) { w('Window closed before click could fire.'); return }
 try {
 await bot.clickWindow(targetSlot, 0, 0)
-if (!foundTargetItem) {
+if (currentEntry?.shardshopSlot != null) {
+i(`Clicked slot ${targetSlot} (shardshop slot) — waiting for server transfer…`)
+} else if (!foundTargetItem) {
 i(`Clicked slot ${targetSlot} — waiting for server transfer…`)
 } else {
 i(`Clicked slot ${targetSlot} — matched configured item search`)
@@ -2247,7 +2262,7 @@ i(`Clicked slot ${targetSlot} — matched configured item search`)
 
 // AFK Warp logic
 pushT(async () => {
-if (!foundTargetItem) {
+if (!foundTargetItem && currentEntry?.shardshopSlot == null) {
 bot.chat(WARP_AFK)
 i(`Warped — waiting for server transfer…`)
 }
@@ -2427,11 +2442,12 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 const COMMANDS = {
 '/all <cmd>': 'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
 '/all-slow <cmd>': `Like /all, but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS)`,
+'/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
 '/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
 '/crates [color]': `Warp to crates, find + walk to the nearest shulker box of [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}, within ${CRATE_SCAN_RADIUS} blocks) and right-click it; falls back to ${WARP_AFK} if not found or unreachable. [color] can be a name like "purple" or a full block id like "purple_shulker_box"`,
 '/crates-loop [n] [color]': 'Run /crates repeatedly (default: until failure). Specify n for a fixed count and/or a crate [color]',
-'/shardshop-loop': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap`,
+'/shardshop-loop [slot]': `Repeatedly run ${SHARDSHOP_COMMAND} until the server signals it's empty (grep: SHARDSHOP_STOP_PHRASES) or hits the ${SHARDSHOP_LOOP_MAX_RUNS}-run safety cap; optional [slot] overrides default GUI slot`,
 '/crates-all [n] [color]': `Run shardshop → crates → dump on bots 1 through n (default: all bots) targeting crate [color] (default: ${CRATE_SHULKER_BLOCK.replace(/_/g, ' ')}), ${(CRATES_ALL_STAGGER_MS / 1000).toFixed(0)}s apart so they don't hit the server at once`,
 '/crates-solo [bot] [color]': 'Run shardshop → crates → dump on just one bot (default: active bot) targeting crate [color] — not all bots',
 '/spawners': `Without moving, right-click every ${SPAWNER_BLOCK.replace(/_/g, ' ')} already within reach (${SPAWNER_REACH} blocks), clicking GUI slot ${SPAWNER_SLOT_FIRST} then slot ${SPAWNER_SLOT_SECOND} on each one`,
@@ -2607,9 +2623,7 @@ count: 50
 
 if (chestBlocks.length === 0) {
 logFor(id, `{yellow-fg}⚠ ${label}: No chests found within ${scanRadius} blocks.{/yellow-fg}`)
-return
-}
-
+} else {
 chestBlocks.sort((a, b) => {
 return bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b)
 })
@@ -2620,7 +2634,7 @@ const itemsToDump = spawnersOnly
   : bot.inventory.items()
 if (itemsToDump.length === 0) {
   if (spawnersOnly) logFor(id, `{green-fg}✓ ${label}: no spawners left in the inventory — done.{/green-fg}`)
-  return
+  break
 }
 
 const chestBlock = bot.blockAt(chestPos)
@@ -2678,6 +2692,11 @@ if (remaining.length === 0) {
 } else {
   logFor(id, `{yellow-fg}⚠ ${label}: nearby chests are full — ${remaining.length} stack(s) remaining in inventory.{/yellow-fg}`)
 }
+}
+
+await new Promise(r => setTimeout(r, 2500))
+logFor(id, `{cyan-fg}› Warping back to AFK…{/cyan-fg}`)
+try { bot.chat(WARP_AFK) } catch (_) {}
 
 } finally {
 if (bots[id]) bots[id].inDumpRoutine = false
@@ -2689,7 +2708,10 @@ const entry = bots[id]
 if (!entry) return false
 const { bot } = entry
 
-switch (cmd) {
+const parts = String(cmd || '').trim().split(/\s+/)
+const baseCmd = parts[0]
+
+switch (baseCmd) {
 case '/status': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
 const pos = bot.entity.position
@@ -2722,13 +2744,11 @@ return true
 }
 case '/dump': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-tpaAndDump(bot, id)
-return true
+return tpaAndDump(bot, id)
 }
 case '/dump-spawners': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-tpaAndDump(bot, id, { spawnersOnly: true })
-return true
+return tpaAndDump(bot, id, { spawnersOnly: true })
 }
 case '/players': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
@@ -2783,26 +2803,31 @@ return true
 
 case '/crates': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-runCrateRoutine(id) // fire-and-forget async routine, logs its own progress
-return true
+return runCrateRoutine(id)
 }
 
 case '/crates-loop': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-runCrateLoop(id) // fire-and-forget, logs its own progress
-return true
+return runCrateLoop(id)
 }
 
 case '/spawners': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-runSpawnerRoutine(id) // fire-and-forget async routine, logs its own progress
-return true
+return runSpawnerRoutine(id)
 }
 
 case '/shardshop-loop': {
 if (!bot.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-fg}`); return true }
-shardshopLoopCommand(id) // fire-and-forget, logs its own progress
+let slot = null
+if (parts.length > 1) {
+const parsed = parseInt(parts[1], 10)
+if (isNaN(parsed) || parsed < 0 || parsed > 53 || String(parsed) !== parts[1]) {
+logFor(id, `{yellow-fg}⚠ Invalid slot "${sanitize(parts[1])}". Must be an integer between 0 and 53.{/yellow-fg}`)
 return true
+}
+slot = parsed
+}
+return shardshopLoopCommand(id, slot)
 }
 
 default:
@@ -3189,7 +3214,7 @@ if (bots[id]) bots[id].crateLoopRunning = false
 // ── /shardshop-loop: keep sending /shardshop until the server signals "empty" ──
 // Mirrors clickCrateUntilStopMessage's grep-until-stop-phrase approach, but for
 // repeatedly running the shardshop command instead of clicking a block.
-function runShardshopLoop(id) {
+function runShardshopLoop(id, customSlot = null) {
 return new Promise((resolve) => {
 const entry = bots[id]
 if (entry?.manualMode) { logFor(id, `{yellow-fg}⚠ Stop manual interact (/manual-stop) before starting /shardshop-loop.{/yellow-fg}`); resolve(null); return }
@@ -3201,6 +3226,7 @@ if (entry.guiSessionTimer) { clearTimeout(entry.guiSessionTimer); entry.guiSessi
 if (!entry?.bot?.entity) { logFor(id, `{yellow-fg}⚠ ${id} is not currently spawned.{/yellow-ffg}`); resolve(null); return }
 if (entry.shardshopLoopRunning) { logFor(id, `{yellow-fg}⚠ /shardshop-loop is already running for ${id}.{/yellow-fg}`); resolve(null); return }
 entry.shardshopLoopRunning = true
+entry.shardshopSlot = customSlot
 const { bot } = entry
 
 let settled = false
@@ -3213,7 +3239,10 @@ settled = true
 bot.removeListener('messagestr', onMessage)
 clearTimeout(sendTimer)
 clearTimeout(ceiling)
-if (bots[id]) bots[id].shardshopLoopRunning = false
+if (bots[id]) {
+bots[id].shardshopLoopRunning = false
+bots[id].shardshopSlot = null
+}
 resolve({ runs, stopReason })
 }
 
@@ -3244,8 +3273,8 @@ sendOnce()
 })
 }
 
-async function shardshopLoopCommand(id) {
-const result = await runShardshopLoop(id)
+async function shardshopLoopCommand(id, customSlot = null) {
+const result = await runShardshopLoop(id, customSlot)
 if (!result) return
 const { runs, stopReason } = result
 switch (stopReason) {
@@ -3463,7 +3492,33 @@ function inventorySlotUsage (bot) {
 }
 
 // ── Command router (real tail + context routing prologue for the web GUI) ────
+function executeCommandChain(chain, ctx, overrides = {}) {
+  return executeCommandChainBase(chain, ctx, {
+    executeSingle: (cmd, c) => handleSingleCommand(cmd, c, { isChained: true }),
+    ...overrides
+  })
+}
+
 function handleCommand(raw, ctx) {
+  const trimmed = String(raw ?? '').trim()
+  if (!trimmed) return
+
+  const chain = parseCommandChain(trimmed)
+  if (chain.length === 0) return
+
+  // If chaining operators exist, or sleep command, or escaped operators:
+  if (chain.length > 1 || /^sleep(?:\s|$)/i.test(chain[0].command) || chain[0].command !== trimmed) {
+    const requestedId = ctx && ctx.selectedId
+    const activeId = requestedId || currentActiveId()
+    logFor(activeId || SYSTEM_ID, `{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
+
+    return executeCommandChain(chain, ctx)
+  }
+
+  return handleSingleCommand(trimmed, ctx)
+}
+
+function handleSingleCommand(raw, ctx, options = {}) {
 const trimmed = String(raw ?? '').trim()
 if (!trimmed) return
 
@@ -3490,7 +3545,9 @@ const logWarn = (msg) => logFor(activeId || SYSTEM_ID, `{yellow-fg}⚠ ${msg}{/y
 const logError = (msg) => logFor(activeId || SYSTEM_ID, `{red-fg}✗ ${msg}{/red-fg}`)
 
 // Echo the run command so the log is self-documenting (the web console needs it)
+if (!options.isChained) {
 log(`{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
+}
 
 // ── /find ───────────────────────────────────
 const findMatch = trimmed.match(/^\/find(?:\s+([\s\S]*))?$/)
@@ -3622,6 +3679,32 @@ if (trimmed === '/cron' || trimmed.startsWith('/cron ')) {
   return
 }
 
+// ── /all-slow-cancel [id] ────────────────────
+const cancelSlowMatch = trimmed.match(/^\/all-slow-cancel(?:\s+([\s\S]*))?$/)
+if (cancelSlowMatch) {
+  const target = (cancelSlowMatch[1] || '').trim()
+  if (target) {
+    const parsedId = parseInt(target.replace(/^#/, ''), 10)
+    if (isNaN(parsedId)) {
+      logWarn(`Usage: /all-slow-cancel [id] — "${sanitize(target)}" is not a valid task ID.`)
+      return
+    }
+    if (slowBroadcast.cancel(parsedId)) {
+      logSuccess(`Cancelled /all-slow [Task #${parsedId}].`)
+    } else {
+      logWarn(`No active /all-slow task with ID #${parsedId}.`)
+    }
+  } else {
+    const count = slowBroadcast.cancelAll()
+    if (count > 0) {
+      logSuccess(`Cancelled all running /all-slow tasks (${count} task(s)).`)
+    } else {
+      logWarn('No active /all-slow tasks to cancel.')
+    }
+  }
+  return
+}
+
 // ── /all and /all-slow ───────────────────────
 const broadcastMatch = trimmed.match(/^\/(all|all-slow)(?:\s+([\s\S]*))?$/)
 if (broadcastMatch) {
@@ -3631,15 +3714,15 @@ if (!msg) { logWarn(`Usage: ${command} <command or message>`); return }
 const isLocal = LOCAL_COMMANDS.includes(msg.split(/\s+/)[0])
 const ids = Object.keys(bots)
 const dispatch = id => dispatchCommandToBot(msg, id)
-const onError = (err, id) => logWarn(`${id}: ${sanitize(err.message)}`)
 if (command === '/all-slow') {
-if (slowBroadcast.running) { logWarn('An /all-slow broadcast is already running. Wait for it to finish.'); return }
-logInfo(`Slow broadcast to ${ids.length} bot(s), ${ALL_SLOW_DELAY_MS / 1000}s apart: ${sanitize(msg)}`)
-slowBroadcast.start(ids, ALL_SLOW_DELAY_MS, dispatch, {
-onError,
-onDone: ({ sent, skipped }) => logSuccess(`Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
+const taskId = slowBroadcast.start(ids, ALL_SLOW_DELAY_MS, dispatch, {
+command: msg,
+onError: (err, id) => logWarn(`[Task #${taskId}] ${id}: ${sanitize(err.message)}`),
+onDone: ({ sent, skipped }) => logSuccess(`[Task #${taskId}] Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
 })
+logInfo(`[Task #${taskId}] Slow broadcast to ${ids.length} bot(s), ${ALL_SLOW_DELAY_MS / 1000}s apart: ${sanitize(msg)}`)
 } else {
+const onError = (err, id) => logWarn(`${id}: ${sanitize(err.message)}`)
 let sent = 0
 for (const id of ids) {
 try { if (dispatch(id)) sent++ } catch (err) { onError(err, id) }
@@ -3838,8 +3921,7 @@ const resolved = resolveCrateBlockName(arg)
 if (!resolved) { logWarn(`Unknown crate color "${arg}". Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
 blockName = resolved
 }
-runCrateRoutine(activeId, blockName)
-return
+return runCrateRoutine(activeId, blockName)
 }
 
 // ── /crates-loop [n] [color] ───
@@ -3858,17 +3940,25 @@ blockName = resolved
 if (parts.length) { logWarn('Usage: /crates-loop [n] [color]'); return }
 const entry = bots[activeId]
 if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); return }
-runCrateLoop(activeId, count, blockName)
-return
+return runCrateLoop(activeId, count, blockName)
 }
 
-// ── /shardshop-loop ───
-if (trimmed === '/shardshop-loop') {
+// ── /shardshop-loop [slot] ───
+if (trimmed === '/shardshop-loop' || trimmed.startsWith('/shardshop-loop ')) {
 if (!activeId) { logWarn('No active bot.'); return }
+const parts = trimmed.slice('/shardshop-loop'.length).trim().split(/\s+/).filter(Boolean)
+let slot = null
+if (parts.length > 0) {
+const parsed = parseInt(parts[0], 10)
+if (isNaN(parsed) || parsed < 0 || parsed > 53 || String(parsed) !== parts[0]) {
+logWarn(`Invalid slot "${sanitize(parts[0])}". Must be an integer between 0 and 53.`)
+return
+}
+slot = parsed
+}
 const entry = bots[activeId]
 if (!entry?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); return }
-shardshopLoopCommand(activeId)
-return
+return shardshopLoopCommand(activeId, slot)
 }
 
 // ── /crates-all [n] [color] ───
@@ -3883,8 +3973,7 @@ blockName = resolveCrateBlockName(parts.shift())
 if (!blockName) { logWarn(`Unknown crate color. Try one of: ${SHULKER_COLORS.join(', ')} — or a full block name like "purple_shulker_box".`); return }
 }
 if (parts.length) { logWarn('Usage: /crates-all [n] [color]'); return }
-runCratesAll(maxBots, blockName)
-return
+return runCratesAll(maxBots, blockName)
 }
 
 // ── /crates-solo [bot] [color] — same shardshop → crates → dump chain as /crates-all,
@@ -3918,8 +4007,7 @@ if (!targetId) { logWarn('No active bot. Usage: /crates-solo [bot name or number
 if (!bots[targetId]) { logWarn(`No bot named "${sanitize(targetId)}".`); return }
 
 logInfo(`Starting /crates-solo (shardshop → crates → dump) for ${targetId}${blockName ? ` targeting ${blockName.replace(/_/g, ' ')}` : ''}…`)
-runCratesAllSequenceForBot(targetId, blockName)
-return
+return runCratesAllSequenceForBot(targetId, blockName)
 }
 
 // ── Manual interaction commands (bot-manual.js) ─────────────
@@ -3937,9 +4025,8 @@ try {
 }
 
 // ── Single-bot local commands ───────────────
-if (activeId && LOCAL_COMMANDS.includes(trimmed)) {
-runLocalCommandForBot(activeId, trimmed)
-return
+if (activeId && LOCAL_COMMANDS.includes(trimmed.split(/\s+/)[0])) {
+return runLocalCommandForBot(activeId, trimmed)
 }
 
 switch (trimmed) {
@@ -3950,7 +4037,7 @@ break
 
 case '/exit':
 logWarn('Exiting all bots…')
-slowBroadcast.cancel()
+slowBroadcastManager.cancelAll()
 initialConnectTimers.forEach(clearTimeout)
 initialConnectTimers.length = 0
 Object.values(bots).forEach(entry => { try { entry.disconnectManually() } catch (_) {} })

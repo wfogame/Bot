@@ -62,6 +62,202 @@ function createSlowBroadcast({ setTimer = setTimeout, clearTimer = clearTimeout 
   }
 }
 
+// Multi-task broadcast manager supporting concurrent /all-slow broadcasts
+function createSlowBroadcastManager({ setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  let nextTaskId = 1
+  const tasks = new Map()
+
+  return {
+    get running() {
+      return tasks.size > 0
+    },
+    start(ids, delayMs, dispatch, { command = '', onError = () => {}, onDone = () => {} } = {}) {
+      const taskId = nextTaskId++
+      const targets = ids.slice()
+      const task = {
+        id: taskId,
+        command,
+        timer: null,
+        generation: 0,
+        targets,
+        sent: 0,
+        skipped: 0
+      }
+      tasks.set(taskId, task)
+
+      const run = ++task.generation
+      let index = 0
+
+      const next = () => {
+        task.timer = null
+        if (task.generation !== run || !tasks.has(taskId)) return
+        if (index < task.targets.length) {
+          const id = task.targets[index++]
+          try {
+            if (dispatch(id, taskId)) task.sent++
+            else task.skipped++
+          } catch (err) {
+            task.skipped++
+            onError(err, id, taskId)
+          }
+        }
+        if (task.generation !== run || !tasks.has(taskId)) return
+        if (index < task.targets.length) {
+          task.timer = setTimer(next, delayMs)
+        } else {
+          tasks.delete(taskId)
+          onDone({ taskId, sent: task.sent, skipped: task.skipped })
+        }
+      }
+
+      next() // first bot immediately; no unnecessary final wait
+      return taskId
+    },
+    cancel(id) {
+      const taskId = Number(id)
+      const task = tasks.get(taskId)
+      if (!task) return false
+      task.generation++
+      if (task.timer !== null) clearTimer(task.timer)
+      task.timer = null
+      tasks.delete(taskId)
+      return true
+    },
+    cancelAll() {
+      const count = tasks.size
+      for (const task of tasks.values()) {
+        task.generation++
+        if (task.timer !== null) clearTimer(task.timer)
+        task.timer = null
+      }
+      tasks.clear()
+      return count
+    },
+    list() {
+      return Array.from(tasks.values()).map(t => ({
+        id: t.id,
+        command: t.command,
+        sent: t.sent,
+        skipped: t.skipped,
+        total: t.targets.length,
+        remaining: t.targets.length - (t.sent + t.skipped)
+      }))
+    }
+  }
+}
+
+// ── Command Chaining & Sleep Parsing ───────────────────────────────────────
+function parseSleepDuration(durationStr) {
+  if (durationStr == null) return null
+  const s = String(durationStr).trim().toLowerCase()
+  if (!s) return null
+  if (s.endsWith('ms')) {
+    const val = parseFloat(s.slice(0, -2))
+    return (!isNaN(val) && val >= 0) ? Math.round(val) : null
+  }
+  if (s.endsWith('s')) {
+    const val = parseFloat(s.slice(0, -1))
+    return (!isNaN(val) && val >= 0) ? Math.round(val * 1000) : null
+  }
+  const val = parseFloat(s)
+  if (isNaN(val) || val < 0) return null
+  // Values >= 1000 are treated as milliseconds (e.g. 5000 -> 5000ms),
+  // values < 1000 are treated as seconds (e.g. 5 -> 5000ms, 1 -> 1000ms, 2.5 -> 2500ms).
+  return val >= 1000 ? Math.round(val) : Math.round(val * 1000)
+}
+
+function parseCommandChain(raw) {
+  if (typeof raw !== 'string') return []
+  const str = raw.trim()
+  if (!str) return []
+
+  const tokens = []
+  let current = ''
+  let i = 0
+
+  while (i < str.length) {
+    if (str[i] === '\\') {
+      if (str.startsWith('\\&&', i)) {
+        current += '&&'
+        i += 3
+        continue
+      }
+      if (str.startsWith('\\;', i)) {
+        current += ';'
+        i += 2
+        continue
+      }
+      current += '\\'
+      i += 1
+      continue
+    }
+
+    if (str.startsWith('&&', i)) {
+      if (current.trim()) {
+        tokens.push({ command: current.trim(), separator: '&&' })
+      }
+      current = ''
+      i += 2
+      continue
+    }
+
+    if (str[i] === ';') {
+      if (current.trim()) {
+        tokens.push({ command: current.trim(), separator: ';' })
+      }
+      current = ''
+      i += 1
+      continue
+    }
+
+    current += str[i]
+    i++
+  }
+
+  if (current.trim()) {
+    tokens.push({ command: current.trim(), separator: null })
+  } else if (tokens.length > 0) {
+    tokens[tokens.length - 1].separator = null
+  }
+
+  return tokens
+}
+
+async function executeCommandChain(chain, ctx, { executeSingle = () => {}, sleep = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
+  if (!Array.isArray(chain) || chain.length === 0) return
+
+  for (let i = 0; i < chain.length; i++) {
+    const step = chain[i]
+    const cmd = step.command
+    if (!cmd) continue
+
+    let executionPromise
+    const sleepMatch = cmd.match(/^sleep(?:\s+([\s\S]*))?$/i)
+    if (sleepMatch) {
+      const ms = parseSleepDuration(sleepMatch[1])
+      executionPromise = (ms !== null && ms > 0) ? sleep(ms) : Promise.resolve()
+    } else {
+      try {
+        executionPromise = Promise.resolve(executeSingle(cmd, ctx))
+      } catch (err) {
+        executionPromise = Promise.reject(err)
+      }
+    }
+
+    if (step.separator === '&&') {
+      try {
+        await executionPromise
+      } catch (_) {}
+    } else if (step.separator === ';') {
+      executionPromise.catch(() => {})
+    } else {
+      try {
+        await executionPromise
+      } catch (_) {}
+    }
+  }
+}
+
 // ── Dedicated proxy groups (SOCKS5/HTTP per bot subset) ─────────────────────
 // PROXY_GROUP_<N>_BOTS = comma-separated usernames
 // PROXY_GROUP_<N>_HOST / _PORT / _TYPE = proxy target for that group
@@ -94,4 +290,14 @@ function resolveBotProxy(username, groups, fallback = null) {
   return fallback
 }
 
-module.exports = { readDelayMs, shuffledCopy, createSlowBroadcast, parseProxyGroups, resolveBotProxy }
+module.exports = {
+  readDelayMs,
+  shuffledCopy,
+  createSlowBroadcast,
+  createSlowBroadcastManager,
+  parseProxyGroups,
+  resolveBotProxy,
+  parseSleepDuration,
+  parseCommandChain,
+  executeCommandChain
+}
