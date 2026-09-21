@@ -14,6 +14,7 @@ const http = require('http')
 const fs = require('fs')
 const path = require('path')
 const zlib = require('zlib')
+const { spawn } = require('child_process')
 const { Readable } = require('stream')
 
 // Text asset types worth gzipping — the client's main JS bundle is multi-MB.
@@ -92,6 +93,150 @@ async function handleResourcePackProxy (req, res, log) {
 
 // Resolves with the real bound port once the server is listening; rejects on
 // bind errors (EADDRINUSE / EACCES) so callers can fall back to the next port.
+// ── On-demand build (non-Docker installs) ─────────────────────────────────────
+// The Dockerfile bakes the client build into the image, so containers always
+// have it. A plain `npm run start` does not: web-client/dist has never been
+// created, and /play used to dead-end on a "build not found" page. This runs
+// scripts/build-web-client.sh in the background instead — the same script the
+// Dockerfile uses, so the two can never drift — and bot.js shows progress on
+// the /play page while it runs.
+//
+// Only the last few log lines are kept in memory (the /play page shows them);
+// the full output is appended to web-client/build.log so a failure can be
+// diagnosed after the fact.
+const BUILD_LOG_TAIL = 40
+
+function defaultDistDir () { return path.join(__dirname, 'web-client', 'dist') }
+
+// scripts/build-web-client.sh is a bash script (it uses `set -euo pipefail`).
+// Debian/Ubuntu symlink /bin/sh to dash, which aborts on that line with
+// "set: Illegal option -o pipefail", so the interpreter is chosen explicitly
+// instead of inherited from sh. The Dockerfile has always called it with bash;
+// this is the same interpreter.
+function bashInterpreter () {
+  for (const candidate of ['/bin/bash', '/usr/bin/bash', '/usr/local/bin/bash', '/opt/homebrew/bin/bash']) {
+    try { if (fs.existsSync(candidate)) return candidate } catch (_) {}
+  }
+  return 'bash' // not found on disk — still try it, and report the real error if absent
+}
+
+// True when a usable build is present. Never throws.
+function buildExists (dir) {
+  try {
+    return fs.existsSync(path.join(dir || defaultDistDir(), 'index.html'))
+  } catch (_) {
+    return false
+  }
+}
+
+let build = { running: false, startedAt: 0, finishedAt: 0, ok: false, error: '', logFile: '', tail: [] }
+let buildChild = null
+let buildCleanupInstalled = false
+
+function buildState () { return build }
+
+// The build peaks around 1.8 GB RSS, so an orphaned one after Ctrl-C is exactly
+// the memory problem this whole non-Docker path is meant to avoid. Kill it when
+// the app exits, and re-raise the signal so the app still terminates the way it
+// did before (adding a SIGINT listener otherwise suppresses Node's default exit).
+function installBuildCleanup () {
+  if (buildCleanupInstalled) return
+  buildCleanupInstalled = true
+  const kill = () => { try { if (buildChild) buildChild.kill('SIGTERM') } catch (_) {} }
+  process.once('exit', kill)
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.once(sig, () => {
+      kill()
+      try { process.kill(process.pid, sig) } catch (_) { process.exit(1) }
+    })
+  }
+}
+
+// Spawns the build and returns immediately — callers poll buildState()/the
+// dist dir. Idempotent: a second call while one is running is a no-op.
+function startBuild ({ dir, command = '', script: scriptOverride = '', cwd = __dirname, log = () => {} } = {}) {
+  if (build.running) return build
+  const distDir = dir || defaultDistDir()
+  const script = scriptOverride || path.join(__dirname, 'scripts', 'build-web-client.sh')
+  const logFile = path.join(path.dirname(distDir), 'build.log')
+  build = { running: true, startedAt: Date.now(), finishedAt: 0, ok: false, error: '', logFile, tail: [] }
+  installBuildCleanup()
+  let stream = null
+  try {
+    fs.mkdirSync(path.dirname(logFile), { recursive: true })
+    stream = fs.createWriteStream(logFile, { flags: 'w' })
+  } catch (_) { stream = null }
+
+  const push = line => {
+    build.tail.push(line)
+    if (build.tail.length > BUILD_LOG_TAIL) build.tail.splice(0, build.tail.length - BUILD_LOG_TAIL)
+    log(line)
+  }
+  // The build prints progress with \r and without trailing newlines, so buffer
+  // by either terminator rather than by readline (which would stall on \r).
+  let carry = ''
+  const feed = chunk => {
+    carry += chunk.toString()
+    const parts = carry.split(/\r\n|\n|\r/)
+    carry = parts.pop()
+    for (const line of parts) {
+      if (!line.trim()) continue
+      if (stream) { try { stream.write(line + '\n') } catch (_) {} }
+      push(line)
+    }
+  }
+
+  let argv, useShell
+  if (command) { argv = [command]; useShell = true } else { argv = [bashInterpreter(), script]; useShell = false }
+  try {
+    buildChild = useShell ? spawn('sh', ['-c', argv[0]], { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+      : spawn(argv[0], argv.slice(1), { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (err) {
+    build.running = false
+    build.finishedAt = Date.now()
+    build.error = err && err.message ? err.message : String(err)
+    push('✗ ' + build.error)
+    try { if (stream) stream.end() } catch (_) {}
+    return build
+  }
+
+  buildChild.stdout.on('data', feed)
+  buildChild.stderr.on('data', feed)
+  buildChild.on('error', err => {
+    if (carry.trim()) { if (stream) { try { stream.write(carry + '\n') } catch (_) {} } push(carry); carry = '' }
+    build.running = false
+    build.finishedAt = Date.now()
+    build.error = err && err.message ? err.message : String(err)
+    push('✗ ' + build.error)
+    try { if (stream) stream.end() } catch (_) {}
+  })
+  buildChild.on('close', code => {
+    if (carry.trim()) { if (stream) { try { stream.write(carry + '\n') } catch (_) {} } push(carry); carry = '' }
+    build.running = false
+    build.finishedAt = Date.now()
+    buildChild = null
+    // A zero exit is not enough — the Dockerfile makes the same check, because
+    // the script can succeed while producing no dist (BUILD_WEB_CLIENT=0 path).
+    build.ok = code === 0 && buildExists(distDir)
+    if (build.ok) {
+      push(`✓ web client built → ${distDir}`)
+    } else if (!build.error) {
+      build.error = code === 0 ? `build produced no ${path.join(distDir, 'index.html')}` : `build exited with code ${code}`
+      push('✗ ' + build.error)
+    }
+    try { if (stream) stream.end() } catch (_) {}
+    log(build.ok ? 'build finished' : `build failed: ${build.error}`)
+  })
+  return build
+}
+
+// Stop an in-flight build (used on shutdown so npm start exits cleanly).
+function stopBuild () {
+  if (buildChild) { try { buildChild.kill('SIGTERM') } catch (_) {} }
+  buildChild = null
+  if (build.running) { build.running = false; build.finishedAt = Date.now(); build.error = build.error || 'build cancelled' }
+}
+
 function listen(server, port, bind) {
   return new Promise((resolve, reject) => {
     const onError = (e) => { server.removeListener('listening', onListening); reject(e) }
@@ -196,4 +341,4 @@ function stopWebClient(handle, log = () => {}) {
   log('web client server stopped')
 }
 
-module.exports = { startWebClient, stopWebClient, handleResourcePackProxy }
+module.exports = { startWebClient, stopWebClient, handleResourcePackProxy, buildExists, startBuild, buildState, stopBuild }

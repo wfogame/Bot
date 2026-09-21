@@ -1,0 +1,62 @@
+[
+  {
+    "file": "bot.js",
+    "line": 6310,
+    "summary": "Command injection via exec() with unsanitized environment variable in URL",
+    "failure_scenario": "ANALYTICS_HOST=localhost; rm -rf / in .env causes arbitrary command execution when /analyze open runs"
+  },
+  {
+    "file": "bot.js",
+    "line": 2764,
+    "summary": "Race condition: bot.js and mineflayer velocity plugin both write bot.inConfigurationPhase without coordination",
+    "failure_scenario": "Server sends start_configuration -> velocity plugin sets flag=true; state changes to play -> bot.js sets flag=false; velocity's 500ms delayed exitConfigurationPhase runs -> physicsEnabled toggles incorrectly, causing position packets during config -> kick"
+  },
+  {
+    "file": "analysis.js",
+    "line": 642,
+    "summary": "sessionMonteCarlo uses Math.random() directly, making statistical test non-deterministic and unreproducible",
+    "failure_scenario": "Same analysis on identical data produces different p-values; CI flakiness; unit tests impossible"
+  },
+  {
+    "file": "analysis.js",
+    "line": 686,
+    "summary": "kellyEfficiency clamps log(1-f) at 0.001 for f>=1, silently corrupting growth rate for all-in bets",
+    "failure_scenario": "Session with any wager >= balance produces meaningless efficiency value that looks valid but is completely wrong"
+  },
+  {
+    "file": "analysis.js",
+    "line": 697,
+    "summary": "kellyEfficiency divides by (kellyLogGrowth || 1) but kellyLogGrowth can be negative, flipping efficiency sign",
+    "failure_scenario": "winRate=0.55 gives kellyOptimal=0.1, kellyLogGrowth≈-0.0012; actualLogGrowth/negative -> negative efficiency -> clamped to 0"
+  },
+  {
+    "file": "analysis.js",
+    "line": 779,
+    "summary": "opponentClusterAnalysis early return omits opponentsTested field, causing downstream crash in deepAnalysis",
+    "failure_scenario": "Session with 1 qualified opponent -> opponentClusters.opponentsTested is undefined -> summary shows 'Found undefined opponents'"
+  },
+  {
+    "file": "analysis.js",
+    "line": 637,
+    "summary": "sessionMonteCarlo runs synchronous 10,000 x N loop blocking event loop for seconds on large sessions",
+    "failure_scenario": "/analyze json on 5000-flip session -> 50M iterations -> 2-5 second freeze, bot unresponsive"
+  },
+  {
+    "file": "analysis.js",
+    "line": 728,
+    "summary": "changePointAnalysis scans split points in steps of 5, missing true change points between steps",
+    "failure_scenario": "Real structural break at flip 23 missed because only splits 15,20,25 tested; p-value at 25 diluted"
+  },
+  {
+    "file": "analysis.js",
+    "line": 654,
+    "summary": "sessionMonteCarlo continuity correction double-counts ties: uses <= comparison then (count+1)/(iter+1) correction",
+    "failure_scenario": "Small wagers produce many exact net ties; p-value inflated by ~ties/iterations (~0.001 bias)"
+  },
+  {
+    "file": "analysis.js",
+    "line": 1186,
+    "summary": "SPRT section dynamically enters/exits BH correction family when decision changes, violating FDR assumptions",
+    "failure_scenario": "At n=500 SPRT excluded (continue); at n=501 SPRT included (reject_fair); all other tests' q-values suddenly inflate"
+  }
+]

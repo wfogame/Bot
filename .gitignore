@@ -1,4 +1,5 @@
 .env
+.claude/
 auto-hack.js
 botnames.txt
 passwords.txt
@@ -7,3 +8,12 @@ node_modules
 bannana
 node_modules/
 .env*
+data/*.json
+# Append-only measurement history (coinflips, time series) — generated, not source.
+data/*.jsonl
+data/*.jsonl.*
+cron-jobs.json
+removed-bots.json
+# Local web-client build (dist + cloned upstream src + build.log).
+# Built on demand by `npm run web-client:build` or automatically on first /play.
+web-client/

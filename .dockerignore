@@ -1,5 +1,7 @@
 node_modules
 .git
+cron-jobs.json
+removed-bots.json
 .env
 .env.*
 patches/.git

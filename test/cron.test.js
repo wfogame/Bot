@@ -1,7 +1,10 @@
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { CronManager, parseSchedule, matches, nextCronRun } = require('../cron')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
+const { CronManager, parseSchedule, matches, nextCronRun, parseBotTargetCommand, matchBotName, parseCronAddArgs } = require('../cron')
 
 test('parseSchedule accepts 5-field cron and @every', () => {
   assert.equal(parseSchedule('0 4 * * *').type, 'cron')
@@ -201,4 +204,194 @@ test('CronManager and parseSchedule strip single and double quotes cleanly', () 
   assert.equal(m.list()[1].command, '/status')
   assert.equal(m.list()[2].schedule, '0 */2 * * *')
   assert.equal(m.list()[2].command, '/dump-spawners')
+})
+
+test('parseBotTargetCommand extracts one or multiple bot targets', () => {
+  assert.deepEqual(parseBotTargetCommand('@Hypr_7_core /spawners'), {
+    botIds: ['Hypr_7_core'], command: '/spawners'
+  })
+  assert.deepEqual(parseBotTargetCommand('@BotA,BotB /data'), {
+    botIds: ['BotA', 'BotB'], command: '/data'
+  })
+  assert.deepEqual(parseBotTargetCommand('/spawners'), {
+    botIds: null, command: '/spawners'
+  })
+})
+
+test('parseBotTargetCommand keeps dotted names and never treats @every as a bot', () => {
+  assert.deepEqual(parseBotTargetCommand('@Bot.One /status'), {
+    botIds: ['Bot.One'], command: '/status'
+  })
+  assert.deepEqual(parseBotTargetCommand('@every 60 /status'), {
+    botIds: null, command: '@every 60 /status'
+  })
+})
+
+test('matchBotName resolves a target case-insensitively', () => {
+  const roster = ['Hypr_7_core', 'BotA']
+  assert.equal(matchBotName('hypr_7_core', roster), 'Hypr_7_core')
+  assert.equal(matchBotName(' BOTA ', roster), 'BotA')
+  assert.equal(matchBotName('nope', roster), null)
+  assert.equal(matchBotName('', roster), null)
+  assert.equal(matchBotName(undefined, roster), null)
+})
+
+test('parseCronAddArgs accepts the bot target on either side of the schedule', () => {
+  assert.deepEqual(parseCronAddArgs('@every 300 @BotA /spawners'), {
+    schedule: '@every 300', command: '@BotA /spawners'
+  })
+  assert.deepEqual(parseCronAddArgs('@BotA @every 300 /spawners'), {
+    schedule: '@every 300', command: '@BotA /spawners'
+  })
+  assert.deepEqual(parseCronAddArgs('@BotA,BotB 0 4 * * * /data'), {
+    schedule: '0 4 * * *', command: '@BotA,BotB /data'
+  })
+  assert.deepEqual(parseCronAddArgs('"0 4 * * *" /crates-all'), {
+    schedule: '0 4 * * *', command: '/crates-all'
+  })
+  assert.deepEqual(parseCronAddArgs('@every 60 /status'), {
+    schedule: '@every 60', command: '/status'
+  })
+  // @every is a schedule token, not a bot target.
+  assert.deepEqual(parseCronAddArgs('@every 60 @BotA /status'), {
+    schedule: '@every 60', command: '@BotA /status'
+  })
+})
+
+test('parseCronAddArgs keeps chained job commands intact', () => {
+  assert.deepEqual(parseCronAddArgs('@every 3600 /spawners && sleep 10s && /data'), {
+    schedule: '@every 3600', command: '/spawners && sleep 10s && /data'
+  })
+  assert.deepEqual(parseCronAddArgs('@BotA 0 4 * * * /data ; /dump'), {
+    schedule: '0 4 * * *', command: '@BotA /data ; /dump'
+  })
+  assert.deepEqual(parseCronAddArgs('@BotA @every 600 /crates purple'), {
+    schedule: '@every 600', command: '@BotA /crates purple'
+  })
+})
+
+// ── Persistence (CRON_STATE_FILE) ────────────────────────────────────────────
+
+function tempStateFile (name) {
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cron-state-')), name)
+}
+
+test('add/remove/setEnabled persist jobs to the state file', () => {
+  const file = tempStateFile('cron-jobs.json')
+  const m = new CronManager({ dispatch: () => 0, stateFile: file })
+  const job = m.add('@every 300', '@BotA /spawners')
+  m.add('0 4 * * *', '/crates-all')
+  m.setEnabled(job.id, false)
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(saved.jobs.length, 2)
+  assert.deepEqual(saved.jobs[0], { id: '1', schedule: '@every 300', command: '@BotA /spawners', enabled: false })
+  assert.equal(saved.jobs[1].command, '/crates-all')
+
+  m.remove('1')
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).jobs.length, 1)
+  m.clear()
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).jobs, [])
+})
+
+test('a new manager reloads saved jobs with their ids and enabled state', () => {
+  const file = tempStateFile('cron-jobs.json')
+  const first = new CronManager({ dispatch: () => 0, stateFile: file })
+  first.add('@every 300', '@BotA /spawners')
+  first.add('0 4 * * *', '/crates-all')
+  first.setEnabled('1', false)
+
+  const reloaded = new CronManager({ dispatch: () => 0, stateFile: file })
+  assert.equal(reloaded.loadFromFile(), 2)
+  const jobs = reloaded.list()
+  assert.deepEqual(jobs.map(j => j.id), ['1', '2'])
+  assert.deepEqual(jobs.map(j => j.command), ['@BotA /spawners', '/crates-all'])
+  assert.equal(jobs[0].enabled, false)
+  assert.equal(jobs[0].nextRun, null) // disabled jobs have no next run
+  assert.equal(jobs[1].enabled, true)
+  assert.ok(jobs[1].nextRun instanceof Date)
+
+  // New ids continue after the restored ones instead of colliding.
+  assert.equal(reloaded.add('@every 60', '/status').id, '3')
+})
+
+// CRON_JOB_<N> in .env stays authoritative: the same schedule+command must not
+// be registered twice when the state file also has it.
+test('saved jobs do not duplicate an identical CRON_JOB_<N> entry', () => {
+  const file = tempStateFile('cron-jobs.json')
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    jobs: [
+      { id: '1', schedule: '@every 300', command: '@BotA /spawners', enabled: true },
+      { id: '9', schedule: '@every 60', command: '/status', enabled: true }
+    ]
+  }))
+  const m = new CronManager({ dispatch: () => 0, stateFile: file, log: () => {} })
+  assert.equal(m.loadFromEnv({ CRON_JOB_1: '@every 300|@BotA /spawners' }), 1)
+  assert.equal(m.loadFromFile(), 1) // only /status is new
+  assert.deepEqual(m.list().map(j => j.command), ['@BotA /spawners', '/status'])
+  assert.deepEqual(m.list().map(j => j.id), ['1', '9']) // the saved id is honored
+})
+
+test('a corrupt or missing state file never throws', () => {
+  const missing = tempStateFile('nope.json')
+  const m = new CronManager({ dispatch: () => 0, stateFile: missing, log: () => {} })
+  assert.equal(m.loadFromFile(), 0)
+
+  const corrupt = tempStateFile('broken.json')
+  fs.writeFileSync(corrupt, '{ not json')
+  const m2 = new CronManager({ dispatch: () => 0, stateFile: corrupt, log: () => {} })
+  assert.equal(m2.loadFromFile(), 0)
+  assert.equal(m2.list().length, 0)
+})
+
+test('invalid saved entries are skipped, unknown schedules are reported', () => {
+  const file = tempStateFile('cron-jobs.json')
+  fs.writeFileSync(file, JSON.stringify([
+    { schedule: '@every 60', command: '/status' },
+    { schedule: 'nope * * * *', command: '/status' },
+    { schedule: '@every 60' },
+    null
+  ]))
+  const logged = []
+  const m = new CronManager({ dispatch: () => 0, stateFile: file, log: msg => logged.push(msg) })
+  assert.equal(m.loadFromFile(), 1)
+  assert.equal(logged.length, 1)
+  assert.match(logged[0], /Invalid minute field/)
+})
+
+test('without a state file nothing is written and load is a no-op', () => {
+  const m = new CronManager({ dispatch: () => 0 })
+  m.add('@every 60', '/status')
+  assert.equal(m.stateFile, '')
+  assert.equal(m.save(), false)
+  assert.equal(m.loadFromFile(), 0)
+  assert.equal(m.list().length, 1)
+})
+
+test('save is atomic: no left-over temp files', () => {
+  const file = tempStateFile('cron-jobs.json')
+  const m = new CronManager({ dispatch: () => 0, stateFile: file })
+  m.add('@every 60', '/status')
+  m.add('@every 90', '/status')
+  const leftovers = fs.readdirSync(path.dirname(file)).filter(name => name.includes('.tmp-'))
+  assert.deepEqual(leftovers, [])
+})
+
+test('jobs added via /cron add parse through to the saved file', () => {
+  const file = tempStateFile('cron-jobs.json')
+  const m = new CronManager({ dispatch: () => 0, stateFile: file })
+  const parsed = parseCronAddArgs('@every 300 @BotA /spawners')
+  m.add(parsed.schedule, parsed.command)
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(saved.jobs[0].schedule, '@every 300')
+  assert.equal(saved.jobs[0].command, '@BotA /spawners')
+})
+
+test('parseCronAddArgs reports what is missing or invalid', () => {
+  assert.throws(() => parseCronAddArgs(''), /Usage/)
+  assert.throws(() => parseCronAddArgs('   '), /Usage/)
+  assert.throws(() => parseCronAddArgs('@every 60'), /Missing command/)
+  assert.throws(() => parseCronAddArgs('0 4 * * *    '), /Missing command/)
+  assert.throws(() => parseCronAddArgs('@every 2 /status'), /@every/)
+  assert.throws(() => parseCronAddArgs('nope * * * * /status'), /Invalid minute field/)
 })

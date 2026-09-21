@@ -1,5 +1,8 @@
 'use strict'
 
+const fs = require('fs')
+const path = require('path')
+
 // Minimal cron scheduler for bot.js — no external dependencies.
 //
 // Schedule formats accepted everywhere (terminal /cron and .env CRON_JOB_<N>):
@@ -10,6 +13,9 @@
 // Field syntax: * | */n | a-b | a-b/n | value | comma-separated combinations.
 // When BOTH day-of-month and day-of-week are restricted, cron fires when EITHER
 // matches (classic cron OR semantics).
+//
+// Jobs added at runtime with `/cron add` are saved to CRON_STATE_FILE (default
+// cron-jobs.json) and reloaded on startup, so they survive a restart.
 
 function parseField (field, min, max, name) {
   const s = String(field).trim()
@@ -98,22 +104,34 @@ function nextCronRun (spec, from = new Date()) {
   return null
 }
 
+// Jobs are kept in memory and, when a state file is configured, mirrored to
+// disk after every change so `/cron add` survives a restart (CRON_JOB_<N> in
+// .env is still loaded first and always wins on an exact schedule+command
+// duplicate, so env can be used to pin a job while the file holds the rest).
 class CronManager {
-  constructor ({ dispatch, log } = {}) {
+  constructor ({ dispatch, log, stateFile = '' } = {}) {
     if (typeof dispatch !== 'function') throw new Error('CronManager requires a dispatch function')
     this.dispatch = dispatch
     this.log = typeof log === 'function' ? log : () => {}
     this.jobs = []
     this.nextId = 1
     this.timer = null
+    this.stateFile = String(stateFile || '').trim()
   }
 
-  add (schedule, command) {
+  // Internal add: validates, assigns the next free id, no disk write. Used by
+  // the loader paths (env and state file), which must never rewrite the file.
+  _add (schedule, command, preferredId = null) {
     const spec = parseSchedule(schedule)
     const cmd = String(command || '').trim()
     if (!cmd) throw new Error('Command is empty')
+    let id = preferredId === null || preferredId === undefined ? '' : String(preferredId)
+    if (id && this.jobs.some(j => j.id === id)) id = ''
+    if (!id) id = String(this.nextId)
+    const numeric = Number(id)
+    if (Number.isFinite(numeric) && numeric >= this.nextId) this.nextId = Math.floor(numeric) + 1
     const job = {
-      id: String(this.nextId++),
+      id,
       schedule: String(schedule).trim(),
       spec,
       command: cmd,
@@ -128,16 +146,97 @@ class CronManager {
     return job
   }
 
+  add (schedule, command) {
+    const job = this._add(schedule, command)
+    this.save()
+    return job
+  }
+
   remove (id) {
     const idx = this.jobs.findIndex(j => j.id === String(id))
     if (idx < 0) return false
     this.jobs.splice(idx, 1)
+    this.save()
     return true
   }
 
   setEnabled (id, enabled) {
     const job = this.jobs.find(j => j.id === String(id))
     if (!job) return false
+    job.enabled = !!enabled
+    job.nextRun = this._computeNext(job)
+    this.save()
+    return true
+  }
+
+  // Writes the job config (schedule/command/enabled/id) to the state file.
+  // Called automatically after every add/remove/setEnabled/clear.
+  // Runtime counters (runs, lastRun) are not persisted — the point is that a
+  // restart keeps your jobs, not that it resumes tick counters. Never throws:
+  // a read-only or missing directory must not take the bot down.
+  save (file = this.stateFile) {
+    const target = String(file || '').trim()
+    if (!target) return false
+    try {
+      const dir = path.dirname(path.resolve(target))
+      fs.mkdirSync(dir, { recursive: true })
+      const payload = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        jobs: this.jobs.map(job => ({ id: job.id, schedule: job.schedule, command: job.command, enabled: job.enabled }))
+      }
+      const tmp = `${path.resolve(target)}.tmp-${process.pid}`
+      fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n')
+      fs.renameSync(tmp, path.resolve(target))
+      return true
+    } catch (err) {
+      this.log(`{yellow-fg}⚠ Could not save cron jobs to ${target}: ${err && err.message ? err.message : err}{/yellow-fg}`)
+      return false
+    }
+  }
+
+  // Restores jobs saved by save(). Missing file is normal (first run). Jobs
+  // whose schedule+command already came from CRON_JOB_<N> are skipped so the
+  // two sources cannot double-register the same job. Loading never writes: the
+  // file is only rewritten by a real mutation (add/remove/on/off/clear), so a
+  // failed or partial load can never clobber a working state file.
+  loadFromFile (file = this.stateFile) {
+    const target = String(file || '').trim()
+    if (!target) return 0
+    let raw
+    try {
+      raw = fs.readFileSync(path.resolve(target), 'utf8')
+    } catch (_) {
+      return 0
+    }
+    let payload
+    try {
+      payload = JSON.parse(raw)
+    } catch (err) {
+      this.log(`{red-fg}✗ ${target} is not valid JSON (${err && err.message ? err.message : err}) — saved cron jobs were ignored{/red-fg}`)
+      return 0
+    }
+    const entries = Array.isArray(payload) ? payload : (Array.isArray(payload && payload.jobs) ? payload.jobs : [])
+    let loaded = 0
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue
+      const schedule = stripQuotes(entry.schedule)
+      const command = stripQuotes(entry.command)
+      if (!schedule || !command) continue
+      if (this.jobs.some(j => j.schedule === schedule && j.command === command)) continue
+      try {
+        const job = this._add(schedule, command, entry.id)
+        if (entry.enabled === false) this.setEnabledSilently(job, false)
+        loaded++
+      } catch (err) {
+        this.log(`{red-fg}✗ Saved cron job ignored — ${err && err.message ? err.message : err}{/red-fg}`)
+      }
+    }
+    return loaded
+  }
+
+  // setEnabled without a disk write, for use while loading.
+  setEnabledSilently (job, enabled) {
     job.enabled = !!enabled
     job.nextRun = this._computeNext(job)
     return true
@@ -158,6 +257,7 @@ class CronManager {
 
   clear () {
     this.jobs = []
+    this.save()
   }
 
   // Load CRON_JOB_<N>="<schedule>|<command>" entries from an env-like object.
@@ -175,7 +275,7 @@ class CronManager {
       const schedule = stripQuotes(raw.slice(0, sep))
       const command = stripQuotes(raw.slice(sep + 1))
       try {
-        this.add(schedule, command)
+        this._add(schedule, command)
         loaded++
       } catch (err) {
         this.log(`{red-fg}✗ ${prefix}${i} ignored — ${err && err.message ? err.message : err}{/red-fg}`)
@@ -232,4 +332,78 @@ class CronManager {
   }
 }
 
-module.exports = { CronManager, parseSchedule, matches, nextCronRun }
+// A cron command may optionally target one or more bot names:
+//   @Hypr_7_core /spawners
+//   @BotA,BotB /spawners
+// Without this prefix, callers retain the existing all-bots behavior.
+// `@every` is a schedule token, never a bot target.
+function parseBotTargetCommand (command) {
+  const text = String(command || '').trim()
+  if (/^@every\b/i.test(text)) return { botIds: null, command: text }
+  const match = text.match(/^@([A-Za-z0-9_.-]+(?:,[A-Za-z0-9_.-]+)*)\s+([\s\S]+)$/)
+  if (!match) return { botIds: null, command: text }
+  return {
+    botIds: match[1].split(',').map(s => s.trim()).filter(Boolean),
+    command: match[2].trim()
+  }
+}
+
+// Case-insensitive roster lookup so `@hypr_7_core` still finds `Hypr_7_core`.
+// Returns the real roster key, or null when nothing matches.
+function matchBotName (name, roster = []) {
+  const want = String(name || '').trim().toLowerCase()
+  if (!want) return null
+  return roster.find(id => String(id).toLowerCase() === want) || null
+}
+
+// Parses the arguments of `/cron add`. The schedule is either a quoted token or
+// the next 5 fields (`@every <secs>` is two); everything after it is the job
+// command, kept verbatim so chained commands (`&& sleep 5s && /dump`) survive.
+// The bot-target prefix may sit on EITHER side of the schedule:
+//   /cron add @every 300 @BotA /spawners
+//   /cron add @BotA @every 300 /spawners
+//   /cron add "0 4 * * *" /crates-all
+function parseCronAddArgs (rest) {
+  let text = String(rest || '').trim()
+  if (!text) throw new Error('Usage: /cron add <schedule> <command>')
+
+  let leadTarget = ''
+  const leading = text.match(/^@([A-Za-z0-9_.-]+(?:,[A-Za-z0-9_.-]+)*)\s+([\s\S]+)$/)
+  if (leading && !/^every$/i.test(leading[1])) {
+    leadTarget = leading[1]
+    text = leading[2].trim()
+  }
+
+  let schedule = ''
+  let command = ''
+  const quoted = text.match(/^"([^"]*)"\s*([\s\S]*)$/) || text.match(/^'([^']*)'\s*([\s\S]*)$/)
+  if (quoted) {
+    schedule = quoted[1].trim()
+    command = quoted[2].trim()
+  } else {
+    const tokens = text.split(/\s+/)
+    if (/^@every$/i.test(tokens[0] || '')) {
+      schedule = tokens.slice(0, 2).join(' ')
+      command = tokens.slice(2).join(' ')
+    } else {
+      schedule = tokens.slice(0, 5).join(' ')
+      command = tokens.slice(5).join(' ')
+    }
+  }
+
+  if (!schedule) throw new Error('Missing schedule — use 5-field cron ("0 4 * * *") or "@every <seconds>"')
+  parseSchedule(schedule) // throws with a specific reason when invalid
+  if (!command) throw new Error(`Missing command after the schedule "${schedule}"`)
+  if (leadTarget) command = `@${leadTarget} ${command}`
+  return { schedule, command }
+}
+
+module.exports = {
+  CronManager,
+  parseSchedule,
+  matches,
+  nextCronRun,
+  parseBotTargetCommand,
+  matchBotName,
+  parseCronAddArgs
+}

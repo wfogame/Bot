@@ -6,6 +6,20 @@ const {
   parseSleepDuration,
   executeCommandChain
 } = require('../bot-controls')
+const { parseNameList, hasInventoryItems, buildHiddenDumpPlan } = require('../bot-controls')
+
+test('parseNameList de-duplicates names and inventory guard is empty-safe', () => {
+  assert.deepEqual(parseNameList(' BotA, BotB, BotA ,, '), ['BotA', 'BotB'])
+  assert.equal(hasInventoryItems({ items: () => [] }), false)
+  assert.equal(hasInventoryItems({ items: () => [{ name: 'stone' }] }), true)
+})
+
+test('buildHiddenDumpPlan starts at the main player and includes every bot once', () => {
+  const plan = buildHiddenDumpPlan(['A', 'B', 'C', 'D', 'E'], 'Main', () => 0.9)
+  assert.equal(plan.length, 5)
+  assert.ok(plan.slice(0, 3).every(step => step.target === 'Main'))
+  assert.deepEqual(new Set(plan.map(step => step.bot)), new Set(['A', 'B', 'C', 'D', 'E']))
+})
 
 test('parseCommandChain handles && sequential, ; concurrent, and mixed operators', () => {
   assert.deepEqual(parseCommandChain('/status && /inv'), [
