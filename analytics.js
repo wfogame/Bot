@@ -46,7 +46,7 @@ function duration (ms) {
 
 /** The machine-readable report behind /api/analytics. */
 function buildReport ({ coinflip = null, timeseries = null, deep = null, config = {}, generatedAt = Date.now() } = {}) {
-  return {
+  const report = {
     generatedAt,
     generatedAtIso: fmtTime(generatedAt),
     config,
@@ -55,6 +55,12 @@ function buildReport ({ coinflip = null, timeseries = null, deep = null, config 
     deep,
     headline: buildHeadline(coinflip, timeseries)
   }
+  // The page builds each tab from this HTML on demand, so the JSON response
+  // carries the rendered sections alongside the data. Same HTML the page
+  // would have built inline — nothing is recomputed on the client.
+  if (deep) report.deepHtml = deepSection(deep)
+  if (timeseries) report.timeseriesHtml = timeseriesSection(timeseries, (timeseries && timeseries.bucketMs) || 3600000)
+  return report
 }
 
 function buildHeadline (coinflip, timeseries) {
@@ -194,6 +200,11 @@ tr.sig td{background:rgba(74,222,128,.07)}
 ul.takeaways{margin:0;padding-left:18px;color:var(--txt)}
 ul.takeaways li{margin:0 0 4px}
 .eq{color:var(--dim)}
+.tabs{display:flex;gap:4px;overflow-x:auto;margin:0 0 18px;border-bottom:1px solid var(--line);padding-bottom:2px}
+.tab{color:var(--dim);text-decoration:none;padding:8px 14px;border:1px solid transparent;border-bottom:none;border-radius:8px 8px 0 0;font-size:12px;white-space:nowrap;cursor:pointer}
+.tab:hover{color:var(--txt);background:var(--panel)}
+.tab.active{color:#e8f0f6;background:var(--panel);border-color:var(--line)}
+.tab[hidden]{display:none}
 `
 
 function kpi (label, value, cls = '') {
@@ -266,6 +277,60 @@ function deepRows (section) {
  * carries — the page never recomputes a statistic, so what is on screen is
  * exactly what /bot-coinflip deep printed and /api/coinflip/deep serves.
  */
+
+/**
+ * The deep dissection, as its own tab. The full report is heavy — fourteen
+ * sections of bucketed statistics — so it gets a tab of its own rather than
+ * sitting inline behind the coinflip summary. The page loads with the summary
+ * tab open (cheap, one KPI row) and only builds this HTML when the tab is
+ * clicked, which keeps the first paint fast on a slow connection.
+ */
+function renderDeepTab (deep) {
+  if (!deep || !deep.resolved) {
+    return `<div class="panel"><div class="empty">No resolved coinflips recorded yet. Run <code>/bot-coinflip run</code> and every dissection fills in here.</div></div>`
+  }
+  const controls = deep.sections.filter(section => section.rows.length || section.summary)
+  const parts = controls.map(section => {
+    const heading = `<div class="panel" style="margin-bottom:12px">
+<h2 style="margin-top:0">${esc(section.title)}</h2>
+<p class="sub" style="margin:0 0 8px">${esc(section.question || '')}</p>
+${section.rows.length
+  ? `<table><thead><tr><th>bucket</th><th>n</th><th>W/L</th><th>rate</th><th>95% CI</th><th>p</th><th>q</th><th></th></tr></thead><tbody>${deepRows(section)}</tbody></table>`
+  : `<div class="empty">${esc(section.summary || 'no data')}</div>`}
+<p class="sub" style="margin:8px 0 0">${esc(section.summary || '')}</p>
+</div>`
+    return heading
+  }).join('')
+
+  return `<div class="kpis">
+${kpi('resolved flips', fmt(deep.resolved))}
+${kpi('win rate', pct(deep.winRate, 2))}
+${kpi('statistical tests', fmt(deep.tests))}
+${kpi('FDR level', esc(String(deep.q)))}
+${kpi('P(win | win)', pct(deep.markov && deep.markov.pWinAfterWin, 2))}
+${kpi('P(win | loss)', pct(deep.markov && deep.markov.pWinAfterLoss, 2))}
+${kpi('lag-1 correlation', deep.autocorrelation && deep.autocorrelation[0] && deep.autocorrelation[0].r != null ? deep.autocorrelation[0].r.toFixed(4) : '–')}
+${kpi('hour clock', esc(deep.hourSource || 'none'))}
+${kpi('deepest drawdown', fmt(deep.curve && deep.curve.maxDrawdown), 'loss')}
+${kpi('longest stretch below a high', `${deep.curve ? deep.curve.longestDrawdown : '–'} flips`)}
+</div>
+<div class="panel" style="margin-top:12px">
+<h2 style="margin-top:0">What the numbers say</h2>
+<ul class="takeaways">${(deep.takeaways || []).map(line => `<li>${esc(line)}</li>`).join('')}</ul>
+<p class="sub" style="margin:8px 0 0">${deep.tests} bucket(s) and trend(s) were tested; the q column is the p-value after the Benjamini–Hochberg correction over all ${deep.tests} of them. A bucket under ${deep.minBucket} flips is marked low n and should be read as an anecdote. <a href="/api/coinflip/deep">/api/coinflip/deep</a> has the same numbers as JSON.</p>
+</div>
+${parts}`
+}
+
+/** Tab bar shared by every analytics page. */
+function renderTabs (active) {
+  const tabs = [
+    { key: 'coinflip', label: 'Coinflip' },
+    { key: 'deep', label: 'Deep dissection' },
+    { key: 'timeseries', label: 'Fleet over time' }
+  ]
+  return `<nav class="tabs">${tabs.map(t => `<a class="tab${t.key === active ? ' active' : ''}" data-tab="${t.key}" href="#${t.key}">${esc(t.label)}</a>`).join('')}</nav>`
+}
 function deepSection (deep) {
   if (!deep || !deep.resolved) {
     return `<h2>Deep dissection</h2><div class="panel"><div class="empty">No resolved coinflips recorded yet. Run <code>/bot-coinflip run</code> and every dissection fills in here.</div></div>`
@@ -348,6 +413,10 @@ ${lineChart(s.banned, { label: 'Banned bots', color: 'var(--red)' })}
 function renderHtml (report) {
   const h = report.headline || {}
   const bucketMs = (report.timeseries && report.timeseries.bucketMs) || 3600000
+  // The first paint only needs the headline + coinflip summary. The deep
+  // dissection and the timeseries charts are heavy, so they are rendered by
+  // the client only when their tab is clicked — the JSON behind them is the
+  // same object the page would have built inline, so nothing is recomputed.
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AFK Analytics</title>
@@ -363,10 +432,52 @@ ${kpi('tracked bots', fmt(h.trackedBots))}
 ${kpi('samples', fmt(h.samples))}
 ${kpi('shards now', fmt(h.shardsNow))}
 </div>
+${renderTabs('coinflip')}
+<section id="tab-coinflip" data-tab="coinflip">
 ${coinflipSection(report.coinflip)}
-${deepSection(report.deep)}
-${timeseriesSection(report.timeseries, bucketMs)}
-<p class="sub" style="margin-top:22px">JSON: <a href="/api/analytics">/api/analytics</a> · coinflips only: <a href="/api/coinflip">/api/coinflip</a> · series: <a href="/api/timeseries?metric=shards&amp;bucket=1h">/api/timeseries?metric=shards&amp;bucket=1h</a></p>
+</section>
+<section id="tab-deep" data-tab="deep" hidden>
+<div class="panel"><div class="empty">Loading the deep dissection…</div></section>
+<section id="tab-timeseries" data-tab="timeseries" hidden>
+<div class="panel"><div class="empty">Loading the fleet charts…</div></section>
+<p class="sub" style="margin-top:22px">JSON: <a href="/api/analytics">/api/analytics</a> · coinflips only: <a href="/api/coinflip">/api/coinflip</a> · series: <a href="/api/timeseries?metric=shards&amp;bucket=1h">/api/timeseries?metric=shards&amp;bucket=1h</a> · deep: <a href="/api/coinflip/deep">/api/coinflip/deep</a></p>
+<script>
+(function () {
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab'));
+  var panels = {};
+  document.querySelectorAll('section[data-tab]').forEach(function (s) { panels[s.getAttribute('data-tab')] = s; });
+  function activate (key) {
+    tabs.forEach(function (t) { t.classList.toggle('active', t.getAttribute('data-tab') === key); });
+    Object.keys(panels).forEach(function (k) {
+      var on = k === key;
+      panels[k].hidden = !on;
+      if (on && panels[k].getAttribute('data-loaded') !== '1') {
+        panels[k].setAttribute('data-loaded', '1');
+        loadTab(key, panels[k]);
+      }
+    });
+    try { location.hash = '#tab-' + key; } catch (e) {}
+  }
+  function loadTab (key, panel) {
+    var url = key === 'deep' ? '/api/coinflip/deep' : '/api/analytics';
+    fetch(url, { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (data) {
+      var html = key === 'deep' ? window.CFK_DEEP_HTML(data) : window.CFK_ANALYTICS_HTML(data);
+      if (html != null) panel.innerHTML = html;
+    }).catch(function () { panel.innerHTML = '<div class="panel"><div class="empty">Could not load that tab.</div></div>'; });
+  }
+  tabs.forEach(function (t) { t.addEventListener('click', function (e) { e.preventDefault(); activate(t.getAttribute('data-tab')); }); });
+  var hash = (location.hash || '').replace('#tab-', '');
+  if (hash && panels[hash]) activate(hash); else activate('coinflip');
+  // Expose the renderers so the client can build each tab from JSON.
+  window.CFK_ANALYTICS_HTML = function (data) { return window.CFK_RENDER(data, 'timeseries'); };
+  window.CFK_DEEP_HTML = function (data) { return window.CFK_RENDER(data, 'deep'); };
+  window.CFK_RENDER = function (data, which) {
+    if (which === 'deep') return data.deepHtml || '';
+    if (which === 'timeseries') return data.timeseriesHtml || '';
+    return '';
+  };
+})();
+</script>
 </body></html>`
 }
 
@@ -387,6 +498,8 @@ module.exports = {
   buildHeadline,
   renderHtml,
   deepSection,
+  renderDeepTab,
+  renderTabs,
   lineChart,
   rateBar,
   parseBucket,

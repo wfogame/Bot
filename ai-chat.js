@@ -1,26 +1,23 @@
 const axios = require('axios');
 
-// FreeLLM API configuration - REQUIRED env vars, no defaults
+// FreeLLM API configuration. Both are optional: /ai-chat is a feature, not a
+// requirement, so a deployment without LLM credentials must not take the whole
+// bot down at module-eval time. callFreeLLMChat() reports the problem on the
+// first turn instead.
 const FREE_LLM_API_KEY = process.env.FREE_LLM_API_KEY;
 const FREE_LLM_BASE_URL = process.env.FREE_LLM_BASE_URL;
 
-if (!FREE_LLM_API_KEY) {
-  console.error('[ai-chat] ERROR: FREE_LLM_API_KEY environment variable is required');
-  process.exit(1);
+let freeLLMClient = null;
+if (FREE_LLM_API_KEY && FREE_LLM_BASE_URL) {
+  // Configure axios to use the base URL
+  freeLLMClient = axios.create({
+    baseURL: FREE_LLM_BASE_URL,
+    headers: {
+      'Authorization': `Bearer ${FREE_LLM_API_KEY}`,
+      'Content-Type': 'application/json'
+    }
+  });
 }
-if (!FREE_LLM_BASE_URL) {
-  console.error('[ai-chat] ERROR: FREE_LLM_BASE_URL environment variable is required');
-  process.exit(1);
-}
-
-// Configure axios to use the base URL
-const freeLLMClient = axios.create({
-  baseURL: FREE_LLM_BASE_URL,
-  headers: {
-    'Authorization': `Bearer ${FREE_LLM_API_KEY}`,
-    'Content-Type': 'application/json'
-  }
-});
 
 // System prompt template - filled in with actual bot name
 function getRedstoneProSystemPrompt(botName) {
@@ -43,6 +40,11 @@ IMPORTANT: When the user message mentions a player chat, respond to THAT message
 
 // Call FreeLLM API for chat completion - returns ONLY the quoted message content
 async function callFreeLLMChat(latestChatMessage = '', botName = 'the bot') {
+  if (!freeLLMClient) {
+    const err = new Error('AI chat is not configured: set FREE_LLM_API_KEY and FREE_LLM_BASE_URL in .env');
+    err.code = 'AI_CHAT_NOT_CONFIGURED';
+    throw err;
+  }
   const systemPrompt = getRedstoneProSystemPrompt(botName);
   const userPrompt = latestChatMessage
     ? `The player just said this in chat: "${latestChatMessage}"\n\nRespond naturally to this as RedStonePro. Remember: ONLY output a single quoted string.`
@@ -174,15 +176,34 @@ function randomDelay(minMs, maxMs) {
 const AI_CHAT_INTERVAL_MIN_MS = 40 * 1000;
 const AI_CHAT_INTERVAL_MAX_MS = 150 * 1000;
 
-async function autoAIChatLoop(bot, send, botName) {
+/**
+ * Runs the AI chat loop for one bot until the caller stops it.
+ *
+ * @param {object} bot - the mineflayer bot instance
+ * @param {(message: string) => void} send - called with each generated message
+ * @param {string} botName - name to speak as
+ * @param {{stop?: boolean}} [state] - when `state.stop` is true the loop exits
+ * @param {(err: Error) => void} [onError] - called on every failed turn; the
+ *   loop keeps going after a failure so a dead LLM does not stop the bot
+ */
+async function autoAIChatLoop(bot, send, botName, state = {}, onError = () => {}) {
   console.log('[ai-chat] Starting Auto AI Chat loop');
 
-  while (true) {
+  while (!state.stop) {
     const delay = Math.floor(Math.random() * (AI_CHAT_INTERVAL_MAX_MS - AI_CHAT_INTERVAL_MIN_MS)) + AI_CHAT_INTERVAL_MIN_MS;
     console.log(`[ai-chat] Waiting ${delay / 1000}s before next AI chat...`);
     await new Promise(resolve => setTimeout(resolve, delay));
+    if (state.stop) break;
 
-    const message = await callFreeLLMChat('', botName);
+    let message
+    try {
+      message = await callFreeLLMChat('', botName)
+    } catch (err) {
+      // A failed turn is not a reason to stop the bot — the LLM might be down
+      // for a minute. Report it and keep the cadence going.
+      onError(err)
+      continue
+    }
     if (message && bot?.entity) {
       console.log(`[ai-chat] AI says: ${message}`);
       send(message);

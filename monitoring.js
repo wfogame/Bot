@@ -83,6 +83,11 @@ const BAN_WORD_RE = /\bbann?ed\b|\bban\b|blacklist|suspended|permaban|ban hammer
 const BLACKLIST_RE = /blacklist|black-list|global ban|network-?wide ban|banned from (?:all|every) servers/i
 const TEMP_WORD_RE = /temporar(?:ily|y)[\s-]*bann?ed|\btemp[\s-]?ban\b|banned for\s+\d|expires?\s+in\b|expires?\s+(?:at|on|until)\b|banned until|ban (?:expires|ends)/i
 const PERM_WORD_RE = /permanent(?:ly)?[\s-]+bann?ed|permanent ban|permaban|banned permanently|never (?:be )?(?:unbanned|allowed)/i
+// "Expires in: permanent" — the value after "expires in" is a word, not a
+// number, so the duration regex never sees it. A server that says the ban is
+// permanent in words means it, and treating it as a temporary ban of unknown
+// length makes the bot log "temporary" and then hold it forever anyway.
+const PERM_EXPIRES_IN_RE = /expires?\s+in\s*:?\s*(permanent(?:ly)?|forever|never|indefinite|eternal)/i
 const SUSPECT_RE = /alt (?:account )?detected|anti-?bot|bot detected|automatic(?:ally)? banned|suspicious (?:activity|connection)/i
 var BAN_DURATION_RE = /\bfor\s+(\d+\s*(?:second|minute|hour|day|week|month|year)s?)/i
 var BAN_EXPIRES_IN_RE = /expires?\s+in\s*:?\s*([0-9][^\n]*)/i
@@ -148,6 +153,10 @@ function classifyKick (message) {
   else kind = 'permanent'
   // An unexpiring ban is a permanent one even if the wording never says so.
   if (kind === 'temporary' && PERM_WORD_RE.test(text) && !durationMs && !expiresAt) kind = 'permanent'
+  // "Expires in: permanent" — the value is a word, not a number, so the
+  // duration regex never sees it and the ban was classified temporary while
+  // being held forever. A server that says the ban is permanent in words means it.
+  if (PERM_EXPIRES_IN_RE.test(text)) kind = 'permanent'
 
   let reason = text
   const reasonMatch = text.match(BAN_REASON_RE)

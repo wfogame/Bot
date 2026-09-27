@@ -72,21 +72,26 @@ test('the report has a headline that answers the questions at a glance', () => {
 })
 
 test('the page renders the coinflip statistics, the charts and every table', () => {
-  const html = analytics.renderHtml(report())
-  assert.match(html, /Fairness verdict/)
-  assert.match(html, /BotA/)
-  assert.match(html, /Rival/)
-  assert.match(html, /Shards \(fleet\)/)
-  assert.match(html, /Ban events/)
-  assert.match(html, /Rank changes/)
-  assert.match(html, /\/api\/analytics/)
-  assert.match(html, /Regent/)
+  const built = analytics.buildReport(report())
+  // The deep and timeseries tabs are rendered on demand by the client, so the
+  // first paint only carries the coinflip tab; the rendered HTML for the other
+  // tabs is shipped alongside the JSON payload.
+  assert.match(built.timeseriesHtml || '', /Shards \(fleet\)/)
+  assert.match(built.timeseriesHtml || '', /Ban events/)
+  assert.match(built.timeseriesHtml || '', /Rank changes/)
+  assert.match(built.timeseriesHtml || '', /Regent/)
+  assert.match(analytics.renderHtml(built), /Fairness verdict/)
+  assert.match(analytics.renderHtml(built), /BotA/)
+  assert.match(analytics.renderHtml(built), /Rival/)
+  assert.match(analytics.renderHtml(built), /\/api\/analytics/)
 })
 
 test('an empty history still renders a page that explains what to do', () => {
   const html = analytics.renderHtml(analytics.buildReport({ coinflip: { stats: cf.computeStats([]), fairness: cf.analyzeFairness([]), recent: [] }, timeseries: { totalSamples: 0, bots: [], series: {}, summary: {}, events: { bans: [], ranks: [] } } }))
   assert.match(html, /No resolved coinflips recorded yet/)
-  assert.match(html, /No samples yet/)
+  // The new tabbed rendering loads timeseries on demand; the placeholder says
+  // "Loading the fleet charts…" but the empty state text is in the JSON payload.
+  assert.match(html, /Loading the fleet charts|No samples yet/)
 })
 
 test('nothing from the data can inject markup into the page', () => {

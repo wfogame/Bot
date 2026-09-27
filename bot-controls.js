@@ -289,6 +289,14 @@ function parseSleepDuration(durationStr) {
     const val = parseFloat(s.slice(0, -2))
     return (!isNaN(val) && val >= 0) ? Math.round(val) : null
   }
+  if (s.endsWith('min')) {
+    const val = parseFloat(s.slice(0, -3))
+    return (!isNaN(val) && val >= 0) ? Math.round(val * 60000) : null
+  }
+  if (s.endsWith('h')) {
+    const val = parseFloat(s.slice(0, -1))
+    return (!isNaN(val) && val >= 0) ? Math.round(val * 3600000) : null
+  }
   if (s.endsWith('s')) {
     const val = parseFloat(s.slice(0, -1))
     return (!isNaN(val) && val >= 0) ? Math.round(val * 1000) : null
@@ -298,6 +306,15 @@ function parseSleepDuration(durationStr) {
   // Values >= 1000 are treated as milliseconds (e.g. 5000 -> 5000ms),
   // values < 1000 are treated as seconds (e.g. 5 -> 5000ms, 1 -> 1000ms, 2.5 -> 2500ms).
   return val >= 1000 ? Math.round(val) : Math.round(val * 1000)
+}
+
+// Render a millisecond duration as a short human string ("30s", "2m", "1h").
+function fmtDuration(ms) {
+  const total = Math.max(0, Math.round(ms))
+  if (total < 1000) return total + 'ms'
+  if (total < 60000) return Math.round(total / 1000) + 's'
+  if (total < 3600000) return Math.floor(total / 60000) + 'm'
+  return Math.floor(total / 3600000) + 'h'
 }
 
 function parseCommandChain(raw) {

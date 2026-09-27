@@ -50,7 +50,7 @@ const analysis = require(path.join(__dirname, 'analysis'))
 const timeseries = require(path.join(__dirname, 'timeseries'))
 const analytics = require(path.join(__dirname, 'analytics'))
 const { handleChartJs, handleCoinflipDashboardJs } = require('./coinflip-dashboard-static')
-const { callFreeLLMChat, getAvailableModels } = require('./ai-chat')
+const { callFreeLLMChat, getAvailableModels, autoAIChatLoop } = require('./ai-chat')
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -59,7 +59,7 @@ try { ({ SocksClient } = require('socks')) } catch (_) { /* only needed if PROXY
 
 // ── .env config (original) ──────────────────────────────────────────────────
 const HOST = process.env.HOST || 'play.fatalmc.org'
-const PORT = parseInt(process.env.PORT || '25565', 10)
+const PORT = readInt(process.env.PORT, 25565, 1, 65535)
 const VERSION = process.env.VERSION || '1.21.2'
 // The /register + /login password is resolved PER BOT (resolveLoginPassword), so
 // each proxy group of accounts can use its own and a single bot can override
@@ -74,10 +74,10 @@ const BOT_PASSWORDS = parseBotPasswords()
 // Once a failure is recorded the bot stops sending auth commands, says which
 // variable to fix, and alerts Discord once. A restart (or /auth-retry) clears it,
 // deliberately: the fix is an edit to .env, and a restart is how that lands.
-const AUTH_REPLY_WINDOW_MS = parseInt(process.env.AUTH_REPLY_WINDOW_MS || '30000', 10)
-const AUTH_THROTTLE_MS = parseInt(process.env.AUTH_RETRY_MS || '300000', 10)
-const AUTH_ALREADY_MS = parseInt(process.env.AUTH_ALREADY_MS || '60000', 10)
-const AUTH_MAX_THROTTLED = Math.max(1, parseInt(process.env.AUTH_MAX_THROTTLED_RETRIES || '2', 10))
+const AUTH_REPLY_WINDOW_MS = readDelayMs(process.env.AUTH_REPLY_WINDOW_MS, 30000)
+const AUTH_THROTTLE_MS = readDelayMs(process.env.AUTH_RETRY_MS, 300000)
+const AUTH_ALREADY_MS = readDelayMs(process.env.AUTH_ALREADY_MS, 60000)
+const AUTH_MAX_THROTTLED = readInt(process.env.AUTH_MAX_THROTTLED_RETRIES, 2, 1, 10)
 // id -> { sentAt, kind, failure }. Survives reconnects on purpose: the failure is
 // a property of the credentials, not of this one connection, so reconnecting
 // must not talk the bot back into retrying them.
@@ -102,7 +102,7 @@ function planAuthAction(id, message, now = Date.now()) {
     const verdict = classifyAuthReply(message)
     if (verdict) {
       const next = nextAuthFailure(failure, verdict, now, {
-        throttleMs: settings.get('AUTH_RETRY_MS'), alreadyMs: settings.get('AUTH_ALREADY_MS'), maxThrottled: settings.get('AUTH_MAX_THROTTLED_RETRIES')
+        throttleMs: AUTH_THROTTLE_MS, alreadyMs: AUTH_ALREADY_MS, maxThrottled: AUTH_MAX_THROTTLED
       })
       // Clear sentAt so the same reply cannot be counted twice.
       authState.set(id, { ...state, failure: next, sentAt: 0 })
@@ -128,12 +128,12 @@ function planAuthAction(id, message, now = Date.now()) {
 }
 
 const BOT_NAMES = (process.env.BOT_NAMES || '').split(',').map(n => n.trim()).filter(Boolean)
-const CONNECT_DELAY_MS = parseInt(process.env.CONNECT_DELAY_MS || '39500', 10)
-const CONNECT_DELAY_RANDOM_MS = parseInt(process.env.CONNECT_DELAY_RANDOM_MS || '0', 10)
+const CONNECT_DELAY_MS = readDelayMs(process.env.CONNECT_DELAY_MS, 39500)
+const CONNECT_DELAY_RANDOM_MS = readDelayMs(process.env.CONNECT_DELAY_RANDOM_MS, 0)
 const ALL_SLOW_DELAY_MS = readDelayMs(process.env.ALL_SLOW_DELAY_MS, 15000)
 const RANDOMIZE_BOT_ORDER = !/^(0|false|no|off)$/i.test((process.env.RANDOMIZE_BOT_ORDER || '').trim())
-const MAX_RECONNECT = parseInt(process.env.MAX_RECONNECT || '17', 10)
-const GUI_SLOT = parseInt(process.env.GUI_SLOT || '11', 10)
+const MAX_RECONNECT = readInt(process.env.MAX_RECONNECT, 17, 1, 100)
+const GUI_SLOT = readInt(process.env.GUI_SLOT, 11, 1, 200)
 const WARP_AFK = process.env.WARP_COMMAND || '/warp afk'
 const WARP_BEFORE_CRATE = (process.env.WARP_BEFORE_CRATE ?? process.env.WARPORNOT ?? 'true').toLowerCase() !== 'false'
 const SERVER_COMMAND = (process.env.SERVER_COMMAND ?? '').trim()
@@ -141,9 +141,9 @@ const TPA_MAIN_PLAYER = (process.env.TPA_MAIN_PLAYER || process.env.TPA_TARGET_P
 const TPA_TRUSTED_BOTS = parseNameList(process.env.TPA_TRUSTED_BOTS || BOT_NAMES.join(','))
 const TPA_AUTO_DEFAULT = /^(1|true|yes|on)$/i.test(process.env.TPA_AUTO_DEFAULT || 'false')
 const DUMP_HOME_COMMAND = (process.env.DUMP_HOME_COMMAND || '/home stash').trim()
-const DUMP_MIN_TPA_GAP_MS = Math.max(180000, parseInt(process.env.DUMP_MIN_TPA_GAP_MS || '180000', 10))
-const DUMP_HIDDEN_MIN_MS = Math.max(60000, parseInt(process.env.DUMP_HIDDEN_MIN_MS || '480000', 10))
-const DUMP_HIDDEN_MAX_MS = Math.max(DUMP_HIDDEN_MIN_MS, parseInt(process.env.DUMP_HIDDEN_MAX_MS || '720000', 10))
+const DUMP_MIN_TPA_GAP_MS = Math.max(180000, readDelayMs(process.env.DUMP_MIN_TPA_GAP_MS, 180000))
+const DUMP_HIDDEN_MIN_MS = Math.max(60000, readDelayMs(process.env.DUMP_HIDDEN_MIN_MS, 480000))
+const DUMP_HIDDEN_MAX_MS = Math.max(DUMP_HIDDEN_MIN_MS, readDelayMs(process.env.DUMP_HIDDEN_MAX_MS, 720000))
 // /dump + /dump-spawners tuning. Every value has the long-standing default, so
 // an existing .env needs no changes; invalid values fall back instead of
 // producing NaN timers.
@@ -223,6 +223,15 @@ function releaseExpiredBans () {
     const expiresAt = Number(row.banExpiresAt) || 0
     // No expiry means permanent — that one is never released automatically.
     if (!expiresAt || Date.now() < expiresAt) return
+    // Don't force-reconnect a bot that was manually disconnected — it will
+    // reconnect on its own if/when the operator runs /reconnect.
+    if (bots[id]?.manualDisconnect) {
+      dataStore.upsertBot(dataState, { bot: id, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 })
+      persistData()
+      logFor(id, `{green-fg}✓ ${sanitize(id)}'s ban has expired (was manually disconnected).{/green-fg}`)
+      notifyBotsChanged()
+      return
+    }
     dataStore.upsertBot(dataState, { bot: id, banned: false, bannedAt: null, banKind: null, banReason: null, banExpiresAt: 0 })
     persistData()
     logFor(id, `{green-fg}✓ ${sanitize(id)}'s ban has expired — reconnecting.{/green-fg}`)
@@ -247,8 +256,8 @@ function botLocation (bot) {
 // the right server. Chat lines can be prefixed with odd unicode just before the
 // "<name>: message" part — detectPlayerChat strips non-ASCII before matching.
 const CHAT_WATCHDOG_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CHAT_WATCHDOG_ENABLED ?? 'true')
-const CHAT_WATCHDOG_TIMEOUT_MS = parseInt(process.env.CHAT_WATCHDOG_TIMEOUT_MS || '600000', 10)
-const CHAT_WATCHDOG_CHECK_MS = parseInt(process.env.CHAT_WATCHDOG_CHECK_MS || '60000', 10)
+const CHAT_WATCHDOG_TIMEOUT_MS = readDelayMs(process.env.CHAT_WATCHDOG_TIMEOUT_MS, 600000)
+const CHAT_WATCHDOG_CHECK_MS = readDelayMs(process.env.CHAT_WATCHDOG_CHECK_MS, 60000)
 const CHAT_WATCHDOG_COMMAND = (process.env.CHAT_WATCHDOG_COMMAND ?? '').trim()
 const CLICK_COMPASS_ENABLED = /^(1|true|yes|on)$/i.test(process.env.CLICK_COMPASS || '')
 
@@ -260,12 +269,12 @@ const WEB_GUI = /^(1|true|yes|on)$/i.test(process.env.WEB_GUI ?? 'true')
 const TUI_GUI = process.env.TUI_GUI === undefined
 ? Boolean(process.stdout.isTTY)
 : /^(1|true|yes|on)$/i.test(process.env.TUI_GUI)
-const WEB_PORT = parseInt(process.env.WEB_PORT || '80', 10) // if taken (or EACCES), 81, 82, … are tried
+const WEB_PORT = readInt(process.env.WEB_PORT, 80, 1, 65535)
 const WEB_BIND = process.env.WEB_BIND || '0.0.0.0'
-const WEB_PORT_MAX_ATTEMPTS = parseInt(process.env.WEB_PORT_MAX_ATTEMPTS || '20', 10)
+const WEB_PORT_MAX_ATTEMPTS = readInt(process.env.WEB_PORT_MAX_ATTEMPTS, 20, 1, 100)
 const WEB_PASSWORD = process.env.WEB_PASSWORD || null // null → random password generated + printed at startup
-const WEB_SESSION_HOURS = parseFloat(process.env.WEB_SESSION_HOURS || '12')
-const WEB_LOGIN_MAX_FAILS = parseInt(process.env.WEB_LOGIN_MAX_FAILS || '10', 10)
+const WEB_SESSION_HOURS = readNumber(process.env.WEB_SESSION_HOURS, 12, 0.1, 168)
+const WEB_LOGIN_MAX_FAILS = readInt(process.env.WEB_LOGIN_MAX_FAILS, 10, 1, 100)
 const WEB_TERMINAL_LOG = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_LOG ?? 'true')
 const WEB_TERMINAL_ENABLED = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_ENABLED || 'false')
 
@@ -278,8 +287,8 @@ const WEB_TERMINAL_ENABLED = /^(1|true|yes|on)$/i.test(process.env.WEB_TERMINAL_
 // connect screen; everything can be edited in the client itself.
 const MC_WEB_ENABLED = /^(1|true|yes|on)$/i.test(process.env.MC_WEB_ENABLED ?? 'true')
 const MC_WEB_CLIENT_URL = process.env.MC_WEB_CLIENT_URL || '' // override for the client page (e.g. https://client.example.com); empty = serve the local build
-const MC_WEB_CLIENT_PORT = parseInt(process.env.MC_WEB_CLIENT_PORT || '8090', 10) // local port serving the client build
-const MC_WEB_CLIENT_PORT_MAX_ATTEMPTS = parseInt(process.env.MC_WEB_CLIENT_PORT_MAX_ATTEMPTS || '10', 10)
+const MC_WEB_CLIENT_PORT = readInt(process.env.MC_WEB_CLIENT_PORT, 8090, 1, 65535)
+const MC_WEB_CLIENT_PORT_MAX_ATTEMPTS = readInt(process.env.MC_WEB_CLIENT_PORT_MAX_ATTEMPTS, 10, 1, 100)
 const MC_WEB_CLIENT_DIR = process.env.MC_WEB_CLIENT_DIR || require('path').join(__dirname, 'web-client', 'dist')
 const MC_WEB_CLIENT_HOST_PORT = process.env.MC_WEB_CLIENT_HOST_PORT || '' // host-side client port when docker maps it (set by run-docker.sh)
 // Non-Docker installs have no baked-in client build (the Dockerfile produces
@@ -322,7 +331,7 @@ const LOG_PRUNE_INTERVAL_MS = readDelayMs(process.env.LOG_PRUNE_INTERVAL_MS, 600
 const DASHBOARD_TITLE = (process.env.DASHBOARD_TITLE || 'AFK Console').trim() || 'AFK Console'
 const WEB_REFRESH_MS = readDelayMs(process.env.WEB_REFRESH_MS, 2000)
 const WINDOW_DEBUG = /^(1|true|yes|on)$/i.test(process.env.WINDOW_DEBUG || '') // true restores full window slot dumps
-const CONFIG_PACKET_LOG_LIMIT = parseInt(process.env.CONFIG_PACKET_LOG_LIMIT || '120', 10) // 0 = unlimited config packet logging
+const CONFIG_PACKET_LOG_LIMIT = readInt(process.env.CONFIG_PACKET_LOG_LIMIT, 120, 0, 100000)
 
 // ── GUI slot selection: fixed slot (default) vs. search-by-item (opt-in) ────
 // GUI_ITEM_SEARCH_TERMS syntax: ";" separates AND-groups, "|" separates OR-alternatives
@@ -344,8 +353,8 @@ return GUI_ITEM_SEARCH_GROUPS.every(group => group.some(term => itemStr.includes
 // ── /crates command config ─────────────────────────────────────────────────
 const WARP_CRATES = process.env.CRATE_COMMAND || '/warp crates'
 const CRATE_SHULKER_BLOCK = process.env.CRATE_SHULKER_BLOCK || 'red_shulker_box'
-const CRATE_SCAN_RADIUS = parseInt(process.env.CRATE_SCAN_RADIUS || '20', 10)
-const CRATE_REACH = parseFloat(process.env.CRATE_REACH || '3.5')
+const CRATE_SCAN_RADIUS = readInt(process.env.CRATE_SCAN_RADIUS, 20, 1, 256)
+const CRATE_REACH = readNumber(process.env.CRATE_REACH, 3.5, 0.5, 10)
 
 // ── /spawners config ───────────────────────────────────────────────────────
 // The bot never moves for this: it scans for spawner blocks already inside its
@@ -353,13 +362,13 @@ const CRATE_REACH = parseFloat(process.env.CRATE_REACH || '3.5')
 // opens, waits, clicks SPAWNER_SLOT_SECOND (53), then moves on to the next
 // spawner until every reachable spawner has been handled.
 const SPAWNER_BLOCK = process.env.SPAWNER_BLOCK || 'spawner'
-const SPAWNER_REACH = parseFloat(process.env.SPAWNER_REACH || '4.5')
-const SPAWNER_MAX_COUNT = parseInt(process.env.SPAWNER_MAX_COUNT || '64', 10)
-const SPAWNER_SLOT_FIRST = parseInt(process.env.SPAWNER_SLOT_FIRST || '13', 10)
-const SPAWNER_SLOT_SECOND = parseInt(process.env.SPAWNER_SLOT_SECOND || '53', 10)
-const SPAWNER_WINDOW_WAIT_MS = parseInt(process.env.SPAWNER_WINDOW_WAIT_MS || '3000', 10)
-const SPAWNER_SLOT_DELAY_MS = parseInt(process.env.SPAWNER_SLOT_DELAY_MS || '1500', 10)
-const SPAWNER_NEXT_DELAY_MS = parseInt(process.env.SPAWNER_NEXT_DELAY_MS || '1500', 10)
+const SPAWNER_REACH = readNumber(process.env.SPAWNER_REACH, 4.5, 0.5, 10)
+const SPAWNER_MAX_COUNT = readInt(process.env.SPAWNER_MAX_COUNT, 64, 1, 1000)
+const SPAWNER_SLOT_FIRST = readInt(process.env.SPAWNER_SLOT_FIRST, 13, 1, 200)
+const SPAWNER_SLOT_SECOND = readInt(process.env.SPAWNER_SLOT_SECOND, 53, 1, 200)
+const SPAWNER_WINDOW_WAIT_MS = readDelayMs(process.env.SPAWNER_WINDOW_WAIT_MS, 3000)
+const SPAWNER_SLOT_DELAY_MS = readDelayMs(process.env.SPAWNER_SLOT_DELAY_MS, 1500)
+const SPAWNER_NEXT_DELAY_MS = readDelayMs(process.env.SPAWNER_NEXT_DELAY_MS, 1500)
 
 // ── Crate color customization ──────────────────────────────────────────────
 const SHULKER_COLORS = [
@@ -390,16 +399,16 @@ const SHARDSHOP_COMMAND = process.env.SHARDSHOP_COMMAND || '/shardshop' // ⚠ v
 // queries preceding it send several commands back-to-back and would otherwise
 // trip the server cooldown.
 const RANK_FIX_COMMAND = process.env.RANK_FIX_COMMAND || '/fix'
-const RANK_COOLDOWN_MS = (() => { const n = parseInt(process.env.RANK_COOLDOWN_MS, 10); return Number.isFinite(n) && n >= 0 ? n : 4500 })()
+const RANK_COOLDOWN_MS = readDelayMs(process.env.RANK_COOLDOWN_MS, 4500)
 const RANK_REPLY_TIMEOUT_MS = 2500
 const RANK_MEMBER_PATTERNS = [
   /you do not have access(?: to the command)?/i,
   /\bno permission\b/i
 ]
 const RANK_COOLDOWN_PATTERN = /you are on cool ?down/i
-const CRATES_ALL_STAGGER_MS = parseInt(process.env.CRATES_ALL_STAGGER_MS || '30000', 10)
-const CRATES_ALL_SHARDSHOP_WAIT_MS = parseInt(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS || '4000', 10)
-const CRATES_ALL_STEP_WAIT_MS = parseInt(process.env.CRATES_ALL_STEP_WAIT_MS || '3000', 10)
+const CRATES_ALL_STAGGER_MS = readDelayMs(process.env.CRATES_ALL_STAGGER_MS, 30000)
+const CRATES_ALL_SHARDSHOP_WAIT_MS = readDelayMs(process.env.CRATES_ALL_SHARDSHOP_WAIT_MS, 4000)
+const CRATES_ALL_STEP_WAIT_MS = readDelayMs(process.env.CRATES_ALL_STEP_WAIT_MS, 3000)
 // What /crates-all does once the crates are done. Defaults reproduce the
 // original behaviour exactly (TPA to TPA_MAIN_PLAYER → dump into nearby chests
 // → /warp afk after 15s), so an existing .env keeps working unchanged:
@@ -417,19 +426,19 @@ const CRATES_ALL_SOLO_USAGE = `/crates-solo [bot name or number] [color] ${CRATE
 // ── /shardshop-loop: keep running /shardshop until the server says there's nothing left ──
 const SHARDSHOP_STOP_PHRASES = (process.env.SHARDSHOP_STOP_PHRASES || 'insufficent fund,not enough,insufficient fund,no more shards,more shards')
 .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-const SHARDSHOP_LOOP_DELAY_MS = parseInt(process.env.SHARDSHOP_LOOP_DELAY_MS || '4200', 10)
-const SHARDSHOP_LOOP_TIMEOUT_MS = parseInt(process.env.SHARDSHOP_LOOP_TIMEOUT_MS || '60000', 10)
-const SHARDSHOP_LOOP_MAX_RUNS = parseInt(process.env.SHARDSHOP_LOOP_MAX_RUNS || '200', 10)
+const SHARDSHOP_LOOP_DELAY_MS = readDelayMs(process.env.SHARDSHOP_LOOP_DELAY_MS, 4200)
+const SHARDSHOP_LOOP_TIMEOUT_MS = readDelayMs(process.env.SHARDSHOP_LOOP_TIMEOUT_MS, 60000)
+const SHARDSHOP_LOOP_MAX_RUNS = readInt(process.env.SHARDSHOP_LOOP_MAX_RUNS, 200, 1, 10000)
 
 // ── Crate click loop (real tail) ────────────────────────────────────────────
 const CRATE_STOP_PHRASES = ['you do not have a', 'error']
-const CRATE_CLICK_DELAY_MS = parseInt(process.env.CRATE_CLICK_DELAY_MS || '900', 10)
-const CRATE_CLICK_TIMEOUT_MS = parseInt(process.env.CRATE_CLICK_TIMEOUT_MS || '60000', 10)
+const CRATE_CLICK_DELAY_MS = readDelayMs(process.env.CRATE_CLICK_DELAY_MS, 900)
+const CRATE_CLICK_TIMEOUT_MS = readDelayMs(process.env.CRATE_CLICK_TIMEOUT_MS, 60000)
 
 // ── Outbound proxy config (original) ────────────────────────────────────────
 const PROXY_HOST = process.env.PROXY_HOST || ''
 const PROXY_ENABLED = Boolean(PROXY_HOST)
-const PROXY_PORT = parseInt(process.env.PROXY_PORT || '1080', 10)
+const PROXY_PORT = readInt(process.env.PROXY_PORT, 1080, 1, 65535)
 const PROXY_TYPE = (process.env.PROXY_TYPE || 'socks5').toLowerCase()
 // Credentials for the GLOBAL proxy. Each PROXY_GROUP_<N>_* carries its own, so
 // two providers on one machine never share a login. _PASSWORD is an accepted
@@ -446,9 +455,9 @@ const PROXY_GROUPS_ENABLED = PROXY_GROUPS.length > 0
 
 // ── Proxy stall watchdog ────────────────────────────────────────────────────
 const PROXY_STALL_ENABLED = PROXY_ENABLED && process.env.PROXY_STALL_WATCHDOG !== '0'
-const PROXY_STALL_TIMEOUT_MS = parseInt(process.env.PROXY_STALL_TIMEOUT_MS || '90000', 10)
-const PROXY_STALL_CHECK_MS = parseInt(process.env.PROXY_STALL_CHECK_MS || '20000', 10)
-const PROXY_STALL_RATIO = parseFloat(process.env.PROXY_STALL_RATIO || '0.5')
+const PROXY_STALL_TIMEOUT_MS = readDelayMs(process.env.PROXY_STALL_TIMEOUT_MS, 90000)
+const PROXY_STALL_CHECK_MS = readDelayMs(process.env.PROXY_STALL_CHECK_MS, 20000)
+const PROXY_STALL_RATIO = readNumber(process.env.PROXY_STALL_RATIO, 0.5, 0, 1)
 const PROXY_IS_LOCAL = /^(127\.0\.0\.1|localhost|::1)$/i.test(PROXY_HOST)
 // Only a local SOCKS proxy can be restarted from here, and the command to do it
 // differs per platform: Homebrew on macOS, systemd on Linux. It used to assume
@@ -460,7 +469,7 @@ const PROXY_RESTART_CMD = process.env.PROXY_RESTART_CMD || (PROXY_IS_LOCAL
 : process.platform === 'linux' ? 'systemctl restart tor 2>/dev/null || sudo systemctl restart tor'
 : '')
 : '')
-const PROXY_RESTART_COOLDOWN_MS = parseInt(process.env.PROXY_RESTART_COOLDOWN_MS || '120000', 10)
+const PROXY_RESTART_COOLDOWN_MS = readDelayMs(process.env.PROXY_RESTART_COOLDOWN_MS, 120000)
 let lastProxyRestart = 0
 
 // ── Velocity / BungeeCord proxy crash detection ───────────────────────────────
@@ -805,7 +814,7 @@ const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRec
 const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
 
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -2008,11 +2017,20 @@ if (Date.now() > exp - SESSION_MS / 2) sessions.set(token, Date.now() + SESSION_
 return true
 }
 function parseCookies(req) {
-const out = {}
-const raw = req.headers.cookie
-if (!raw) return out
-raw.split(';').forEach(p => { const i = p.indexOf('='); if (i > 0) out[p.slice(0, i).trim()] = p.slice(i + 1).trim() })
-return out
+  const out = {}
+  const raw = req.headers.cookie
+  if (!raw) return out
+  raw.split(';').forEach(p => {
+    const i = p.indexOf('=')
+    // Reject empty-value pairs (e.g. "sid=") rather than silently dropping
+    // them: a present-but-empty cookie is a malformed request, not a missing
+    // one, and the caller should see that.
+    if (i <= 0) return
+    const k = p.slice(0, i).trim()
+    if (!k) return
+    out[k] = p.slice(i + 1).trim()
+  })
+  return out
 }
 function tokenFromReq(req, url) {
 return parseCookies(req).sid || (url && url.searchParams.get('token')) || null
@@ -2704,7 +2722,13 @@ const attempt = bots[id]?.reconnectAttempts || 0
 
 // Check max reconnect limit (only for non-proxy-crash disconnects; proxy crashes reset the count)
 if (!proxyCrash && attempt >= MAX_RECONNECT) {
-if (bots[id]) bots[id].reconnectTimer = null
+if (bots[id]) {
+  bots[id].reconnectTimer = null
+  // Clear the counter so we don't spam "reached max reconnects" on every
+  // subsequent disconnect/error event. The bot is effectively dead until
+  // someone runs /reconnect manually.
+  bots[id].reconnectAttempts = 0
+}
 e(`${id} reached max reconnects (${MAX_RECONNECT}). Disconnected permanently. Use /reconnect to try again.`)
 monitoring?.onReconnectExhausted(id, MAX_RECONNECT)
 return
@@ -3344,6 +3368,7 @@ const COMMANDS = {
 '/closeBot': 'Disconnect the active bot and completely remove it from the UI',
 '/clear': 'Clear the active bot\'s log view',
 '/help': 'List all available commands',
+'/repeat [n|duration] <cmd>': 'Re-run the last command n times (default 1, max 50), or for a duration (e.g. /repeat 30s /spawners, /repeat 2m /dump) until that much time has elapsed. With no command given, repeats the previous command from history. /all-slow is not affected — it is a separate command with its own staggered dispatch.',
 '/status': 'Show active bot\'s connection, position, health, ping, uptime',
 '/inv': 'List active bot\'s inventory',
 '/tpauto on|off': 'Toggle automatic /tpaccept for trusted bot names only',
@@ -3837,6 +3862,17 @@ return true
 
 case '/reconnect': {
 const { host, port, version } = entry
+// Don't reconnect into an active ban — the ban sweep will handle it when it
+// expires, and repeated logins during a ban look like evasion.
+const ban = activeBan(id)
+if (ban) {
+  if (ban.permanent) {
+    logFor(id, `{red-fg}✗ ${id} is permanently banned (${ban.kind}) — cannot reconnect. Remove it from BOT_NAMES, or run /closeBot ${id}.{/red-fg}`)
+  } else {
+    logFor(id, `{yellow-fg}⚠ ${id} is banned (${ban.kind}) — held off until ${new Date(ban.expiresAt).toLocaleString()}.{/yellow-fg}`)
+  }
+  return true
+}
 logFor(id, `{yellow-fg}⚠ Reconnecting ${id}…{/yellow-fg}`)
 try { entry.disconnectManually() } catch (_) {}
 setTimeout(() => createBotInstance(id, host, port, version), 1000)
@@ -4547,15 +4583,21 @@ const coinflipLastRun = new Map() // bot -> the finished session, for the bot ca
 
 
 // ── AI Chat configuration ───────────────────────────────────────────────────
+// The interval and word limit live in ai-chat.js alongside the loop that uses
+// them, so bot.js just reads them back instead of re-defining constants that
+// can silently drift apart. AI_CHAT_MODEL is registered with the settings
+// registry so the .ENV tab can set it and specFor() knows its type.
 const AI_CHAT_ENABLED = true  // Enable AI chat by default
 const AI_CHAT_INTERVAL_MIN_MS = parseInt(process.env.AI_CHAT_INTERVAL_MIN_MS || '40000', 10) // 40 seconds
 const AI_CHAT_INTERVAL_MAX_MS = parseInt(process.env.AI_CHAT_INTERVAL_MAX_MS || '150000', 10) // 150 seconds
 const AI_CHAT_WORD_LIMIT = parseInt(process.env.AI_CHAT_WORD_LIMIT || '15', 10)
+cfDefine('AI_CHAT_MODEL', { type: 'string', def: 'auto', group: 'AI chat', desc: 'FreeLLM model to use for /ai-chat (empty = the API picks)' })
 
 // ── AI Chat state ────────────────────────────────────────────────────────────
-const aiChatSessions = new Map() // bot -> active AI chat session
-const aiChatModelsCache = { models: [], lastFetched: 0 } // Cache for available models
-const AI_CHAT_MODELS_CACHE_TTL_MS = 3600000 // Cache for 1 hour
+// bot -> { stop, lastMessage, lastError, failures }. `stop` is the signal the
+// loop checks between turns; the entry is removed on stop so a stopped bot
+// cannot be left running, and so the loop's own promise rejection cleans up.
+const aiChatSessions = new Map()
 
 // ── AI Chat functions ─────────────────────────────────────────────────────────
 function startAIChatForBot(id) {
@@ -4565,63 +4607,70 @@ function startAIChatForBot(id) {
     logFor(id, '{yellow-fg}⚠ AI chat requires the bot to be spawned.{/yellow-fg}')
     return false
   }
-  
+
   if (aiChatSessions.has(id)) {
     logFor(id, '{yellow-fg}⚠ AI chat is already running for this bot.{/yellow-fg}')
     return false
   }
-  
-  aiChatSessions.set(id, true)
 
   // Get the bot's actual name from BOT_NAMES
   const botIndex = BOT_NAMES.indexOf(id)
   const botName = botIndex >= 0 ? BOT_NAMES[botIndex] : id
-  
-  // Start the loop
-  const loop = async () => {
-    while (aiChatSessions.has(id)) {
-      try {
-        // Get latest player chat if available
-        const latestChat = entry.lastPlayerChat || ''
-        const message = await callFreeLLMChat(latestChat, botName)
-        if (message && entry.bot?.entity) {
-          const words = message.split(/\s+/).filter(Boolean);
-          const limited = words.slice(0, 8).join(' ');
-          logFor(id, `{cyan-fg}AI → ${limited}{/cyan-fg}`)
-          entry.bot.chat(limited)
-        }
-      } catch (err) {
-        // Log different error types with appropriate messages
-        if (err.message?.includes('404') || err.message?.includes('Not Found')) {
-          logFor(id, `{yellow-fg}⚠ AI chat endpoint not found (404) — check FREE_LLM_BASE_URL in .env{/yellow-fg}`)
-          logFor(id, `{gray-fg}⚠ Falling back to random Minecraft messages{/gray-fg}`)
-        } else if (err.message?.includes('ECONNREFUSED') || err.message?.includes('connection refused')) {
-          logFor(id, `{yellow-fg}⚠ AI chat server unreachable — check FREE_LLM_BASE_URL{/yellow-fg}`)
-          logFor(id, `{gray-fg}⚠ Falling back to random Minecraft messages{/gray-fg}`)
-        } else {
-          logFor(id, `{red-fg}✗ AI chat error: ${sanitize(err.message)}{/red-fg}`)
-        }
-      }
 
-      // Wait random interval between 40-150 seconds
-      const delay = Math.floor(Math.random() * (AI_CHAT_INTERVAL_MAX_MS - AI_CHAT_INTERVAL_MIN_MS)) + AI_CHAT_INTERVAL_MIN_MS
-      await new Promise(resolve => setTimeout(resolve, delay))
-    }
+  const state = { stop: false, lastMessage: null, lastError: null, failures: 0 }
+  aiChatSessions.set(id, state)
+
+  const send = (message) => {
+    if (!message || !entry.bot?.entity) return
+    const words = message.split(/\s+/).filter(Boolean)
+    const limited = words.slice(0, AI_CHAT_WORD_LIMIT).join(' ')
+    state.lastMessage = limited
+    logFor(id, `{cyan-fg}AI → ${limited}{/cyan-fg}`)
+    entry.bot.chat(limited)
   }
-  
-  loop().catch(err => {
-    logFor(id, `{red-fg}✗ AI chat loop failed: ${sanitize(err.message)}{/red-fg}`)
-    aiChatSessions.delete(id)
-  })
 
+  // Delegate the wait-and-repeat cadence to ai-chat.js, which owns the
+  // interval constants. The loop calls `send` for each turn and `state` for
+  // the stop signal, and `aiChatTurnFailed` on every failed turn so a dead
+  // LLM is reported out loud instead of being swallowed.
+  autoAIChatLoop(entry.bot, send, botName, state, err => aiChatTurnFailed(id, err))
+    .then(() => {
+      // The loop exited on its own (stop signal) — clean up.
+      aiChatSessions.delete(id)
+    })
+    .catch(err => {
+      aiChatSessions.delete(id)
+      logFor(id, `{red-fg}✗ AI chat loop failed: ${sanitize(err.message)}{/red-fg}`)
+    })
+
+  logFor(id, '{green-fg}✓ AI chat started{/green-fg}')
   return true
 }
 
 function stopAIChatForBot(id) {
-  if (!aiChatSessions.has(id)) return false
+  const state = aiChatSessions.get(id)
+  if (!state) return false
+  // Signal the loop, then drop the entry so a retry cannot restart it.
+  state.stop = true
   aiChatSessions.delete(id)
   logFor(id, '{yellow-fg}⚠ AI chat stopped.{/yellow-fg}')
   return true
+}
+
+// How the loop reports a failed turn. The loop keeps going after a failure
+// (a dead LLM is not a reason to stop the bot), but it says so out loud every
+// time so the operator can see the LLM is down without digging through logs.
+function aiChatTurnFailed(id, err) {
+  const state = aiChatSessions.get(id)
+  if (state) state.failures++
+  const msg = String(err && err.message ? err.message : err)
+  if (/404|not found/i.test(msg)) {
+    logFor(id, `{yellow-fg}⚠ AI chat endpoint not found (404) — check FREE_LLM_BASE_URL in .env{/yellow-fg}`)
+  } else if (/ECONNREFUSED|connection refused|unreachable|ENOTFOUND|network/i.test(msg)) {
+    logFor(id, `{yellow-fg}⚠ AI chat server unreachable — check FREE_LLM_BASE_URL{/yellow-fg}`)
+  } else {
+    logFor(id, `{red-fg}✗ AI chat error: ${sanitize(msg)}{/red-fg}`)
+  }
 }
 
 // ── /ai-chat command ─────────────────────────────────────────────────────────
@@ -4747,7 +4796,12 @@ function persistCoinflipSummary () {
     fs.mkdirSync(path.dirname(COINFLIP_SUMMARY_FILE), { recursive: true })
     fs.writeFileSync(COINFLIP_SUMMARY_FILE, JSON.stringify(summary, null, 2))
     persistCoinflipDeepReport()
-  } catch (_) {}
+  } catch (err) {
+    // A single fs error silently drops both coinflip-stats.json and
+    // coinflip-deep.json, leaving the dashboard on stale data with no
+    // indication. Log it so the operator sees the write failed.
+    logFor(SYSTEM_ID, `{red-fg}✗ Could not persist coinflip summary: ${sanitize(err.message)}{/red-fg}`)
+  }
 }
 
 // ── Deep dissection report ───────────────────────────────────────────────────
@@ -4888,23 +4942,14 @@ async function runCoinflipAcrossBots (ids, opts) {
 // MAX_CONCURRENT bots are active at once. When one finishes, another random
 // bot is selected from the queue automatically. This prevents server
 // rate-limiting from a burst of simultaneous creates while keeping the fleet
-// busy. Uses Fisher-Yates shuffle for random selection.
-function shuffleArray (arr) {
-  const a = arr.slice()
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    ;[a[i], a[j]] = [a[j], a[i]]
-  }
-  return a
-}
-
+// busy. Uses Fisher-Yates shuffle for random selection (via bot-controls.shuffledCopy).
 async function runCoinflipAll (ids, opts) {
   const maxConcurrent = Math.max(1, Math.min(opts.maxConcurrent || 5, ids.length))
   const flipsPerBot = opts.flips || settings.get('COINFLIP_DEFAULT_FLIPS')
   const totalFlips = flipsPerBot * ids.length
-  
+
   coinflipAllPool.active.clear()
-  coinflipAllPool.queue = shuffleArray(ids)
+  coinflipAllPool.queue = shuffledCopy(ids)
   coinflipAllPool.completed = 0
   coinflipAllPool.total = totalFlips
   coinflipAllPool.running = true
@@ -4931,14 +4976,19 @@ async function runCoinflipAll (ids, opts) {
         // Run the session asynchronously; when done, remove from pool and pump again
         runCoinflipForBot(botId, { flips: flipsPerBot, wagerSpec: opts.wagerSpec }).finally(() => {
           coinflipAllPool.active.delete(botId)
-          coinflipAllPool.completed += flipsPerBot
+          // Count what actually ran, not what was planned: a session that stopped
+          // early (stop-loss, disconnect, despawn) must not inflate "completed".
+          coinflipAllPool.completed += session.flips
           notifyBotsChanged()
           pump() // refill the pool
         })
       }
-      
-      // Check if done
-      if (coinflipAllPool.active.size === 0 && coinflipAllPool.queue.length === 0) {
+
+      // Done means no more to launch AND nothing still running. A stop request
+      // alone is not enough — if the queue still has bots and every active session
+      // has finished, the pump would otherwise leave running=true forever and
+      // refuse a second run as "already running".
+      if (coinflipAllPool.active.size === 0 && (coinflipAllPool.queue.length === 0 || coinflipAllPool.stopRequested)) {
         coinflipAllPool.running = false
         logFor(SYSTEM_ID, `{green-fg}✓ /bot-coinflip-all finished: ${coinflipAllPool.completed} flips completed across ${ids.length} bot(s).{/green-fg}`)
         resolve({ completed: coinflipAllPool.completed, total: coinflipAllPool.total })
@@ -4993,7 +5043,11 @@ function persistTimeseriesSnapshot () {
     const snapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS') })
     fs.mkdirSync(path.dirname(TIMESERIES_SUMMARY_FILE), { recursive: true })
     fs.writeFileSync(TIMESERIES_SUMMARY_FILE, JSON.stringify(snapshot, null, 2))
-  } catch (_) {}
+  } catch (err) {
+    // Same deal as the coinflip summary: a silent fs error leaves the dashboard
+    // on stale data with no indication the write failed.
+    logFor(SYSTEM_ID, `{red-fg}✗ Could not persist time-series summary: ${sanitize(err.message)}{/red-fg}`)
+  }
 }
 
 async function sampleTimeseriesNow (opts = {}) {
@@ -5089,6 +5143,8 @@ function buildAnalyticsReport (opts = {}) {
     suspicionP: settings.get('COINFLIP_SUSPICION_P')
   })
   const tsSnapshot = timeseriesStore.snapshot({ bucketMs: settings.get('ANALYTICS_BUCKET_MS'), bot: opts.bot || null })
+  // buildReport renders the deep and timeseries tabs to HTML for the client to
+  // fetch on demand, so the first page paint only carries the coinflip tab.
   return analytics.buildReport({
     coinflip: coinflipSummary,
     timeseries: tsSnapshot,
@@ -5208,6 +5264,10 @@ function startAnalyticsServer () {
     }
   })
   analyticsServer.on('error', (err) => {
+    // A taken port is not fatal — the dashboard still runs — but the analytics
+    // page is gone, so drop the handle rather than leaving a server object that
+    // isn't listening (which makes listeningPort() return null forever).
+    analyticsServer = null
     logFor(SYSTEM_ID, `{yellow-fg}⚠ Analytics server could not listen on ${preferred}: ${sanitize(err.message)} — change ANALYTICS_PORT in the .ENV tab.{/yellow-fg}`)
   })
   analyticsServer.listen(preferred, WEB_BIND, () => {
@@ -5377,7 +5437,11 @@ async function compileAndPushData (log = () => {}, onlyIds = null) {
       trackedSpawners: Object.values(dataState.spawners).filter(row => row.bot === name).length,
       // Survivors of a ban keep banned:true in the data state, so a bot that is
       // back online must publish an explicit false rather than a blank cell.
-      banned: Boolean(dataState.bots[name]?.banned)
+      banned: Boolean(dataState.bots[name]?.banned),
+      // When a ban expires or is cleared, wipe the stale fields so the persisted
+      // row and published sheet aren't self-contradictory (banned:false but
+      // banKind/banExpiresAt still present).
+      ...(Boolean(dataState.bots[name]?.banned) ? {} : { banKind: null, banReason: null, banExpiresAt: 0, banDuration: null, banCaseId: null })
     })
     recordTimeseriesSample(name, { shards, coins, balance: money, rank: rank || undefined }, 'data')
   }
@@ -5562,6 +5626,90 @@ const logError = (msg) => logFor(activeId || SYSTEM_ID, `{red-fg}✗ ${msg}{/red
 // Echo the run command so the log is self-documenting (the web console needs it)
 if (!options.isChained) {
 log(`{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
+}
+
+// ── /repeat [n|duration] <command> ─────────────────────────────────────────
+// Re-runs the last command sent to this bot n times (default 1), or — when the
+// first token is a duration — keeps running it until that much wall-clock time
+// has elapsed. It is a thin wrapper over handleSingleCommand itself, so the
+// repeated command goes through the exact same routing, echo and chaining
+// rules as a typed command would. `all-slow` does NOT repeat this — it is a
+// different command with its own staggered dispatch, so /repeat is not
+// re-dispatched through the slow-broadcast engine (which would re-trigger
+// /all-slow forever). The first token is only ever treated as a count or
+// duration when it is a bare number/duration AND a command follows it, so a
+// command that starts with a digit (e.g. /repeat /coinflip create 500000) is
+// never mistaken for a count.
+const repeatMatch = trimmed.match(/^\/repeat(?:\s+([\s\S]*))?$/)
+if (repeatMatch) {
+const rest = (repeatMatch[1] || '').trim()
+const last = commandHistory[commandHistory.length - 1]
+
+// Split off an optional leading count/duration token. It is only ever a
+// count or duration when it is a bare number/duration AND a command follows
+// it, so a command that starts with a digit (e.g. /repeat /coinflip create
+// 500000) is never mistaken for a count.
+let count = 1
+let durationMs = null
+let command = rest || last
+if (!command) { logWarn('Nothing to repeat — send a command first.'); return }
+
+const splitAt = rest.search(/\s/)
+if (splitAt > 0) {
+const firstToken = rest.slice(0, splitAt)
+const body = rest.slice(splitAt + 1).trim()
+if (/^\d+$/.test(firstToken)) {
+count = parseInt(firstToken, 10)
+if (count < 1) { logWarn('Usage: /repeat [n] <command> — n must be a positive whole number.'); return }
+if (count > 50) { logWarn(`/repeat capped at 50 runs (you asked for ${count}).`); count = 50 }
+command = body || last
+} else {
+const parsed = parseSleepDuration(firstToken)
+if (parsed !== null && parsed > 0 && body) {
+durationMs = parsed
+command = body
+}
+// else: not a count/duration — the whole rest is the command.
+}
+} else if (splitAt === -1 && rest) {
+// Bare token, no command after it. A bare integer is a count (repeat the
+// last command that many times); anything else is the command itself.
+if (/^\d+$/.test(rest)) {
+count = parseInt(rest, 10)
+if (count < 1) { logWarn('Usage: /repeat [n] <command> — n must be a positive whole number.'); return }
+if (count > 50) { logWarn(`/repeat capped at 50 runs (you asked for ${count}).`); count = 50 }
+command = last
+} else {
+const parsed = parseSleepDuration(rest)
+if (parsed !== null && parsed > 0) {
+logWarn('Usage: /repeat [duration] <command> — a duration needs a command after it.')
+return
+}
+command = rest
+}
+}
+
+if (durationMs !== null) {
+const deadline = Date.now() + durationMs
+let runs = 0
+logInfo(`Repeating for ${fmtDuration(durationMs)}: ${sanitize(command)}`)
+const tick = () => {
+if (Date.now() >= deadline) { logSuccess(`✓ /repeat finished after ${runs} run(s).`); return }
+runs++
+log(`{gray-fg}… run ${runs}{/gray-fg}`)
+handleSingleCommand(command, ctx, { isChained: true })
+if (Date.now() >= deadline) { logSuccess(`✓ /repeat finished after ${runs} run(s).`); return }
+setTimeout(tick, 0)
+}
+tick()
+} else {
+logInfo(`Repeating ${count} time(s): ${sanitize(command)}`)
+for (let i = 0; i < count; i++) {
+if (i > 0) log(`{gray-fg}… run ${i + 1}/${count}{/gray-fg}`)
+handleSingleCommand(command, ctx, { isChained: true })
+}
+}
+return
 }
 
 // ── /find ───────────────────────────────────
@@ -6018,9 +6166,10 @@ if (!targetId || !Object.hasOwn(bots, targetId)) {
 logWarn(/^\d+$/.test(arg) ? `No bot at index [${arg}]. Valid: 1–${names.length}` : `No bot named "${sanitize(arg)}".`)
 return
 }
-// A browser owns its selection; do not change the TUI or another tab.
+// Always update the global activeId so /all and cron see the change.
+// Additionally call ctx.selectBot for the web GUI's per-tab context.
+switchTo(targetId)
 if (ctx && typeof ctx.selectBot === 'function') ctx.selectBot(targetId)
-else switchTo(targetId)
 return { selectedId: targetId }
 }
 
@@ -6431,6 +6580,17 @@ if (aiChatMatch) {
       return
     }
     stopAIChatForBot(targetBot)
+  } else if (sub === 'status') {
+    const targetBot = botArg || ctxId || currentActiveId()
+    const state = aiChatSessions.get(targetBot)
+    if (!state) {
+      logInfo(`AI chat for ${sanitize(targetBot || 'current bot')}: {yellow-fg}not running{/yellow-fg}`)
+      return
+    }
+    const running = '{green-fg}running{/green-fg}'
+    const failures = state.failures
+    const last = state.lastMessage ? ` · last said: ${sanitize(state.lastMessage)}` : ''
+    logInfo(`AI chat for ${sanitize(targetBot || 'current bot')}: ${running}${last}${failures ? ` · {yellow-fg}${failures} failed turn(s){/yellow-fg}` : ''}`)
   } else if (sub === 'models') {
     // Query available models from FreeLLM API
     (async () => {
@@ -6463,12 +6623,6 @@ if (aiChatMatch) {
     }
     settings.set('AI_CHAT_MODEL', modelArg);
     logSuccess(`AI chat model set to: ${modelArg}`);
-  } else if (sub === 'status') {
-    const targetBot = botArg || ctxId || currentActiveId()
-    const status = aiChatSessions.has(targetBot)
-      ? '{green-fg}running{/green-fg}'
-      : '{yellow-fg}not running{/yellow-fg}'
-    logInfo(`AI chat status for ${sanitize(targetBot || 'current bot')}: ${status}`)
   } else {
     logWarn(`Unknown /ai-chat subcommand "${sub}" — try: start, stop, status, models, model-set`)
   }
