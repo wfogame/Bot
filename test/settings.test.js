@@ -21,6 +21,33 @@ test('a registered setting falls back to its default, then to the environment, t
   delete process.env.TEST_SETTING_MS
 })
 
+test('a mistyped case lands on the registered key instead of an inert shadow', () => {
+  settings.define('TEST_CASE_SETTING', { type: 'int', def: 1, group: 'Test' })
+  const result = settings.set('test_case_setting', '7')
+  assert.equal(result.ok, true)
+  assert.equal(result.key, 'TEST_CASE_SETTING', 'the canonical name wins')
+  assert.equal(settings.get('TEST_CASE_SETTING'), 7)
+  assert.equal(settings.get('TeSt_CaSe_SeTtInG'), 7)
+  assert.equal(settings.reset('test_case_setting').ok, true)
+  assert.equal(settings.get('TEST_CASE_SETTING'), 1)
+})
+
+test('a wrong name is recognizable as wrong and suggests the real one', () => {
+  settings.define('SOME_LONG_SETTING_NAME', { type: 'string', def: 'x', group: 'Test' })
+  assert.equal(settings.isKnownKey('SOME_LONG_SETTING_NAME'), true)
+  assert.equal(settings.isKnownKey('some_long_setting_name'), true, 'case-insensitive')
+  assert.equal(settings.isKnownKey('SOME_LONG_SETTING_NAM'), false)
+  const suggestions = settings.suggestKeys('SOME_LONG_SETTING_NAM')
+  assert.equal(suggestions[0], 'SOME_LONG_SETTING_NAME', 'the closest real key is offered')
+  // An existing environment key counts as known — it is settable on purpose.
+  process.env.TEST_ENV_ONLY_KEY = '1'
+  try {
+    assert.equal(settings.isKnownKey('TEST_ENV_ONLY_KEY'), true)
+  } finally {
+    delete process.env.TEST_ENV_ONLY_KEY
+  }
+})
+
 test('durations parse with units and plain integers are still integers', () => {
   assert.equal(settings.coerce('ms', '1500ms'), 1500)
   assert.equal(settings.coerce('ms', '90s'), 90000)

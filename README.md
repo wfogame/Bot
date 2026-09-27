@@ -541,6 +541,47 @@ delay interval (15 seconds by default). For example:
   with a warning; `/exit` cancels pending dispatches. Normal `/all` stays immediate.
 - The scheduler holds only one pending timeout, rather than one timeout per bot.
 
+### `ALL_CHAT_GUARD` — the broadcast chat guard
+
+A mistyped broadcast must never reach public chat: `/all .server lifesteal`
+(meant as `/all /server lifesteal`) would make **every** bot say the same typo
+and expose the fleet instantly. `ALL_CHAT_GUARD` (default `true`) refuses any
+`/all` or `/all-slow` broadcast that is not a `/command`:
+
+```text
+/all .server lifesteal      # blocked — not a /command
+/all /server lifesteal      # fine — a server command
+/all !hello everyone        # fine — "!" forces a deliberate chat broadcast
+```
+
+- The refusal names the intended fix (including the `/`-form when the typo
+  starts with `.`) and how to turn the guard off for a run:
+  `/env set ALL_CHAT_GUARD false`, or `ALL_CHAT_GUARD=false` in `.env`.
+- A leading `!` is stripped and the rest is sent as chat deliberately.
+- Scheduled cron jobs are untouched — a job you typed on purpose is not a typo.
+
+### `/repeat [n|duration] [delay] <command>`
+
+Re-runs a command with **time between the runs** instead of machine-gunning
+it: the first run happens immediately and the rest are spaced `REPEAT_DELAY_MS`
+(default `2000`) apart. An explicit delay token overrides the gap for that run:
+
+```text
+/repeat 5 /spawners          # 5 runs, 2s apart (REPEAT_DELAY_MS)
+/repeat 5 30s /spawners      # 5 runs, 30s apart
+/repeat 30s 2s /spawners     # every 2s until 30s have elapsed
+/repeat 10 hello there       # say "hello there" 10 times, paced
+/repeat 3                    # repeat the previous command 3 times
+/repeat stop                 # cancel the runs still queued
+```
+
+- A bare integer is the count (max 50); a duration (`30s`, `2min`) keeps the
+  command running until that much time has elapsed. Delay tokens use the same
+  units as `sleep` (`30` = 30 s, `5000` = 5000 ms, `500ms`, `2min`).
+- A leading token is only read as a count/duration/delay when the command
+  follows it, so `/repeat /coinflip create 500000` keeps its numeric argument.
+- `/repeat stop` cancels what the current tab/terminal still has scheduled.
+
 ### Random initial connection order
 
 `RANDOMIZE_BOT_ORDER` defaults to `true`. A Fisher-Yates shuffle creates a copy
@@ -602,6 +643,9 @@ check logs before retrying to avoid accidentally executing a command twice.
 | `WARP_COMMAND` | `/warp afk` | Destination after GUI/crate handling |
 | `WARP_BEFORE_CRATE` | `true` | Warp to the crate location before scanning |
 | `CRATE_COMMAND` | `/warp crates` | Command used to reach the crate area |
+| `BOOK_ITEM_QUERY` | `book` | What `/use-book` scans for: a substring of the display, custom or registry name |
+| `BOOK_USE_DELAY_MS` | `200` | Pause between the `/use-book` steps (move, hotbar select, each `/use`) |
+| `BOOK_AUTO` | `false` | Run `/use-book` automatically whenever a GUI opens with a matching item in it; with no match, nothing happens at all |
 | `CRATE_SHULKER_BLOCK` | `red_shulker_box` | Default shulker block target |
 | `CRATE_SCAN_RADIUS` | `20` | Maximum crate scan distance |
 | `CRATE_REACH` | `3.5` | Maximum walking distance from a crate |
@@ -1062,7 +1106,10 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/switch <id>` | Select a bot by name or list number |
 | `/new-bot <name> [host] [port] [version]` | Create a bot at runtime |
 | `/chat <message>` | Send a chat message without local command parsing |
-| `/all <command>` | Run a local command on every bot or broadcast chat |
+| `/all <command>` | Run a local command on every bot or broadcast a server command to all. `ALL_CHAT_GUARD` (on by default) refuses plain chat so a typo cannot make every bot say it — prefix with `!` for deliberate chat (`/all !hello`) |
+| `/repeat [n\|duration] [delay] <cmd>` | Re-run a command with time between the runs (`REPEAT_DELAY_MS`, or an explicit delay like `/repeat 5 30s /spawners`); `/repeat stop` cancels pending runs |
+| `/use-book [name]` | Scan the open GUI (or the inventory) for a book, swap it into hotbar slot 1, select it and run `/use && /use`, every step 200 ms apart. `/use-book auto on\|off` runs it whenever a GUI opens with a book in it — no book, nothing happens |
+| `/copy [name]` | Everything about the held item — the exact name with unicode intact, registry name, type, count, slot, enchants, lore, NBT — printed and copied to the clipboard; `/copy name` copies just the name |
 | `/clear` | Clear the active bot's stored log view |
 | `/disconnect`, `/dc` | Stop the active bot and automatic reconnect |
 | `/reconnect` | Reconnect the active bot |
@@ -1096,7 +1143,8 @@ Any unrecognized input is sent as a Minecraft chat message or command.
 | `/bot-coinflip help` | The same list from the console (a bare `/bot-coinflip` prints it too) |
 | `/timeseries [sample [ranks]\|series <metric> [bucket] [bot]\|events\|clear confirm]` | Shards, coins, balance, rank and ban counts over time - a sparkline, the last buckets, and where the JSON lives |
 | `/analytics` | Where the read-only analytics page and its JSON endpoints are |
-| `/env [list [filter]\|get KEY\|set KEY VALUE\|reset KEY\|reset-all]` | Show or change a configuration value for this run only - never written to `.env` |
+| `/env [list [filter]\|get KEY\|set KEY VALUE\|reset KEY\|reset-all]` | Show or change a configuration value for this run only - never written to `.env`. Keys are matched case-insensitively, and a wrong variable name is refused with a "did you mean …?" instead of being set silently |
+| `/ai-chat [start\|stop\|status\|models\|model-set] [bot]` | AI chat that answers the last 5 chat messages the bot saw — only the message inside the reply's double quotes is sent, verified first. No prerecorded fallback |
 
 Valid crate colors include `white`, `orange`, `magenta`, `light_blue`,
 `yellow`, `lime`, `pink`, `gray`, `light_gray`, `cyan`, `purple`, `blue`,
@@ -1209,6 +1257,34 @@ If no player chat has been seen for a while, the bot runs a server command
 Note: short server replies that look like `<word>: value` (e.g. `Shards: 123`)
 can also reset the timer; the watchdog is meant for servers where the chat is
 otherwise completely silent.
+
+## `/ai-chat` — chat that answers the room
+
+`/ai-chat` starts a chat loop for a bot (every 40–150 seconds) that uses the
+FreeLLM API. Three rules make it safe to leave running:
+
+1. **It answers the room.** The last 5 chat messages the bot saw are passed to
+   the model every turn, so the reply responds to what was actually said.
+2. **Only the quoted message is sent.** The model must answer as a single
+   double-quoted string; that string is extracted and verified — cleaned up,
+   word-limited (`AI_CHAT_WORD_LIMIT`), never starting with `/` or `.` — and
+   only a message that passes ever reaches public chat.
+3. **No prerecorded fallback.** If the API is down or produces nothing
+   verifiable, the turn is skipped and reported; a canned line dropped into a
+   live conversation is worse than silence.
+
+```text
+/ai-chat                    # start for the current bot
+/ai-chat start Bot7         # start for a specific bot
+/ai-chat status             # running? last message? failed turns?
+/ai-chat models             # what the API offers
+/ai-chat model-set auto:fast # pick a model (AI_CHAT_MODEL — applies live)
+/ai-chat stop               # stop
+```
+
+Requires `FREE_LLM_API_KEY` and `FREE_LLM_BASE_URL` in `.env` — or
+`/env set` them for the current run; the API configuration is read on every
+turn, so changes apply without a restart.
 
 ## Reconnect Behavior
 

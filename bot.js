@@ -22,6 +22,7 @@ const {
   nextAuthFailure,
   isAuthBlocked,
   parseSleepDuration,
+  fmtDuration,
   parseCommandChain,
   executeCommandChain: executeCommandChainBase,
   parseNameList,
@@ -39,7 +40,7 @@ const path = require('path')
 const http = require('http')
 const crypto = require('crypto')
 const zlib = require('zlib')
-const { exec } = require('child_process')
+const { exec, execFile } = require('child_process')
 const { createTerminal, sshConfig } = require('./expose-terminal')
 const dataStore = require(path.join(__dirname, 'data-store'))
 // Runtime settings (the dashboard .ENV tab: temporary overrides, never written to disk),
@@ -50,7 +51,7 @@ const analysis = require(path.join(__dirname, 'analysis'))
 const timeseries = require(path.join(__dirname, 'timeseries'))
 const analytics = require(path.join(__dirname, 'analytics'))
 const { handleChartJs, handleCoinflipDashboardJs } = require('./coinflip-dashboard-static')
-const { callFreeLLMChat, getAvailableModels, autoAIChatLoop } = require('./ai-chat')
+const { callFreeLLMChat, getAvailableModels, autoAIChatLoop, AI_CHAT_CONTEXT_MESSAGES } = require('./ai-chat')
 const mineflayer = require('mineflayer')
 const armorManager = require('mineflayer-armor-manager')
 const { pathfinder, Movements, goals: { GoalNear } } = require('mineflayer-pathfinder')
@@ -780,6 +781,11 @@ cfDefine('ANALYTICS_BUCKET_MS', { type: 'ms', def: 3600000, min: 60000, group: '
 // Keys that are read once at startup. They are listed so the tab is a complete
 // picture of the configuration rather than only the new half of it.
 cfDefine('ALL_SLOW_DELAY_MS', { type: 'ms', def: 15000, min: 0, group: 'Timing', desc: 'Default gap between bots in /all-slow (live)' })
+cfDefine('REPEAT_DELAY_MS', { type: 'ms', def: 2000, min: 0, group: 'Timing', desc: 'Gap between /repeat runs (live); a per-run delay token overrides it for that run' })
+cfDefine('ALL_CHAT_GUARD', { type: 'bool', def: true, group: 'Safety', desc: 'Refuse /all and /all-slow broadcasts that are not /commands — a typo like "/all .server lifesteal" would make every bot say it in chat and expose the fleet. Prefix with "!" to send chat deliberately ( /all !hello )' })
+cfDefine('BOOK_AUTO', { type: 'bool', def: false, group: 'Book', desc: 'Run /use-book automatically whenever a GUI opens with a matching item in it — when there is no match, nothing happens at all' })
+cfDefine('BOOK_ITEM_QUERY', { type: 'string', def: 'book', group: 'Book', desc: 'What /use-book scans for: a substring of the display, custom or registry name' })
+cfDefine('BOOK_USE_DELAY_MS', { type: 'ms', def: 200, min: 0, group: 'Book', desc: 'Pause between the /use-book steps (move, hotbar select, each /use) so the server is never spammed' })
 cfDefine('AUTH_RETRY_MS', { type: 'ms', def: 300000, min: 1000, group: 'Auth', desc: 'Wait before retrying a throttled login (live)' })
 cfDefine('AUTH_ALREADY_MS', { type: 'ms', def: 60000, min: 0, group: 'Auth', desc: 'Wait when the server says "already logged in" (live)' })
 cfDefine('AUTH_MAX_THROTTLED_RETRIES', { type: 'int', def: 2, min: 1, group: 'Auth', desc: 'Throttled retries before it becomes a wrong-password failure (live)' })
@@ -814,7 +820,7 @@ const coinflipStore = coinflip.createCoinflipStore({ file: COINFLIP_FILE, maxRec
 const timeseriesStore = timeseries.createTimeseriesStore({ file: TIMESERIES_FILE })
 
 
-const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat']
+const LOCAL_COMMANDS = ['/status', '/inv', '/players', '/clear', '/disconnect', '/dump', '/dump-spawners', '/dc', '/reconnect', '/crates', '/crates-loop', '/spawners', '/data', '/shardshop-loop', '/closeBot', '/bot-coinflip', '/bot-coinflip-all', '/ai-chat', '/repeat', '/use-book']
 
 const logSubscribers = new Set()
 function subscribeLog(fn) { logSubscribers.add(fn); return () => logSubscribers.delete(fn) }
@@ -2928,6 +2934,20 @@ bot.on('messagestr', (text) => {
   } catch (_) {}
 })
 
+// Chat context for /ai-chat: keep the last few lines the bot has seen (color
+// codes stripped, unicode intact) so every AI turn answers what was actually
+// said. Action-bar output (position 2) is not chat and is skipped.
+bot.on('messagestr', (message, messagePosition) => {
+  if (messagePosition === 2) return
+  try {
+    const line = String(message ?? '').replace(/\u00a7./g, '').trim()
+    if (!line) return
+    const chatLog = bots[id].chatHistory || (bots[id].chatHistory = [])
+    chatLog.push(line)
+    if (chatLog.length > 20) chatLog.splice(0, chatLog.length - 20)
+  } catch (_) {}
+})
+
 bot.on('resourcePack', (url, hashOrUuid) => {
 i(`Resource pack requested — auto-accepting…`)
 try {
@@ -2995,6 +3015,19 @@ if (manual.onWindowOpen(id, window)) return
 // auto-click, and delayed AFK warp must never run on them (it would grab
 // items out of the chest and warp away mid-dump).
 if (bots[id]?.inCrateRoutine || bots[id]?.inDumpRoutine || bots[id]?.inSpawnerRoutine) return
+
+// Book auto mode (BOOK_AUTO): a GUI that holds a matching item hands the
+// window to /use-book (scan → hotbar slot 1 → /use && /use) and nothing else
+// touches it. With no book in the window the routine does nothing at all and
+// normal GUI handling below runs as usual.
+if (settings.get('BOOK_AUTO') && bots[id]) {
+const autoSlot = findBookSlot(window, settings.get('BOOK_ITEM_QUERY'))
+if (autoSlot !== null && !bookRoutineBusy(bots[id]) && Date.now() >= (bots[id].bookAutoUntil || 0)) {
+bots[id].bookAutoUntil = Date.now() + BOOK_AUTO_COOLDOWN_MS
+runBookUseRoutine(id, {})
+return
+}
+}
 
 const title = window.title?.toString ? window.title.toString() : String(window.title || '')
 
@@ -3341,8 +3374,8 @@ else entry.bot?.emit('end', 'proxy-watchdog: forced')
 
 // ── Command registry (original + /stats) ──────────────────────────────────────
 const COMMANDS = {
-'/all <cmd>': 'Run a local command on EVERY bot, or broadcast a raw chat/command to all',
-'/all-slow [delay] <cmd>': `Like /all, but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
+'/all <cmd>': 'Run a local command on EVERY bot, or broadcast a server command to all. ALL_CHAT_GUARD (on by default) refuses plain chat so a typo like "/all .server lifesteal" cannot make every bot say it — prefix with "!" to send chat deliberately ( /all !hello )',
+'/all-slow [delay] <cmd>': `Like /all (chat guard included), but starts each bot ${ALL_SLOW_DELAY_MS / 1000}s apart (ALL_SLOW_DELAY_MS). An optional leading delay overrides it for that run, in the same units as sleep: /all-slow 30 /spawners, /all-slow 500ms /status`,
 '/all-slow-cancel [id]': 'Cancel a specific running /all-slow broadcast task by ID (e.g. /all-slow-cancel 1), or all tasks if no ID is specified',
 '/overview': 'Dashboard of every bot\'s health, food, ping, rank (via /fix + /rank), shards, coins, balance, and inventory slots',
 '/stats': 'Runtime stats: memory, event-loop lag, log rate, web viewers, uptime',
@@ -3368,11 +3401,13 @@ const COMMANDS = {
 '/closeBot': 'Disconnect the active bot and completely remove it from the UI',
 '/clear': 'Clear the active bot\'s log view',
 '/help': 'List all available commands',
-'/repeat [n|duration] <cmd>': 'Re-run the last command n times (default 1, max 50), or for a duration (e.g. /repeat 30s /spawners, /repeat 2m /dump) until that much time has elapsed. With no command given, repeats the previous command from history. /all-slow is not affected — it is a separate command with its own staggered dispatch.',
+'/repeat [n|duration] [delay] <cmd>': `Re-run a command n times (default 1, max 50) or for a duration (e.g. /repeat 30s /spawners), leaving ${settings.get('REPEAT_DELAY_MS')}ms between runs (REPEAT_DELAY_MS) so a repeat takes time instead of machine-gunning the server. An explicit delay token overrides the gap for that run: /repeat 5 30s /spawners (5 runs, 30s apart), /repeat 30s 2s /spawners (every 2s for 30s). With no command given, repeats the previous command from history. /repeat stop cancels the runs still pending. /all-slow is not affected — it is a separate command with its own staggered dispatch.`,
 '/status': 'Show active bot\'s connection, position, health, ping, uptime',
 '/inv': 'List active bot\'s inventory',
 '/tpauto on|off': 'Toggle automatic /tpaccept for trusted bot names only',
 '/find <name>': 'Search EVERY bot\'s inventory and open window for an item by display, custom, or registry name',
+  '/use-book [name]': `Scan the open GUI (or, with none open, the inventory) for a book, swap it into hotbar slot 1, select it and run /use && /use — every step ${settings.get('BOOK_USE_DELAY_MS')}ms apart (BOOK_USE_DELAY_MS) so the server is never spammed. [name] overrides the scan term (default "${settings.get('BOOK_ITEM_QUERY')}"). /use-book auto on|off (BOOK_AUTO) runs it automatically whenever a GUI opens with a book in it — no book in the GUI, nothing happens`,
+  '/copy [name]': 'Everything about the held item — the exact name with unicode intact (clean, and raw with colour codes), registry name, type, count, slot, enchants, lore and NBT — printed AND copied to the clipboard. /copy name copies just the name',
 '/cron': 'List scheduled jobs; /cron add <schedule> <cmd> | rm <id> | on|off <id> | run <id> — add jobs with /cron add <schedule> <command>, optionally prefixed with @BotName to target a single bot; jobs are saved to CRON_STATE_FILE and reloaded on restart. Schedules are 5-field cron or "@every <secs>"; env CRON_JOB_<N>="<schedule>|<command>"',
 
 '/players': 'List players online from the active bot\'s perspective',
@@ -3412,7 +3447,7 @@ const COMMANDS = {
 'anything else': 'Sent directly as a chat message/command from the active bot',
 '/dump [home|hidden|cancel]': 'Dump inventory: TPA to the configured main player, use /home stash, run the hidden chain, or cancel',
 '/dump-spawners': 'Same as /dump, but only transfers SPAWNERS into the chests (everything else stays in the inventory)',
-'/ai-chat [start|stop|status] [bot]': 'Start AI chat for a bot — uses FreeLLM API to generate Minecraft-themed messages every 40-150 seconds with occasional grammar mistakes. Start a chat loop for the current bot (or a specific one), stop an active AI chat, or check status. Requires FREE_LLM_API_KEY and FREE_LLM_BASE_URL in .env'
+'/ai-chat [start|stop|status|models|model-set] [bot]': 'AI chat for a bot — every 40-150 seconds the FreeLLM API answers the last 5 chat messages the bot saw, and only the message inside its double quotes is sent (verified first: cleaned up, word-limited, never starting with / or .). No prerecorded fallback — a turn that produces nothing verifiable is skipped and reported. \`models\` lists the API\'s models, \`model-set <model>\` picks one (AI_CHAT_MODEL, applies live). Requires FREE_LLM_API_KEY and FREE_LLM_BASE_URL'
 }
 
 // True when an item is a spawner (mob/monster spawner). Matches the registry
@@ -4591,7 +4626,7 @@ const AI_CHAT_ENABLED = true  // Enable AI chat by default
 const AI_CHAT_INTERVAL_MIN_MS = parseInt(process.env.AI_CHAT_INTERVAL_MIN_MS || '40000', 10) // 40 seconds
 const AI_CHAT_INTERVAL_MAX_MS = parseInt(process.env.AI_CHAT_INTERVAL_MAX_MS || '150000', 10) // 150 seconds
 const AI_CHAT_WORD_LIMIT = parseInt(process.env.AI_CHAT_WORD_LIMIT || '15', 10)
-cfDefine('AI_CHAT_MODEL', { type: 'string', def: 'auto', group: 'AI chat', desc: 'FreeLLM model to use for /ai-chat (empty = the API picks)' })
+cfDefine('AI_CHAT_MODEL', { type: 'string', def: 'auto', group: 'AI chat', desc: 'FreeLLM model used by /ai-chat — read on every turn, so a change applies to the next message (/ai-chat model-set is the same thing)' })
 
 // ── AI Chat state ────────────────────────────────────────────────────────────
 // bot -> { stop, lastMessage, lastError, failures }. `stop` is the signal the
@@ -4622,18 +4657,22 @@ function startAIChatForBot(id) {
 
   const send = (message) => {
     if (!message || !entry.bot?.entity) return
-    const words = message.split(/\s+/).filter(Boolean)
-    const limited = words.slice(0, AI_CHAT_WORD_LIMIT).join(' ')
-    state.lastMessage = limited
-    logFor(id, `{cyan-fg}AI → ${limited}{/cyan-fg}`)
-    entry.bot.chat(limited)
+    // The message is already verified and word-limited by ai-chat.js — it is
+    // sent exactly as generated (unicode and all), never truncated here.
+    state.lastMessage = message
+    logFor(id, `{cyan-fg}AI → ${message}{/cyan-fg}`)
+    entry.bot.chat(message)
   }
 
   // Delegate the wait-and-repeat cadence to ai-chat.js, which owns the
-  // interval constants. The loop calls `send` for each turn and `state` for
-  // the stop signal, and `aiChatTurnFailed` on every failed turn so a dead
-  // LLM is reported out loud instead of being swallowed.
-  autoAIChatLoop(entry.bot, send, botName, state, err => aiChatTurnFailed(id, err))
+  // interval constants. The loop calls `send` for each VERIFIED message and
+  // `state` for the stop signal, and `aiChatTurnFailed` on every failed turn
+  // so a dead LLM is reported out loud instead of being swallowed. Each turn
+  // is answered against the last few chat lines the bot has seen.
+  autoAIChatLoop(entry.bot, send, botName, state, err => aiChatTurnFailed(id, err), {
+    getHistory: () => (bots[id]?.chatHistory || []).slice(-AI_CHAT_CONTEXT_MESSAGES),
+    maxWords: AI_CHAT_WORD_LIMIT
+  })
     .then(() => {
       // The loop exited on its own (stop signal) — clean up.
       aiChatSessions.delete(id)
@@ -4673,35 +4712,6 @@ function aiChatTurnFailed(id, err) {
   }
 }
 
-// ── /ai-chat command ─────────────────────────────────────────────────────────
-const AI_CHAT_USAGE = '/ai-chat [start|stop|status] [bot] — starts or stops AI chat for a bot. With no args, starts AI chat for the current bot.'
-
-function handleAIChatCommand (cmd, ctx) {
-  const parts = cmd.trim().split(/\s+/)
-  const action = parts[1]?.toLowerCase()
-  const targetBot = parts[2] || ctx?.selectedId
-  
-  if (!action || action === 'start') {
-    if (!targetBot) {
-      logFor(ctx?.selectedId || SYSTEM_ID, `{yellow-fg}⚠ Specify a bot: ${AI_CHAT_USAGE}{/yellow-fg}`)
-      return
-    }
-    startAIChatForBot(targetBot)
-  } else if (action === 'stop') {
-    if (!targetBot) {
-      logFor(ctx?.selectedId || SYSTEM_ID, `{yellow-fg}⚠ Specify a bot: ${AI_CHAT_USAGE}{/yellow-fg}`)
-      return
-    }
-    stopAIChatForBot(targetBot)
-  } else if (action === 'status') {
-    const status = aiChatSessions.has(targetBot)
-      ? '{green-fg}running{/green-fg}'
-      : '{yellow-fg}not running{/yellow-fg}'
-    logFor(targetBot || SYSTEM_ID, `{cyan-fg}AI chat status for ${targetBot || 'current bot'}: ${status}{/cyan-fg}`)
-  } else {
-    logFor(ctx?.selectedId || SYSTEM_ID, `{yellow-fg}⚠ Unknown action "${action}". ${AI_CHAT_USAGE}{/yellow-fg}`)
-  }
-}
 
 // ── /bot-coinflip-all concurrency-pooled fleet engine ───────────────────────
 // Runs coinflips across the fleet with a concurrency pool: at most
@@ -5572,6 +5582,171 @@ function executeCommandChain(chain, ctx, overrides = {}) {
   })
 }
 
+// Pending /repeat timers per scheduling context (ctx.selectedId, or the TUI),
+// so /repeat stop can cancel what is still queued without touching other tabs.
+const repeatTimers = new Map()
+
+// ── Broadcast chat guard ─────────────────────────────────────────────────────
+// A mistyped /all must never reach public chat: "/all .server lifesteal"
+// (meant "/all /server lifesteal") would have EVERY bot say the same typo and
+// expose the fleet instantly. With ALL_CHAT_GUARD on, a broadcast that is not
+// a /command is refused; a leading "!" forces a deliberate chat broadcast.
+function guardBroadcastText (text, commandName) {
+  const forced = text.startsWith('!')
+  const body = forced ? text.slice(1).trim() : text
+  if (!body) return { ok: false, message: `Usage: ${commandName} <command or message>` }
+  if (!forced && settings.get('ALL_CHAT_GUARD') && !body.startsWith('/')) {
+    const intended = body.startsWith('.') ? ` — if you meant the command, run ${commandName} /${sanitize(body.slice(1))}` : ''
+    return {
+      ok: false,
+      message: `Blocked by ALL_CHAT_GUARD: "${sanitize(body)}" is not a /command, so every bot would say it in chat${intended}. To send it as chat deliberately, prefix it with "!" ( ${commandName} !${sanitize(body)} ) — or turn the guard off: /env set ALL_CHAT_GUARD false`
+    }
+  }
+  return { ok: true, body, forced }
+}
+
+// ── /use-book: find a book, move it to hotbar 1, use it twice ─────────────────
+// Scans the open GUI (or, with none open, the inventory) for a book, swaps it
+// into the FIRST hotbar slot, selects that slot and runs the /use && /use pair
+// the server's items expect. Every step is spaced BOOK_USE_DELAY_MS (200ms by
+// default) so the server is never spammed. BOOK_AUTO runs the same routine
+// whenever a GUI opens with a matching item in it — with no match present it
+// does nothing at all.
+const BOOK_AUTO_COOLDOWN_MS = 3000 // one auto-run per window-open burst
+
+function bookRoutineBusy (entry) {
+  return !!(entry && (entry.inCrateRoutine || entry.inDumpRoutine || entry.inSpawnerRoutine ||
+    entry.crateRoutineRunning || entry.crateLoopRunning || entry.shardshopLoopRunning || entry.bookRoutineRunning))
+}
+
+// First slot in the window (or inventory) whose display, custom or registry
+// name contains the query — the same matching /find uses.
+function findBookSlot (win, query) {
+  const needle = String(query || 'book').toLowerCase()
+  if (!win || !win.slots) return null
+  for (let slot = 0; slot < win.slots.length; slot++) {
+    const item = win.slots[slot]
+    if (!item) continue
+    const shown = itemDisplayName(item)
+    const candidates = [shown, itemAltName(item, shown), itemCustomName(item), item.name].filter(Boolean)
+    if (candidates.some(name => String(name).toLowerCase().includes(needle))) return slot
+  }
+  return null
+}
+
+async function runBookUseRoutine (id, opts = {}) {
+  const entry = bots[id]
+  if (!entry?.bot?.entity) return { ran: false, reason: 'not spawned' }
+  if (bookRoutineBusy(entry)) return { ran: false, reason: 'another routine is running' }
+  const bot = entry.bot
+  const query = opts.query || settings.get('BOOK_ITEM_QUERY') || 'book'
+  const delayMs = Math.max(0, settings.get('BOOK_USE_DELAY_MS') ?? 200)
+  const quiet = !!opts.quiet
+  // Zero delay needs no timer at all (and keeps the routine drivable in tests).
+  const pause = () => (delayMs > 0 ? new Promise(resolve => setTimeout(resolve, delayMs)) : Promise.resolve())
+
+  entry.bookRoutineRunning = true
+  try {
+    const win = bot.currentWindow || bot.inventory
+    const sourceSlot = findBookSlot(win, query)
+    if (sourceSlot === null) {
+      if (!quiet) logFor(id, `{yellow-fg}⚠ No item matching "${sanitize(query)}" in ${bot.currentWindow ? 'the open GUI' : 'the inventory'} — nothing to do.{/yellow-fg}`)
+      return { ran: false, reason: 'no match' }
+    }
+    const item = win.slots[sourceSlot]
+    const shown = itemDisplayName(item) || item.name || 'item'
+    if (!quiet) logFor(id, `{cyan-fg}› /use-book: ${item.count || 1}x ${sanitize(shown)} from slot ${sourceSlot} → hotbar slot 1…{/cyan-fg}`)
+
+    // First hotbar slot in THIS window: the last 9 slots of the player
+    // inventory section (slot 36 in the bare player inventory, 54 in a
+    // single chest, 90 in a double chest — always inventoryEnd − 9).
+    const hotbarSlot = Number.isInteger(win.inventoryEnd) ? win.inventoryEnd - 9 : 36
+    if (sourceSlot !== hotbarSlot) {
+      // Click-swap: pick the book up, drop it on the hotbar slot; when that
+      // slot was occupied, the displaced item goes back where the book was.
+      const displaced = win.slots[hotbarSlot] || null
+      await bot.clickWindow(sourceSlot, 0, 0)
+      await pause()
+      await bot.clickWindow(hotbarSlot, 0, 0)
+      await pause()
+      if (displaced) {
+        await bot.clickWindow(sourceSlot, 0, 0)
+        await pause()
+      }
+    }
+    bot.setQuickBarSlot(0)
+    await pause()
+    // /use && /use — the pair the server's book items expect.
+    bot.activateItem()
+    await pause()
+    if (!bots[id]?.bot?.entity) return { ran: true, reason: 'despawned mid-routine' }
+    bot.activateItem()
+    if (!quiet) logFor(id, `{green-fg}✓ /use-book done — ${sanitize(shown)} in hotbar slot 1, used twice.{/green-fg}`)
+    return { ran: true }
+  } catch (err) {
+    logFor(id, `{red-fg}✗ /use-book failed: ${sanitize((err && err.message) || String(err))}{/red-fg}`)
+    return { ran: false, reason: (err && err.message) || String(err) }
+  } finally {
+    if (bots[id]) bots[id].bookRoutineRunning = false
+  }
+}
+
+// ── /copy: everything about the held item, unicode included ───────────────────
+// The exact name is the point: the cleaned text (what you would paste) and the
+// raw text with colour codes intact, then every other fact the item carries.
+// The report is printed AND copied to the clipboard so nothing is lost to a
+// terminal that cannot select a line.
+function heldItemReport (item) {
+  const lines = []
+  const name = itemDisplayName(item) || item.name || 'item'
+  lines.push(`Name: ${name}`)
+  let rawName = null
+  try { rawName = item.customName ?? null } catch (_) {}
+  if (rawName == null) { try { rawName = item.nbt?.value?.display?.value?.Name?.value ?? null } catch (_) {} }
+  if (rawName != null) {
+    const parts = []
+    textParts(rawName, parts)
+    const rawText = parts.join('')
+    if (rawText && rawText !== name) lines.push(`Raw name: ${rawText}`)
+  }
+  const alt = itemAltName(item, name)
+  if (alt) lines.push(`Also known as: ${alt}`)
+  lines.push(`Registry: ${item.name ?? '?'}`)
+  lines.push(`Type: ${item.type ?? '?'}${item.metadata != null ? ` (metadata ${item.metadata})` : ''}`)
+  lines.push(`Count: ${item.count ?? 1}`)
+  lines.push(`Slot: ${item.slot ?? '?'}${item.slot >= 36 && item.slot <= 44 ? ` (hotbar ${item.slot - 35})` : ''}`)
+  try {
+    const ench = item.enchantments
+    const entries = Array.isArray(ench)
+      ? ench.map(e => `${e.id ?? e.name ?? '?'} ${e.level ?? e.lvl ?? ''}`.trim())
+      : ench && typeof ench === 'object' ? Object.entries(ench).map(([id, level]) => `${id} ${level}`) : []
+    if (entries.length) lines.push(`Enchants: ${entries.join(', ')}`)
+  } catch (_) {}
+  const loreParts = []
+  try {
+    const lore = item.customLore ?? item.nbt?.value?.display?.value?.Lore?.value
+    textParts(lore, loreParts)
+  } catch (_) {}
+  if (loreParts.length) lines.push(`Lore: ${loreParts.join(' | ')}`)
+  try {
+    if (item.nbt) lines.push(`NBT: ${JSON.stringify(item.nbt)}`)
+  } catch (_) {}
+  return lines
+}
+
+function copyTextToClipboard (text, done) {
+  // Never a shell string — execFile with an argv array, text over stdin.
+  const platform = process.platform
+  const cmd = platform === 'darwin' ? 'pbcopy' : platform === 'win32' ? 'clip' : 'xclip'
+  const args = platform === 'linux' ? ['-selection', 'clipboard'] : []
+  try {
+    const child = execFile(cmd, args, err => done(!err, err))
+    child.stdin.end(text, 'utf8')
+  } catch (err) {
+    done(false, err)
+  }
+}
+
 function handleCommand(raw, ctx) {
   const trimmed = String(raw ?? '').trim()
   if (!trimmed) return
@@ -5628,86 +5803,142 @@ if (!options.isChained) {
 log(`{bold}{green-fg}❯ ${sanitize(trimmed)}{/green-fg}{/bold}`)
 }
 
-// ── /repeat [n|duration] <command> ─────────────────────────────────────────
-// Re-runs the last command sent to this bot n times (default 1), or — when the
-// first token is a duration — keeps running it until that much wall-clock time
-// has elapsed. It is a thin wrapper over handleSingleCommand itself, so the
-// repeated command goes through the exact same routing, echo and chaining
-// rules as a typed command would. `all-slow` does NOT repeat this — it is a
-// different command with its own staggered dispatch, so /repeat is not
-// re-dispatched through the slow-broadcast engine (which would re-trigger
-// /all-slow forever). The first token is only ever treated as a count or
-// duration when it is a bare number/duration AND a command follows it, so a
-// command that starts with a digit (e.g. /repeat /coinflip create 500000) is
-// never mistaken for a count.
+// ── /repeat [n|duration] [delay] <command> ─────────────────────────────────
+// Re-runs a command n times (default 1), or — when the first token is a
+// duration — keeps running it until that much wall-clock time has elapsed.
+// Every run is spaced REPEAT_DELAY_MS apart (an explicit delay token overrides
+// it for that run), so a repeat takes time instead of machine-gunning the
+// server:
+//   /repeat 5 /spawners        → 5 runs, REPEAT_DELAY_MS apart
+//   /repeat 5 30s /spawners    → 5 runs, 30s apart
+//   /repeat 30s 2s /spawners   → every 2s until 30s have elapsed
+// The first run happens immediately; the delay is the gap between runs.
+// It is a thin wrapper over handleSingleCommand itself, so the repeated
+// command goes through the exact same routing, echo and chaining rules as a
+// typed command would. `all-slow` does NOT repeat this — it is a different
+// command with its own staggered dispatch, so /repeat is not re-dispatched
+// through the slow-broadcast engine (which would re-trigger /all-slow
+// forever). A leading token is only ever treated as a count, duration or
+// delay when it is a bare number/duration AND a command follows it (or the
+// previous command stands in), so a command that starts with a digit (e.g.
+// /repeat /coinflip create 500000) is never mistaken for a count.
 const repeatMatch = trimmed.match(/^\/repeat(?:\s+([\s\S]*))?$/)
 if (repeatMatch) {
 const rest = (repeatMatch[1] || '').trim()
-const last = commandHistory[commandHistory.length - 1]
 
-// Split off an optional leading count/duration token. It is only ever a
-// count or duration when it is a bare number/duration AND a command follows
-// it, so a command that starts with a digit (e.g. /repeat /coinflip create
-// 500000) is never mistaken for a count.
+// /repeat stop cancels whatever this context still has scheduled.
+if (/^(?:stop|cancel)$/i.test(rest)) {
+const key = (ctx && ctx.selectedId) || SYSTEM_ID
+const pending = repeatTimers.get(key) || []
+pending.forEach(t => clearTimeout(t))
+repeatTimers.delete(key)
+if (pending.length) logSuccess(`Cancelled ${pending.length} pending /repeat run(s).`)
+else logWarn('No /repeat runs are pending.')
+return
+}
+
+// The previous command — skipping /repeat itself, which the interfaces
+// record in history BEFORE this handler runs, so taking the raw last entry
+// would make bare /repeat repeat /repeat forever.
+const last = [...commandHistory].reverse().find(entry => !/^\/repeat(?:\s|$)/.test(String(entry)))
+
+// A bare number or duration token ("5000", "30", "30s", "2min") in exactly
+// the units `sleep` uses; anything else is part of the command.
+const durationTokenMs = token => {
+if (!/^\d+(?:\.\d+)?(?:ms|s|min|h)?$/i.test(token)) return null
+const parsed = parseSleepDuration(token)
+return parsed !== null && parsed > 0 ? parsed : null
+}
+// Peel one leading token off the front, keeping the rest of the string
+// untouched (a repeated chat message must survive byte-for-byte).
+const peel = text => {
+const m = String(text).match(/^(\S+)\s*([\s\S]*)$/)
+return m ? [m[1], m[2].trim()] : [null, '']
+}
+
 let count = 1
 let durationMs = null
-let command = rest || last
-if (!command) { logWarn('Nothing to repeat — send a command first.'); return }
+let delayMs = null
+let body = rest
 
-const splitAt = rest.search(/\s/)
-if (splitAt > 0) {
-const firstToken = rest.slice(0, splitAt)
-const body = rest.slice(splitAt + 1).trim()
+// [count|duration] — a bare integer is always a count (also: bare /repeat N
+// repeats the previous command N times); a duration only counts when it is
+// not the whole command, i.e. when something follows it.
+const [firstToken, afterFirst] = peel(rest)
+if (firstToken !== null) {
 if (/^\d+$/.test(firstToken)) {
 count = parseInt(firstToken, 10)
 if (count < 1) { logWarn('Usage: /repeat [n] <command> — n must be a positive whole number.'); return }
 if (count > 50) { logWarn(`/repeat capped at 50 runs (you asked for ${count}).`); count = 50 }
-command = body || last
+body = afterFirst
 } else {
-const parsed = parseSleepDuration(firstToken)
-if (parsed !== null && parsed > 0 && body) {
-durationMs = parsed
-command = body
-}
-// else: not a count/duration — the whole rest is the command.
-}
-} else if (splitAt === -1 && rest) {
-// Bare token, no command after it. A bare integer is a count (repeat the
-// last command that many times); anything else is the command itself.
-if (/^\d+$/.test(rest)) {
-count = parseInt(rest, 10)
-if (count < 1) { logWarn('Usage: /repeat [n] <command> — n must be a positive whole number.'); return }
-if (count > 50) { logWarn(`/repeat capped at 50 runs (you asked for ${count}).`); count = 50 }
-command = last
-} else {
-const parsed = parseSleepDuration(rest)
-if (parsed !== null && parsed > 0) {
+const firstMs = durationTokenMs(firstToken)
+if (firstMs !== null && afterFirst) {
+durationMs = firstMs
+body = afterFirst
+} else if (firstMs !== null) {
 logWarn('Usage: /repeat [duration] <command> — a duration needs a command after it.')
 return
 }
-command = rest
 }
 }
+
+// [delay] — only peeled when the count/duration was, and only when it is a
+// bare number/duration followed by a command (or standing where the previous
+// command will be repeated).
+if (body !== rest) {
+const [secondToken, afterSecond] = peel(body)
+const secondMs = secondToken !== null ? durationTokenMs(secondToken) : null
+if (secondMs !== null && (afterSecond || last)) {
+delayMs = secondMs
+body = afterSecond
+}
+}
+
+const command = body || last
+if (!command) { logWarn('Nothing to repeat — send a command first.'); return }
+if (delayMs === null) delayMs = settings.get('REPEAT_DELAY_MS')
+if (!(delayMs >= 0)) delayMs = 0
+
+// Runs are scheduled, not looped — each one arms a timer under this context
+// so /repeat stop can cancel the queue without touching other tabs.
+const runKey = (ctx && ctx.selectedId) || SYSTEM_ID
+const schedule = (fn, ms) => {
+const timer = setTimeout(() => {
+const pending = repeatTimers.get(runKey)
+if (pending) { pending.delete(timer); if (!pending.size) repeatTimers.delete(runKey) }
+fn()
+}, ms)
+let pending = repeatTimers.get(runKey)
+if (!pending) { pending = new Set(); repeatTimers.set(runKey, pending) }
+pending.add(timer)
+}
+const gap = delayMs > 0 ? ` (${fmtDuration(delayMs)} between runs)` : ''
 
 if (durationMs !== null) {
 const deadline = Date.now() + durationMs
 let runs = 0
-logInfo(`Repeating for ${fmtDuration(durationMs)}: ${sanitize(command)}`)
+logInfo(`Repeating for ${fmtDuration(durationMs)}${gap}: ${sanitize(command)}`)
 const tick = () => {
 if (Date.now() >= deadline) { logSuccess(`✓ /repeat finished after ${runs} run(s).`); return }
 runs++
 log(`{gray-fg}… run ${runs}{/gray-fg}`)
 handleSingleCommand(command, ctx, { isChained: true })
 if (Date.now() >= deadline) { logSuccess(`✓ /repeat finished after ${runs} run(s).`); return }
-setTimeout(tick, 0)
+schedule(tick, delayMs)
 }
 tick()
 } else {
-logInfo(`Repeating ${count} time(s): ${sanitize(command)}`)
-for (let i = 0; i < count; i++) {
-if (i > 0) log(`{gray-fg}… run ${i + 1}/${count}{/gray-fg}`)
+let runs = 0
+logInfo(`Repeating ${count} time(s)${gap}: ${sanitize(command)}`)
+const tick = () => {
+runs++
+if (runs > 1) log(`{gray-fg}… run ${runs}/${count}{/gray-fg}`)
 handleSingleCommand(command, ctx, { isChained: true })
+if (runs >= count) { logSuccess(`✓ /repeat finished after ${runs} run(s).`); return }
+schedule(tick, delayMs)
 }
+tick()
 }
 return
 }
@@ -5761,6 +5992,52 @@ if (findMatch) {
   }
   if (foundTotal === 0) logInfo(`No bot has an item matching "${sanitize(term)}" (${scanned} scanned, ${botNames.length - scanned} offline).`)
   else logSuccess(`Found ${foundTotal} matching item(s) across ${botNames.length} bot(s).`)
+  return
+}
+
+// ── /use-book [name] ───────────────────────────────────────────────────────
+const useBookMatch = trimmed.match(/^\/use-book(?:\s+([\s\S]*))?$/)
+if (useBookMatch) {
+  const arg = (useBookMatch[1] || '').trim()
+  const toggle = arg.match(/^auto(?:\s+(on|off))?$/i)
+  if (toggle) {
+    const next = toggle[1] ? toggle[1].toLowerCase() === 'on' : !settings.get('BOOK_AUTO')
+    settings.set('BOOK_AUTO', next ? 'true' : 'false')
+    logSuccess(`Book auto-use is ${next ? 'on' : 'off'} for this run — ${next ? 'opening a GUI with a book in it runs /use-book automatically (no book, nothing happens)' : 'only /use-book itself runs the routine'}.`)
+    return
+  }
+  if (!activeId) { logWarn('No active bot.'); return }
+  if (!bots[activeId]?.bot?.entity) { logWarn(`${activeId} is not currently spawned.`); return }
+  runBookUseRoutine(activeId, arg ? { query: arg } : {})
+  return
+}
+
+// ── /copy [name] ───────────────────────────────────────────────────────────
+if (trimmed === '/copy' || trimmed.startsWith('/copy ')) {
+  const arg = trimmed.slice(5).trim()
+  if (arg && arg.toLowerCase() !== 'name') {
+    logWarn(`Usage: /copy — copies the held item's full report (exact name, unicode and all); /copy name copies just the name`)
+    return
+  }
+  if (!activeId) { logWarn('No active bot.'); return }
+  const item = bots[activeId]?.bot?.heldItem
+  if (!item) { logWarn('Nothing is held — select a hotbar slot with an item first (/hotbar <1-9>).'); return }
+  const name = itemDisplayName(item) || item.name || 'item'
+  if (arg.toLowerCase() === 'name') {
+    // Just the name — cleaned text, unicode intact, ready to paste.
+    copyTextToClipboard(name, ok => {
+      if (ok) logSuccess(`Copied the name to the clipboard: ${sanitize(name)}`)
+      else logWarn(`Clipboard unavailable — the name is: ${sanitize(name)}`)
+    })
+    return
+  }
+  const lines = heldItemReport(item)
+  logInfo('{bold}── Held item ──{/bold}')
+  lines.forEach(line => log(` ${sanitize(line)}`))
+  copyTextToClipboard(lines.join('\n') + '\n', ok => {
+    if (ok) logSuccess(`Copied the full item report (${lines.length} line(s)) to the clipboard.`)
+    else logWarn('Clipboard unavailable on this system — the report above can be selected manually.')
+  })
   return
 }
 
@@ -5877,9 +6154,7 @@ if (broadcastMatch) {
 const command = '/' + broadcastMatch[1]
 const msg = (broadcastMatch[2] || '').trim()
 if (!msg) { logWarn(`Usage: ${command} <command or message>`); return }
-const isLocal = LOCAL_COMMANDS.includes(msg.split(/\s+/)[0])
 const ids = Object.keys(bots)
-const dispatch = id => dispatchCommandToBot(msg, id)
 if (command === '/all-slow') {
 // An optional leading delay overrides ALL_SLOW_DELAY_MS for this run:
 //   /all-slow 30 /spawners    → 30s apart
@@ -5899,15 +6174,23 @@ if (!body) { logWarn('Usage: /all-slow [delay] <command>'); return }
 // Below a quarter second the dispatches overlap and the point is lost.
 delayMs = Math.max(250, requested)
 }
-const slowDispatch = id => dispatchCommandToBot(body, id)
+// The chat guard sees the final text only — the delay token is ours, not
+// something the server or the bots ever see.
+const guard = guardBroadcastText(body, command)
+if (!guard.ok) { logWarn(guard.message); return }
+const slowDispatch = id => dispatchCommandToBot(guard.body, id)
 const taskId = slowBroadcast.start(ids, delayMs, slowDispatch, {
-command: body,
+command: guard.body,
 onError: (err, id) => logWarn(`[Task #${taskId}] ${id}: ${sanitize(err.message)}`),
 onDone: ({ sent, skipped }) => logSuccess(`[Task #${taskId}] Slow broadcast finished: ${sent} dispatched, ${skipped} skipped/failed.`)
 })
 const apart = delayMs % 1000 === 0 ? `${delayMs / 1000}s` : `${(delayMs / 1000).toFixed(1)}s`
-logInfo(`[Task #${taskId}] Slow broadcast to ${ids.length} bot(s), ${apart} apart: ${sanitize(body)}`)
+logInfo(`[Task #${taskId}] Slow broadcast to ${ids.length} bot(s), ${apart} apart: ${sanitize(guard.body)}`)
 } else {
+const guard = guardBroadcastText(msg, command)
+if (!guard.ok) { logWarn(guard.message); return }
+const isLocal = LOCAL_COMMANDS.includes(guard.body.split(/\s+/)[0])
+const dispatch = id => dispatchCommandToBot(guard.body, id)
 const onError = (err, id) => logWarn(`${id}: ${sanitize(err.message)}`)
 let sent = 0
 for (const id of ids) {
@@ -6166,10 +6449,12 @@ if (!targetId || !Object.hasOwn(bots, targetId)) {
 logWarn(/^\d+$/.test(arg) ? `No bot at index [${arg}]. Valid: 1–${names.length}` : `No bot named "${sanitize(arg)}".`)
 return
 }
-// Always update the global activeId so /all and cron see the change.
-// Additionally call ctx.selectBot for the web GUI's per-tab context.
-switchTo(targetId)
+// A web-tab /switch only moves THAT tab's target (ctx.selectBot) — the global
+// activeId is the TUI's view and must not jump because another tab switched.
+// The TUI calls with no per-tab context, so it is the only one that moves the
+// global selection.
 if (ctx && typeof ctx.selectBot === 'function') ctx.selectBot(targetId)
+else switchTo(targetId)
 return { selectedId: targetId }
 }
 
@@ -6561,10 +6846,28 @@ if (coinflipCall && coinflipCall.sub === 'unknown') {
   return
 }
 // ── AI Chat ───────────────────────────────────────────────────────────────────
-const aiChatMatch = trimmed.match(/^\/ai-chat(?:\[([^\]]+)\])?\s*(.*)/i)
+// /ai-chat [start|stop|status|models|model-set] [bot|model] — the older
+// /ai-chat[start] bracket form is still accepted. With no action it starts for
+// the current bot. The FreeLLM call reads its config per turn, so /env set of
+// FREE_LLM_* or AI_CHAT_MODEL applies to the next turn without a restart.
+const aiChatMatch = trimmed.match(/^\/ai-chat(?:\[([^\]]+)\])?(?:\s+([\s\S]*))?$/i)
 if (aiChatMatch) {
-  const sub = (aiChatMatch[1] || 'start').toLowerCase()
-  const botArg = aiChatMatch[2]?.trim()
+  const rest = `${aiChatMatch[1] ? aiChatMatch[1] + ' ' : ''}${aiChatMatch[2] || ''}`.trim()
+  const words = rest.split(/\s+/).filter(Boolean)
+  const AI_CHAT_ACTIONS = ['start', 'stop', 'status', 'models', 'model-set']
+  // The bracket form always names a subcommand — a typo there is a typo, not
+  // a bot name. The plain form lets the first word be a bot name.
+  if (aiChatMatch[1] && words.length && !AI_CHAT_ACTIONS.includes(words[0].toLowerCase())) {
+    logWarn(`Unknown /ai-chat subcommand "${sanitize(words[0])}" — try: start, stop, status, models, model-set`)
+    return
+  }
+  let sub = 'start'
+  let args = words
+  if (words.length && AI_CHAT_ACTIONS.includes(words[0].toLowerCase())) {
+    sub = words[0].toLowerCase()
+    args = words.slice(1)
+  }
+  const botArg = args.join(' ')
 
   if (sub === 'start') {
     const targetBot = botArg || ctxId || currentActiveId()
@@ -6616,13 +6919,14 @@ if (aiChatMatch) {
       }
     })();
   } else if (sub === 'model-set') {
-    const modelArg = botArg?.split(/\s+/)[0];
+    const modelArg = args[0];
     if (!modelArg) {
-      logWarn('/ai-chat model-set <model> — specify a model name to use');
+      logWarn('/ai-chat model-set <model> — specify a model name to use (/ai-chat models lists them)');
       return;
     }
-    settings.set('AI_CHAT_MODEL', modelArg);
-    logSuccess(`AI chat model set to: ${modelArg}`);
+    const result = settings.set('AI_CHAT_MODEL', modelArg);
+    if (!result.ok) { logError(`Could not set AI_CHAT_MODEL: ${sanitize(result.error)}`); return }
+    logSuccess(`AI chat model set to: ${modelArg} — applies to the next AI chat turn`);
   } else {
     logWarn(`Unknown /ai-chat subcommand "${sub}" — try: start, stop, status, models, model-set`)
   }
@@ -6703,7 +7007,11 @@ if (trimmed === '/env' || trimmed.startsWith('/env ')) {
     const key = parts[1]
     if (!key) { logWarn('Usage: /env get KEY'); return }
     const row = settings.list().find(entry => entry.key.toLowerCase() === key.toLowerCase())
-    if (!row) { logWarn(`No setting named "${sanitize(key)}". /env list shows them all.`); return }
+    if (!row) {
+      const suggestions = settings.suggestKeys(key)
+      logWarn(`No setting named "${sanitize(key)}".${suggestions.length ? ` Did you mean ${suggestions.map(sanitize).join(', ')}?` : ' /env list shows them all.'}`)
+      return
+    }
     logInfo(`${row.key}: ${row.secret ? (row.configured ? '(set — value withheld)' : '(unset)') : (row.value == null || row.value === '' ? '(unset)' : String(row.value))} {gray-fg}(${row.source}${row.live ? '' : ', startup-only'}){/gray-fg}`)
     return
   }
@@ -6711,10 +7019,18 @@ if (trimmed === '/env' || trimmed.startsWith('/env ')) {
     const key = parts[1]
     const value = parts.slice(2).join(' ')
     if (!key || !value) { logWarn('Usage: /env set KEY VALUE'); return }
+    // A wrong variable name must never set silently: when nothing reads the
+    // key, the set would "work" and do exactly nothing. Say so, and point at
+    // the names that actually exist.
+    if (!settings.isKnownKey(key)) {
+      const suggestions = settings.suggestKeys(key)
+      logWarn(`No setting named "${sanitize(key)}"${suggestions.length ? ` — did you mean ${suggestions.map(sanitize).join(', ')}?` : ''} Nothing in this run reads that name, so the value would change nothing. /env list shows every setting; a brand-new variable belongs in .env followed by a restart.`)
+      return
+    }
     const result = settings.set(key, value)
     if (!result.ok) { logError(`Could not set ${sanitize(key)}: ${sanitize(result.error)}`); return }
-    logSuccess(result.secret ? `${key} updated (temporary — not saved; value withheld)` : `${key} = ${String(result.value)} {gray-fg}(temporary — not saved){/gray-fg}`)
-    if (!result.live) logWarn(`${key} is read once at startup, so the running process keeps its old value. Edit the file and restart for that one.`)
+    logSuccess(result.secret ? `${result.key} updated (temporary — not saved; value withheld)` : `${result.key} = ${String(result.value)} {gray-fg}(temporary — not saved){/gray-fg}`)
+    if (!result.live) logWarn(`${result.key} is read once at startup, so the running process keeps its old value. Edit the file and restart for that one.`)
     return
   }
   if (sub === 'reset') {

@@ -689,6 +689,7 @@ module.exports = {
   nextAuthFailure,
   isAuthBlocked,
   parseSleepDuration,
+  fmtDuration,
   parseCommandChain,
   executeCommandChain
 }

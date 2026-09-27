@@ -80,6 +80,8 @@ function runtime(env = {}) {
       }
       // Resolved against this test file, not against bot.js, so it needs an entry.
       if (name === './removed-bots') return require('../removed-bots')
+      if (name === './coinflip-dashboard-static') return require('../coinflip-dashboard-static')
+      if (name === './ai-chat') return require('../ai-chat')
       if (name === './bot-manual') return () => ({ routeCommand: () => false, key() {}, onWindowOpen: () => false, onWindowClose() {}, stopManualMode() {}, snapshotFor: () => null })
       if (name === 'mineflayer') return { createBot() { throw Error('Live bot connections forbidden in tests') } }
       if (name === 'mineflayer-armor-manager') return () => {}
@@ -181,7 +183,7 @@ test('HTTP fallback returns selected bot and honors explicit targets without glo
 test('actual router handles slow chat, removed/offline bots, local arguments, and exit cancellation', () => {
   const r = runtime({ ALL_SLOW_DELAY_MS: '25' })
   r.timers.clear()
-  r.run(`handleCommand('/all-slow hello')`)
+  r.run(`handleCommand('/all-slow !hello')`)
   assert.deepEqual(plain(r.context.chats), [['A', 'hello']])
   assert.equal([...r.timers.values()][0].delay, 25)
   r.run('delete bots.B; bots.C.bot.entity = null')
@@ -200,8 +202,171 @@ test('bare broadcasts give usage; normal /all stays immediate', () => {
   const r = runtime()
   r.run(`handleCommand('/all'); handleCommand('/all-slow')`)
   assert.deepEqual(plain(r.context.chats), [])
+  r.run(`handleCommand('/all !hello')`)
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['B', 'hello'], ['C', 'hello']])
+})
+
+test('ALL_CHAT_GUARD blocks a mistyped /all broadcast; "!" forces chat deliberately', () => {
+  const r = runtime()
+  // The exposure this guard exists for: one typo, every bot saying it.
+  r.run(`handleCommand('/all .server lifesteal')`)
+  assert.deepEqual(plain(r.context.chats), [], 'a non-command never reaches chat')
+  r.run(`handleCommand('/all-slow .server lifesteal')`)
+  assert.deepEqual(plain(r.context.chats), [], '/all-slow is guarded too')
+  // Commands pass untouched, and "!" is the deliberate-chat escape hatch.
+  r.run(`handleCommand('/all /server lifesteal')`)
+  assert.deepEqual(plain(r.context.chats), [['A', '/server lifesteal'], ['B', '/server lifesteal'], ['C', '/server lifesteal']])
+  r.run(`handleCommand('/all !hello there')`)
+  assert.deepEqual(plain(r.context.chats).slice(-3), [['A', 'hello there'], ['B', 'hello there'], ['C', 'hello there']])
+})
+
+test('ALL_CHAT_GUARD=false keeps plain /all chat broadcasts working', () => {
+  const r = runtime({ ALL_CHAT_GUARD: 'false' })
   r.run(`handleCommand('/all hello')`)
   assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['B', 'hello'], ['C', 'hello']])
+})
+
+// ── /repeat: repetitions take time instead of machine-gunning ───────────────
+test('/repeat spaces its runs with REPEAT_DELAY_MS instead of looping instantly', () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`handleCommand('/repeat 3 hello')`)
+  // The first run is immediate; the rest are queued as timers, not looped.
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello']])
+  assert.equal(r.timers.size, 1)
+  assert.equal([...r.timers.values()][0].delay, 2000) // REPEAT_DELAY_MS default
+  const tick = () => { const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn() }
+  tick()
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['A', 'hello']])
+  tick()
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['A', 'hello'], ['A', 'hello']])
+  assert.equal(r.timers.size, 0, 'finished after 3 runs')
+})
+
+test('/repeat takes an explicit delay per command', () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`handleCommand('/repeat 2 500ms hi')`)
+  assert.deepEqual(plain(r.context.chats), [['A', 'hi']])
+  assert.equal([...r.timers.values()][0].delay, 500)
+  const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn()
+  assert.equal(r.timers.size, 0)
+  assert.equal(r.context.chats.length, 2)
+})
+
+test('/repeat duration mode paces runs and stops at the deadline', () => {
+  const r = runtime()
+  r.timers.clear()
+  // The vm context has its own Date — move its clock per tick so the
+  // deadline check is deterministic.
+  r.run('__clock = Date.now(); Date.now = () => __clock')
+  r.run(`handleCommand('/repeat 2s 500ms x')`)
+  assert.deepEqual(plain(r.context.chats), [['A', 'x']])
+  const tick = () => { const t = [...r.timers.keys()][0]; r.timers.delete(t); r.run('__clock += 500'); t.fn() }
+  tick(); tick(); tick()
+  assert.equal(r.context.chats.length, 4, 'runs at 0, 500, 1000 and 1500ms')
+  tick()
+  assert.equal(r.context.chats.length, 4, 'the 2s deadline stops the repeat')
+  assert.equal(r.timers.size, 0)
+})
+
+test('/repeat stop cancels the queued runs', () => {
+  const r = runtime()
+  r.timers.clear()
+  r.run(`handleCommand('/repeat 5 hello')`)
+  assert.equal(r.timers.size, 1)
+  r.run(`handleCommand('/repeat stop')`)
+  assert.equal(r.timers.size, 0)
+  assert.equal(r.context.chats.length, 1, 'only the immediate first run happened')
+})
+
+test('/repeat repeats the previous command, never /repeat itself', () => {
+  const r = runtime()
+  r.timers.clear()
+  // The interfaces record the command in history before handling it — the
+  // same order a typed /repeat has, so the naive "last entry" would be
+  // /repeat and recurse.
+  r.run(`recordHistory('hello there'); recordHistory('/repeat 2'); handleCommand('/repeat 2')`)
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello there']])
+  const t = [...r.timers.keys()][0]; r.timers.delete(t); t.fn()
+  assert.deepEqual(plain(r.context.chats), [['A', 'hello there'], ['A', 'hello there']])
+})
+
+// ── /use-book: book → hotbar slot 1 → /use && /use ──────────────────────────
+test('/use-book swaps the book into hotbar slot 1, selects it and uses it twice', async () => {
+  const r = runtime({ BOOK_USE_DELAY_MS: '0' })
+  r.run(`
+    __steps = []
+    __slots = []
+    __slots[10] = { name: 'book', displayName: 'Book', count: 3, slot: 10 }
+    __slots[36] = { name: 'diamond', displayName: 'Diamond', count: 2, slot: 36 }
+    bots.A.bot.currentWindow = null
+    bots.A.bot.inventory = { slots: __slots, inventoryEnd: 45 }
+    bots.A.bot.clickWindow = async (slot) => { __steps.push('click ' + slot) }
+    bots.A.bot.setQuickBarSlot = (n) => { __steps.push('hotbar ' + n) }
+    bots.A.bot.activateItem = () => { __steps.push('use') }
+  `)
+  const result = plain(await r.run("runBookUseRoutine('A')"))
+  assert.equal(result.ran, true)
+  // The displaced diamond goes back where the book was.
+  assert.deepEqual(plain(r.run('__steps')), ['click 10', 'click 36', 'click 10', 'hotbar 0', 'use', 'use'])
+})
+
+test('/use-book with no book present does nothing at all', async () => {
+  const r = runtime({ BOOK_USE_DELAY_MS: '0' })
+  r.run(`
+    __steps = []
+    __slots = []
+    __slots[36] = { name: 'diamond', displayName: 'Diamond', count: 2, slot: 36 }
+    bots.A.bot.currentWindow = null
+    bots.A.bot.inventory = { slots: __slots, inventoryEnd: 45 }
+    bots.A.bot.clickWindow = async (slot) => { __steps.push('click ' + slot) }
+    bots.A.bot.setQuickBarSlot = () => { __steps.push('hotbar') }
+    bots.A.bot.activateItem = () => { __steps.push('use') }
+  `)
+  const result = plain(await r.run("runBookUseRoutine('A')"))
+  assert.equal(result.ran, false)
+  assert.deepEqual(plain(r.run('__steps')), [], 'no match — no clicks, no use')
+})
+
+test('/use-book auto toggles the GUI-triggered mode', () => {
+  const r = runtime()
+  try {
+    r.run("handleCommand('/use-book auto on')")
+    assert.equal(r.run("settings.get('BOOK_AUTO')"), true)
+    r.run("handleCommand('/use-book auto off')")
+    assert.equal(r.run("settings.get('BOOK_AUTO')"), false)
+  } finally {
+    r.run("settings.reset('BOOK_AUTO')")
+  }
+})
+
+// ── /copy: the held item, everything about it, unicode included ─────────────
+test('/copy reports the held item fully and copies it to the clipboard', () => {
+  const r = runtime()
+  try {
+    r.run("copyTextToClipboard = (text, done) => { __copied = text; done(true) }")
+    r.run(`
+      bots.A.bot.heldItem = {
+        name: 'paper', displayName: 'Paper', type: 332, metadata: 0, count: 1, slot: 36,
+        customName: '\u{1D4AE}\u{1D4FC}\u{1D4F9}\u{1D4F9}\u{1D502} \u{1D4FC}\u{1D4FA}',
+        enchantments: [{ id: 'unbreaking', level: 3 }],
+        nbt: { type: 'compound', value: {} }
+      }
+    `)
+    r.run("handleCommand('/copy')")
+    const report = r.run('__copied')
+    assert.match(report, /Name: \u{1D4AE}\u{1D4FC}\u{1D4F9}\u{1D4F9}\u{1D502} \u{1D4FC}\u{1D4FA}/u, 'the unicode name survives verbatim')
+    assert.match(report, /Registry: paper/)
+    assert.match(report, /Enchants: unbreaking 3/)
+    assert.match(report, /NBT: /)
+    assert.match(channelLogs(r, 'A'), /Copied the full item report/)
+
+    r.run("handleCommand('/copy name')")
+    assert.equal(r.run('__copied'), '\u{1D4AE}\u{1D4FC}\u{1D4F9}\u{1D4F9}\u{1D502} \u{1D4FC}\u{1D4FA}', '/copy name copies just the name')
+  } finally {
+    r.run("bots.A.bot.heldItem = null")
+  }
 })
 
 // A permanent ban has to actually leave the roster, and the removed list — not a
@@ -408,7 +573,7 @@ test('/all reuses the shared dispatcher (local args preserved, chat broadcast)',
   let logText = r.run(`JSON.stringify(bots.A.logs.map(l => l.text.replace(/^.*?}/, '')))`)
   assert.match(logText, /Ran locally on 3 bots/)
   assert.equal(r.run('chats.length'), 0)
-  r.run(`handleCommand('/all hello')`)
+  r.run(`handleCommand('/all !hello')`)
   assert.deepEqual(plain(r.context.chats), [['A', 'hello'], ['B', 'hello'], ['C', 'hello']])
 })
 
@@ -551,8 +716,8 @@ test('multiple concurrent /all-slow tasks and cancellation', () => {
   r.timers.clear()
 
   // Start two concurrent /all-slow broadcasts
-  r.run(`handleCommand('/all-slow first')`)
-  r.run(`handleCommand('/all-slow second')`)
+  r.run(`handleCommand('/all-slow !first')`)
+  r.run(`handleCommand('/all-slow !second')`)
 
   assert.equal(r.run('slowBroadcast.running'), true)
   assert.equal(r.run('slowBroadcast.list().length'), 2)
@@ -1638,6 +1803,20 @@ test('a value that cannot be parsed is refused by /env instead of silently rever
   assert.match(channelLogs(r, 'A'), /not a valid int/)
 })
 
+test('/env set refuses a wrong variable name instead of setting it silently', () => {
+  const r = runtime(dataEnv())
+  // The "I set the wrong .env variable" case: nothing reads this name, so a
+  // silent success would look like it worked while changing nothing.
+  r.run("handleCommand('/env set COINFLIP_WAGER_MI 5000', { selectedId: 'A' })")
+  assert.equal(r.run("settings.isKnownKey('COINFLIP_WAGER_MI')"), false)
+  assert.match(channelLogs(r, 'A'), /No setting named "COINFLIP_WAGER_MI"/)
+  assert.match(channelLogs(r, 'A'), /COINFLIP_WAGER_MIN/, 'the real name is suggested')
+  // Case typos land on the registered key instead of an inert shadow.
+  r.run("handleCommand('/env set coinflip_wager_min 7000', { selectedId: 'A' })")
+  assert.equal(r.run("settings.get('COINFLIP_WAGER_MIN')"), 7000)
+  r.run("handleCommand('/env reset COINFLIP_WAGER_MIN', { selectedId: 'A' })")
+})
+
 test('a startup-only key says so rather than pretending the change took effect', () => {
   const r = runtime(dataEnv())
   r.run("handleCommand('/env set BOT_NAMES A,B,C,D', { selectedId: 'A' })")
@@ -1787,18 +1966,24 @@ test('the analytics report and page carry the dissection', () => {
   assert.equal(report.headline.coinflips, 45)
   assert.ok(report.config.coinflipDeepFile.endsWith('coinflip-deep.json'))
 
+  // The deep dissection is its own tab: the page ships the tab shell and the
+  // loader, and the section HTML (deepHtml) is what the tab fills in from
+  // /api/coinflip/deep — so the assertions live on the section, not the shell.
   const html = r.run("analytics.renderHtml(buildAnalyticsReport())")
   assert.match(html, /Deep dissection/)
-  assert.match(html, /What the numbers say/)
   assert.match(html, /\/api\/coinflip\/deep/)
-  assert.match(html, /statistical tests/)
+  assert.equal(/undefined|NaN/.test(html), false, 'no placeholder leaked into the page')
+
+  const deepHtml = report.deepHtml
+  assert.match(deepHtml, /What the numbers say/)
+  assert.match(deepHtml, /statistical tests/)
   // Every dissection gets a table, every table and row is closed, and no
   // template placeholder survived the render.
-  const tables = html.split('<table>').length - 1
-  assert.equal(html.split('</table>').length - 1, tables, 'every table is closed')
+  const tables = deepHtml.split('<table>').length - 1
+  assert.equal(deepHtml.split('</table>').length - 1, tables, 'every table is closed')
   assert.ok(tables >= 13, `${tables} dissection tables`)
-  assert.equal(html.split('<tr').length, html.split('</tr>').length, 'every row is closed')
-  assert.equal(/undefined|NaN/.test(html), false, 'no placeholder leaked into the page')
+  assert.equal(deepHtml.split('<tr').length, deepHtml.split('</tr>').length, 'every row is closed')
+  assert.equal(/undefined|NaN/.test(deepHtml), false, 'no placeholder leaked into the section')
 })
 
 test('the create waits out the configured cooldown after the balance answer', async () => {

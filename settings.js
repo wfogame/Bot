@@ -86,6 +86,67 @@ function isSecret (key) {
   return SECRET_RE.test(key)
 }
 
+/**
+ * Key lookup is case-insensitive and canonicalizes to the real spelling:
+ * `/env set all_slow_delay_ms 5s` must land on ALL_SLOW_DELAY_MS instead of
+ * creating an inert shadow key that nothing reads — the "I set it and nothing
+ * happened" class of bug this registry exists to prevent.
+ */
+function canonicalKey (name) {
+  const trimmed = String(name || '').trim()
+  if (registry.has(trimmed)) return trimmed
+  const upper = trimmed.toUpperCase()
+  if (registry.has(upper)) return upper
+  for (const key of registry.keys()) {
+    if (key.toUpperCase() === upper) return key
+  }
+  if (Object.prototype.hasOwnProperty.call(process.env, trimmed)) return trimmed
+  if (Object.prototype.hasOwnProperty.call(process.env, upper)) return upper
+  for (const key of Object.keys(process.env)) {
+    if (key.toUpperCase() === upper) return key
+  }
+  return trimmed
+}
+
+/** True when the name is a registered setting or an existing environment key. */
+function isKnownKey (name) {
+  const key = canonicalKey(name)
+  if (registry.has(key)) return true
+  return Object.prototype.hasOwnProperty.call(process.env, key)
+}
+
+function levenshtein (a, b) {
+  if (a === b) return 0
+  const prev = new Array(b.length + 1)
+  for (let j = 0; j <= b.length; j++) prev[j] = j
+  for (let i = 1; i <= a.length; i++) {
+    let last = prev[0]
+    prev[0] = i
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j]
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, last + (a[i - 1] === b[j - 1] ? 0 : 1))
+      last = tmp
+    }
+  }
+  return prev[b.length]
+}
+
+/** Closest known keys — the "did you mean …?" list for a mistyped name. */
+function suggestKeys (name, limit = 3) {
+  const needle = String(name || '').trim().toLowerCase()
+  if (!needle) return []
+  const maxDistance = Math.max(2, Math.floor(needle.length / 3))
+  const seen = new Set()
+  return [...registry.keys(), ...Object.keys(process.env)]
+    .filter(key => !seen.has(key) && seen.add(key))
+    .filter(key => /^[A-Z][A-Z0-9_]*$/.test(key) && !NOISE_RE.test(key))
+    .map(key => ({ key, distance: levenshtein(needle, key.toLowerCase()) }))
+    .filter(entry => entry.distance > 0 && entry.distance <= maxDistance)
+    .sort((a, b) => a.distance - b.distance || a.key.localeCompare(b.key))
+    .slice(0, limit)
+    .map(entry => entry.key)
+}
+
 // Temporary values, and the value each key had before the first override so
 // /env reset can put it back exactly (including "it was not set at all").
 const overrides = new Map()
@@ -105,6 +166,7 @@ function specFor (key) {
 
 /** Effective value: override → process.env → registered default. */
 function get (key) {
+  key = canonicalKey(key)
   const spec = specFor(key)
   const raw = overrides.has(key) ? overrides.get(key)
     : process.env[key] !== undefined && process.env[key] !== '' ? process.env[key]
@@ -115,6 +177,7 @@ function get (key) {
 }
 
 function getRaw (key) {
+  key = canonicalKey(key)
   const spec = specFor(key)
   if (overrides.has(key)) return overrides.get(key)
   if (process.env[key] !== undefined && process.env[key] !== '') return process.env[key]
@@ -122,6 +185,7 @@ function getRaw (key) {
 }
 
 function source (key) {
+  key = canonicalKey(key)
   if (overrides.has(key)) return 'override'
   if (process.env[key] !== undefined && process.env[key] !== '') return 'env'
   return 'default'
@@ -134,7 +198,7 @@ function source (key) {
  * whole module exists to avoid.
  */
 function set (key, raw) {
-  const name = String(key || '').trim()
+  const name = canonicalKey(key)
   if (!name) return { ok: false, error: 'a setting name is required' }
   const spec = specFor(name)
   const secret = isSecret(name)
@@ -170,7 +234,7 @@ function set (key, raw) {
 }
 
 function reset (key) {
-  const name = String(key || '').trim()
+  const name = canonicalKey(key)
   if (!overrides.has(name)) return { ok: false, error: `${name} has no temporary override` }
   const original = originals.get(name)
   overrides.delete(name)
@@ -243,7 +307,7 @@ function overrideCount () {
 }
 
 function has (key) {
-  return registry.has(key)
+  return registry.has(canonicalKey(key))
 }
 
 function registered () {
@@ -264,5 +328,8 @@ module.exports = {
   registered,
   coerce,
   isSecret,
-  source
+  source,
+  canonicalKey,
+  isKnownKey,
+  suggestKeys
 }
